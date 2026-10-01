@@ -123,10 +123,14 @@
         addMessage(result.reply, 'agent');
         addThinking(result.thinking);
         if (result.research_queued) addMessage('Scholar is looking this up for a future reply.', 'system-note');
-        status.textContent = 'Updating knowledge before the next prompt…';
+        status.textContent = 'Updating knowledge and checking the reply…';
         prompt.focus();
-        const ready = await fetch('/api/ready');
+        const ready = await fetch(`/api/ready?session_id=${sessionId}`);
         if (!ready.ok) throw new Error('Could not check whether curation finished.');
+        const audit = await ready.json();
+        for (const challenge of audit.challenges || []) {
+          addMessage(`Curmudgeon challenged “${challenge.subject} — ${challenge.relation} — ${challenge.object}”. ${challenge.reason} Compared with ${challenge.evidence_refs.join(', ')}.`, 'system-note');
+        }
         status.textContent = 'Ready';
       } catch (error) {
         addMessage(error.message, 'error');

@@ -11,8 +11,10 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::agent::Message;
+use crate::curmudgeon;
 use crate::inference::LocalModel;
 use crate::scholar;
+use crate::scout;
 use crate::storage::{CandidateClaim, LearningStore, Observation};
 
 const LEASE_SECONDS: u64 = 600;
@@ -64,11 +66,15 @@ pub fn process_once(database_path: &str, model: &mut LocalModel) -> io::Result<u
 }
 
 impl CuratorHandle {
-    pub fn spawn(database_path: String, model: Arc<Mutex<LocalModel>>) -> Self {
+    pub fn spawn(
+        database_path: String,
+        knowledge_path: String,
+        model: Arc<Mutex<LocalModel>>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("semantic-curator".into())
-            .spawn(move || run(database_path, model, receiver));
+            .spawn(move || run(database_path, knowledge_path, model, receiver));
         let thread = match thread {
             Ok(thread) => Some(thread),
             Err(error) => {
@@ -104,7 +110,12 @@ impl Drop for CuratorHandle {
     }
 }
 
-fn run(database_path: String, model: Arc<Mutex<LocalModel>>, receiver: mpsc::Receiver<Command>) {
+fn run(
+    database_path: String,
+    knowledge_path: String,
+    model: Arc<Mutex<LocalModel>>,
+    receiver: mpsc::Receiver<Command>,
+) {
     let mut store = match LearningStore::open(Path::new(&database_path)) {
         Ok(store) => store,
         Err(error) => {
@@ -162,10 +173,22 @@ fn run(database_path: String, model: Arc<Mutex<LocalModel>>, receiver: mpsc::Rec
             break;
         }
 
-        if let Ok(mut model) = model.lock()
-            && let Err(error) = scholar::process_once(Path::new(&database_path), &mut model)
-        {
-            eprintln!("scholar worker failed: {error}");
+        if let Ok(mut model) = model.lock() {
+            if let Err(error) = curmudgeon::process_once(
+                Path::new(&database_path),
+                Path::new(&knowledge_path),
+                &mut model,
+            ) {
+                eprintln!("curmudgeon worker failed: {error}");
+            }
+            if let Err(error) =
+                scout::process_once(Path::new(&database_path), Path::new(&knowledge_path))
+            {
+                eprintln!("scout worker failed: {error}");
+            }
+            if let Err(error) = scholar::process_once(Path::new(&database_path), &mut model) {
+                eprintln!("scholar worker failed: {error}");
+            }
         }
 
         match receiver.recv_timeout(IDLE_SCAN_INTERVAL) {

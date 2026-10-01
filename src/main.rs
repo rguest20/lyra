@@ -1,12 +1,15 @@
 mod agent;
 mod curator;
+mod curmudgeon;
 mod inference;
 mod knowledge;
 mod scholar;
+mod scout;
 mod storage;
 mod web;
 
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -35,7 +38,13 @@ fn run() -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from("models/qwen3-0.6b"));
     let adapter_path = env::var_os("COMMUNITY_ADAPTER")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("state/adapter.safetensors"));
+        .unwrap_or_else(|| {
+            if model_dir == std::path::Path::new("models/qwen3-0.6b") {
+                PathBuf::from("state/adapter.safetensors")
+            } else {
+                model_dir.join("adapter.safetensors")
+            }
+        });
     let cpu = env::var("COMMUNITY_DEVICE").is_ok_and(|value| value == "cpu");
     let state_path = env::var_os("COMMUNITY_STATE")
         .map(PathBuf::from)
@@ -65,6 +74,7 @@ fn run() -> Result<(), String> {
             ));
             let curator = curator::CuratorHandle::spawn(
                 database_path.to_string_lossy().into_owned(),
+                knowledge_path.to_string_lossy().into_owned(),
                 backend.clone(),
             );
             println!(
@@ -140,9 +150,40 @@ fn run() -> Result<(), String> {
                 .map_err(|e| format!("could not load local model for curation: {e}"))?;
             let processed = curator::process_once(&database_path.to_string_lossy(), &mut backend)
                 .map_err(|e| format!("curation failed: {e}"))?;
+            let audited = curmudgeon::process_once(&database_path, &knowledge_path, &mut backend)
+                .map_err(|e| format!("curmudgeon failed: {e}"))?;
+            let scouted = scout::process_once(&database_path, &knowledge_path)
+                .map_err(|e| format!("scout failed: {e}"))?;
             let researched = scholar::process_once(&database_path, &mut backend)
                 .map_err(|e| format!("scholar failed: {e}"))?;
-            println!("Curated {processed} observation(s); processed {researched} scholar job(s)");
+            println!(
+                "Curated {processed} observation(s); audited {audited} assistant reply/replies; queued {scouted} Scout investigation(s); processed {researched} Scholar job(s)"
+            );
+        }
+        "scout-once" => {
+            if args.next().is_some() {
+                return Err("scout-once takes no arguments".into());
+            }
+            let queued = scout::process_once(&database_path, &knowledge_path)
+                .map_err(|e| format!("Scout failed: {e}"))?;
+            println!("Queued {queued} Scout investigation(s)");
+        }
+        "scout" => {
+            if args.next().is_some() {
+                return Err("scout takes no arguments".into());
+            }
+            let store = storage::LearningStore::open(&database_path).map_err(|e| e.to_string())?;
+            for investigation in store.scout_investigations().map_err(|e| e.to_string())? {
+                println!(
+                    "[{}] {}",
+                    investigation.trigger_kind, investigation.question
+                );
+                println!(
+                    "  Trigger: {} ({})",
+                    investigation.trigger_ref, investigation.topic_key
+                );
+                println!("  Scholar job: {}", investigation.scholar_job_id);
+            }
         }
         "scholar-once" => {
             if args.next().is_some() {
@@ -153,6 +194,67 @@ fn run() -> Result<(), String> {
             let processed = scholar::process_once(&database_path, &mut backend)
                 .map_err(|e| format!("scholar failed: {e}"))?;
             println!("Processed {processed} scholar job(s)");
+        }
+        "curmudgeon-once" => {
+            if args.next().is_some() {
+                return Err("curmudgeon-once takes no arguments".into());
+            }
+            let mut backend = LocalModel::load(&model_dir, &adapter_path, cpu)
+                .map_err(|e| format!("could not load local model for Curmudgeon: {e}"))?;
+            let processed = curmudgeon::process_once(&database_path, &knowledge_path, &mut backend)
+                .map_err(|e| format!("Curmudgeon failed: {e}"))?;
+            println!("Audited {processed} assistant reply/replies");
+        }
+        "curmudgeon" => {
+            let values = args.collect::<Vec<_>>();
+            let store = storage::LearningStore::open(&database_path).map_err(|e| e.to_string())?;
+            match values.as_slice() {
+                [subcommand, text @ ..] if subcommand == "audit" && !text.is_empty() => {
+                    let reply = text.join(" ");
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| e.to_string())?
+                        .as_nanos();
+                    let turn = usize::try_from(nonce).map_err(|_| "audit timestamp too large")?;
+                    store
+                        .stage_assistant_reply("manual-curmudgeon-audit", turn, &reply)
+                        .map_err(|e| e.to_string())?;
+                    println!("Queued Curmudgeon audit: {reply}");
+                }
+                [] => {
+                    for claim in store.assistant_claims(30).map_err(|e| e.to_string())? {
+                        println!(
+                            "#{} [{}; {:.2} → {:.2}]: {} — {} — {}",
+                            claim.id,
+                            claim.verdict,
+                            claim.confidence_before,
+                            claim.confidence_after,
+                            claim.subject,
+                            claim.relation,
+                            claim.object
+                        );
+                        println!("  Audited assertion: {}", claim.evidence_text);
+                        println!("  {}", claim.reason);
+                        if !claim.evidence_refs.is_empty() {
+                            println!("  Compared with: {}", claim.evidence_refs.join(", "));
+                        }
+                    }
+                    for (id, status, error) in store
+                        .assistant_reply_attention()
+                        .map_err(|e| e.to_string())?
+                    {
+                        println!(
+                            "Reply {id} [{status}]{}",
+                            if error.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {error}")
+                            }
+                        );
+                    }
+                }
+                _ => return Err("usage: curmudgeon [audit REPLY_TEXT]".into()),
+            }
         }
         "say" => {
             let input = args.collect::<Vec<_>>().join(" ");
@@ -216,6 +318,154 @@ fn run() -> Result<(), String> {
             println!("Updated adapter: {tokens} target tokens, mean loss {loss:.3}");
             println!("Saved: {}", adapter_path.display());
         }
+        "model" => {
+            let values = args.collect::<Vec<_>>();
+            let store = storage::LearningStore::open(&database_path).map_err(|e| e.to_string())?;
+            match values.as_slice() {
+                [action] if action == "history" => {
+                    for run in store.model_consolidations().map_err(|e| e.to_string())? {
+                        println!(
+                            "#{} db#{} loss {:.3}: {}",
+                            run.id, run.claim_id, run.training_loss, run.output_checkpoint
+                        );
+                        println!("  rollback: {}", run.source_checkpoint);
+                    }
+                }
+                [action, prompt @ ..] if action == "probe-chat" && !prompt.is_empty() => {
+                    let mut backend = LocalModel::load(&model_dir, &adapter_path, cpu)
+                        .map_err(|e| format!("could not load local model: {e}"))?;
+                    println!(
+                        "{}",
+                        backend
+                            .probe_chat(&prompt.join(" "))
+                            .map_err(|e| e.to_string())?
+                    );
+                }
+                [action, prompt @ ..] if action == "probe" && !prompt.is_empty() => {
+                    let mut backend = LocalModel::load(&model_dir, &adapter_path, cpu)
+                        .map_err(|e| format!("could not load local model: {e}"))?;
+                    println!(
+                        "{}",
+                        backend
+                            .probe(&prompt.join(" "))
+                            .map_err(|e| e.to_string())?
+                    );
+                }
+                [action, id, reason @ ..] if action == "approve" && !reason.is_empty() => {
+                    let id: i64 = id.parse().map_err(|_| "claim ID must be an integer")?;
+                    store
+                        .approve_model_claim(id, &reason.join(" "))
+                        .map_err(|e| e.to_string())?;
+                    println!("Approved active SQLite claim db#{id} for model training");
+                }
+                [action, id] if action == "consolidate" => {
+                    let id: i64 = id.parse().map_err(|_| "claim ID must be an integer")?;
+                    let claim = store.approved_model_claim(id).map_err(|e| e.to_string())?;
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| e.to_string())?
+                        .as_nanos();
+                    let name = model_dir
+                        .file_name()
+                        .ok_or("model directory has no name")?
+                        .to_string_lossy();
+                    let output_dir = model_dir.with_file_name(format!("{name}-claim-{id}-{stamp}"));
+                    fs::create_dir(&output_dir)
+                        .map_err(|e| format!("could not create checkpoint directory: {e}"))?;
+                    let training_adapter = output_dir.join("training-adapter.safetensors");
+                    if adapter_path.exists() {
+                        fs::copy(&adapter_path, &training_adapter).map_err(|e| e.to_string())?;
+                    }
+                    let mut backend = LocalModel::load(&model_dir, &training_adapter, cpu)
+                        .map_err(|e| format!("could not load source model: {e}"))?;
+                    let prompt = format!("What is known about {}?", claim.subject);
+                    let answer = format!("{} {} {}.", claim.subject, claim.relation, claim.object);
+                    let mut result = None;
+                    for pass in 1..=24 {
+                        let (tokens, loss) = backend
+                            .train_with_system(agent::SYSTEM_PROMPT, &prompt, &answer)
+                            .map_err(|e| format!("model training failed on pass {pass}: {e}"))?;
+                        if loss <= 0.6 {
+                            let probe = backend
+                                .probe_chat(&prompt)
+                                .map_err(|e| format!("model validation failed: {e}"))?;
+                            if probe.to_lowercase().contains(&claim.object.to_lowercase())
+                                && probe.chars().count() <= 200
+                            {
+                                result = Some((tokens, loss, pass));
+                                break;
+                            }
+                        }
+                    }
+                    let (tokens, loss, passes) = match result {
+                        Some(result) => result,
+                        None => {
+                            drop(backend);
+                            fs::remove_dir_all(&output_dir).map_err(|e| e.to_string())?;
+                            return Err("model did not recall the claim after 24 passes; no checkpoint was published".into());
+                        }
+                    };
+                    let source = model_dir.join("model.safetensors");
+                    let output = output_dir.join("model.safetensors");
+                    backend
+                        .save_merged_checkpoint(&source, &output)
+                        .map_err(|e| format!("checkpoint consolidation failed: {e}"))?;
+                    drop(backend);
+                    fs::remove_file(&training_adapter).map_err(|e| e.to_string())?;
+                    let config_bytes =
+                        fs::read(model_dir.join("config.json")).map_err(|e| e.to_string())?;
+                    let mut config: serde_json::Value =
+                        serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
+                    config["tie_word_embeddings"] = serde_json::Value::Bool(false);
+                    fs::write(
+                        output_dir.join("config.json"),
+                        serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    fs::copy(
+                        model_dir.join("tokenizer.json"),
+                        output_dir.join("tokenizer.json"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let mut check =
+                        LocalModel::load(&output_dir, &output_dir.join("adapter.safetensors"), cpu)
+                            .map_err(|e| format!("new checkpoint failed validation: {e}"))?;
+                    let merged_probe = check
+                        .probe_chat(&prompt)
+                        .map_err(|e| format!("new checkpoint failed recall probe: {e}"))?;
+                    drop(check);
+                    if !merged_probe
+                        .to_lowercase()
+                        .contains(&claim.object.to_lowercase())
+                        || merged_probe.chars().count() > 200
+                    {
+                        fs::remove_dir_all(&output_dir).map_err(|e| e.to_string())?;
+                        return Err("merged checkpoint did not retain the claim; no checkpoint was published".into());
+                    }
+                    store
+                        .record_model_consolidation(
+                            id,
+                            &source.to_string_lossy(),
+                            &output.to_string_lossy(),
+                            loss,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "Trained on approved db#{id}: {passes} passes, {tokens} target tokens, mean loss {loss:.3}"
+                    );
+                    println!("New model: {}", output_dir.display());
+                    println!(
+                        "Use COMMUNITY_MODEL_DIR={} to select it; unset that variable to return to the original checkpoint.",
+                        output_dir.display()
+                    );
+                }
+                _ => {
+                    return Err(
+                        "usage: model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model probe PROMPT | model probe-chat PROMPT".into(),
+                    );
+                }
+            }
+        }
         "revise" => {
             let values: Vec<_> = args.collect();
             if values.len() != 5 {
@@ -257,7 +507,22 @@ fn run() -> Result<(), String> {
             let mut curated_count = 0;
             for detail in curated {
                 let claim = detail.claim;
-                if claim.source_observation_id.is_none() && !claim.source.starts_with("https://") {
+                let duplicate_in_json = map.entries().iter().any(|entry| {
+                    entry.retracted_by.is_none()
+                        && entry
+                            .subject
+                            .trim()
+                            .eq_ignore_ascii_case(claim.subject.trim())
+                        && entry
+                            .relation
+                            .trim()
+                            .eq_ignore_ascii_case(claim.relation.trim())
+                        && entry
+                            .object
+                            .trim()
+                            .eq_ignore_ascii_case(claim.object.trim())
+                });
+                if duplicate_in_json {
                     continue;
                 }
                 curated_count += 1;
@@ -482,7 +747,7 @@ fn run() -> Result<(), String> {
 
 fn usage() {
     println!(
-        "Usage: cargo run -- [chat | serve | say MESSAGE | train PROMPT ANSWER | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | show JOB_ID | review FINDING_ID accept|reject REASON] | scholar-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
+        "Usage: cargo run -- [chat | serve | say MESSAGE | train PROMPT ANSWER | model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model probe PROMPT | model probe-chat PROMPT | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | show JOB_ID | review FINDING_ID accept|reject REASON] | scholar-once | curmudgeon [audit REPLY_TEXT] | curmudgeon-once | scout | scout-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
         Environment: COMMUNITY_MODEL_DIR, COMMUNITY_ADAPTER, COMMUNITY_DEVICE, COMMUNITY_STATE, COMMUNITY_KNOWLEDGE, COMMUNITY_DB"
     );
 }

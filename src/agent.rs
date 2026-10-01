@@ -1,5 +1,6 @@
 //! One agent with durable conversation. Learned knowledge will be a separate layer.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -9,10 +10,12 @@ use serde_json::{Value, json};
 use crate::curator::CuratorHandle;
 use crate::inference::LocalModel;
 use crate::knowledge::KnowledgeMap;
-use crate::storage::{LearningStore, Observation, SemanticClaim, StoredCandidate};
+use crate::storage::{
+    LearningStore, Observation, SemanticClaim, StoredAssistantClaim, StoredCandidate,
+};
 
 const STATE_VERSION: u64 = 1;
-const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
+pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
@@ -165,6 +168,15 @@ impl Agent {
             32,
         )?;
         let curated = services.store.relevant_semantic_claims(input, 5)?;
+        let active_db_ids = services.store.active_semantic_claim_ids()?;
+        let challenges = live_challenges(
+            services
+                .store
+                .relevant_assistant_challenges(input, usize::MAX)?,
+            map,
+            &active_db_ids,
+            3,
+        );
         let review_candidates =
             services
                 .store
@@ -199,8 +211,12 @@ impl Agent {
         {
             grounding_evidence = services.store.observation_text(source_id)?;
         }
-        let messages = self.prompt_messages(input, map, &pending, &curated, &review_candidates);
-        let baseline = self.prompt_messages(input, map, &[], &curated, &[]);
+        let mut messages = self.prompt_messages(input, map, &pending, &curated, &review_candidates);
+        let mut baseline = self.prompt_messages(input, map, &[], &curated, &[]);
+        if let Some(challenge) = challenge_message(&challenges) {
+            messages.insert(1, challenge.clone());
+            baseline.insert(1, challenge);
+        }
         let extra_prompt_tokens = backend.additional_prompt_tokens(&baseline, &messages)?;
         let mut answer = backend.chat(&messages, extra_prompt_tokens, show_thinking)?;
         if self
@@ -208,8 +224,13 @@ impl Agent {
             .chunks_exact(2)
             .any(|pair| pair[0].content != input && pair[1].content.trim() == answer.trim())
         {
-            let retry = self.reference_messages(input, map, &pending, &curated, &review_candidates);
-            let retry_baseline = self.reference_messages(input, map, &[], &curated, &[]);
+            let mut retry =
+                self.reference_messages(input, map, &pending, &curated, &review_candidates);
+            let mut retry_baseline = self.reference_messages(input, map, &[], &curated, &[]);
+            if let Some(challenge) = challenge_message(&challenges) {
+                retry.insert(1, challenge.clone());
+                retry_baseline.insert(1, challenge);
+            }
             let extra_retry_tokens = backend.additional_prompt_tokens(&retry_baseline, &retry)?;
             let revised = backend.chat(&retry, extra_retry_tokens, show_thinking)?;
             if !revised.trim().is_empty() {
@@ -266,6 +287,15 @@ impl Agent {
         if let Err(error) = self.save(services.state_path) {
             self.history.truncate(self.history.len() - 2);
             return Err(error);
+        }
+        if let Err(error) =
+            services
+                .store
+                .stage_assistant_reply(&self.conversation_id, self.turn_count(), &answer)
+        {
+            eprintln!("could not queue Curmudgeon audit: {error}");
+        } else if let Some(curator) = services.curator {
+            curator.wake();
         }
         let thinking = backend.take_thinking();
         let research_queued = match backend.research_query(input, &answer) {
@@ -528,6 +558,59 @@ fn grounded_user_reply(input: &str, answer: &str, evidence: Option<&str>) -> Opt
     }
 }
 
+fn challenge_message(challenges: &[StoredAssistantClaim]) -> Option<Message> {
+    if challenges.is_empty() {
+        return None;
+    }
+    let mut content = String::from(
+        "Curmudgeon flagged these earlier assistant assertions as inconsistent with sourced claims. Do not repeat them as facts. A challenge is evidence of inconsistency, not proof of a corrected answer. If relevant, acknowledge uncertainty and cite the compared claim IDs:\n",
+    );
+    for claim in challenges {
+        content.push_str(&format!(
+            "[assistant claim #{}; usable confidence {:.2}] {} — {} — {}; {}; compared with {}\n",
+            claim.id,
+            claim.confidence_after,
+            claim.subject,
+            claim.relation,
+            claim.object,
+            claim.reason,
+            claim.evidence_refs.join(", "),
+        ));
+    }
+    Some(Message {
+        role: "system".into(),
+        content,
+    })
+}
+
+fn live_challenges(
+    challenges: Vec<StoredAssistantClaim>,
+    map: &KnowledgeMap,
+    active_db_ids: &HashSet<i64>,
+    limit: usize,
+) -> Vec<StoredAssistantClaim> {
+    challenges
+        .into_iter()
+        .filter(|challenge| {
+            challenge.evidence_refs.iter().any(|reference| {
+                reference
+                    .strip_prefix("json:")
+                    .and_then(|id| id.parse::<u64>().ok())
+                    .is_some_and(|id| {
+                        map.entries()
+                            .iter()
+                            .any(|claim| claim.id == id && claim.retracted_by.is_none())
+                    })
+                    || reference
+                        .strip_prefix("db:")
+                        .and_then(|id| id.parse::<i64>().ok())
+                        .is_some_and(|id| active_db_ids.contains(&id))
+            })
+        })
+        .take(limit)
+        .collect()
+}
+
 fn is_personal_question(input: &str) -> bool {
     let normalized = input.trim().to_lowercase();
     (normalized.contains('?')
@@ -616,6 +699,102 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::ScholarFinding;
+
+    #[test]
+    fn scholar_claim_reaches_next_prompt_without_changing_model_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "community-scholar-prompt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("learning.db");
+        let adapter = directory.join("adapter.safetensors");
+        let checkpoint = directory.join("model.safetensors");
+        let mut store = LearningStore::open(&database).unwrap();
+        store
+            .enqueue_research("conversation", 1, "photosynthesis")
+            .unwrap();
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        store
+            .finish_scholar_job(
+                &job.id,
+                "Photosynthesis",
+                "https://en.wikipedia.org/wiki/Photosynthesis",
+                "Photosynthesis converts light energy into chemical energy.",
+                Some(ScholarFinding {
+                    subject: "Photosynthesis".into(),
+                    relation: "converts".into(),
+                    object: "light energy into chemical energy".into(),
+                    evidence_text: "Photosynthesis converts light energy into chemical energy."
+                        .into(),
+                    confidence: 0.98,
+                }),
+                None,
+            )
+            .unwrap();
+        drop(store);
+
+        let store = LearningStore::open(&database).unwrap();
+        let claims = store
+            .relevant_semantic_claims("What does photosynthesis convert?", 5)
+            .unwrap();
+        assert_eq!(claims.len(), 1);
+        let agent = Agent {
+            model: "test".into(),
+            history: Vec::new(),
+            conversation_id: "conversation".into(),
+        };
+        let prompt = agent.prompt_messages(
+            "What does photosynthesis convert?",
+            &KnowledgeMap::default(),
+            &[],
+            &claims,
+            &[],
+        );
+        assert!(
+            prompt[1]
+                .content
+                .contains("Photosynthesis — converts — light energy into chemical energy")
+        );
+        assert!(
+            prompt[1]
+                .content
+                .contains("https://en.wikipedia.org/wiki/Photosynthesis")
+        );
+        assert!(!adapter.exists());
+        assert!(!checkpoint.exists());
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retracted_evidence_stops_an_old_challenge_from_entering_prompt() {
+        let mut map = KnowledgeMap::default();
+        let id = map
+            .add("cricket bat", "length", "90cm", "test source")
+            .unwrap();
+        let challenge = StoredAssistantClaim {
+            id: 1,
+            reply_id: "reply".into(),
+            subject: "cricket bat".into(),
+            relation: "length".into(),
+            object: "400m".into(),
+            evidence_text: "A cricket bat is 400m long.".into(),
+            verdict: "challenged".into(),
+            reason: "Magnitude mismatch".into(),
+            evidence_refs: vec![format!("json:{id}")],
+            confidence_before: 0.5,
+            confidence_after: 0.1,
+        };
+        assert_eq!(
+            live_challenges(vec![challenge.clone()], &map, &HashSet::new(), 3).len(),
+            1
+        );
+        map.retract(id, "source withdrawn").unwrap();
+        assert!(live_challenges(vec![challenge], &map, &HashSet::new(), 3).is_empty());
+    }
 
     #[test]
     fn state_round_trip_and_model_boundary() {

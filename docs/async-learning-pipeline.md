@@ -6,6 +6,22 @@ encyclopedia research. It stores sourced findings in SQLite, promotes directly
 supported claims to the same semantic map, and keeps conflicts or unsupported
 claims for review. See the README's Scholar research queue section for commands.
 
+The Curmudgeon extension adds a separate assistant-reply ledger. Reply claims
+remain untrusted; an audit records either a provenance-linked challenge or an
+inconclusive result. SQLite applies the confidence policy after the audit.
+
+Scout reads that ledger and the active map after Curmudgeon's audit. It queues
+one public research gap for Scholar at a time, prioritizing live challenges,
+uncompared assistant claims, and subjects with one known relation. Its SQLite
+record links the trigger to the Scholar job; duplicate topics and rapid repeated
+lookups are suppressed. Scout does not change map claims or verify them itself.
+
+Reviewed SQLite claims can also be consolidated into a versioned Qwen3-0.6B
+checkpoint with `model approve` followed by `model consolidate`. The trainer
+folds an output adapter into a new untied output head in `model.safetensors`
+after a bounded recall probe. The original checkpoint remains available for
+rollback. This operation is explicit; Scout and Scholar do not train weights.
+
 ## Goal
 
 Replace phrase-specific learning with a general path for capturing

@@ -8,8 +8,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 8;
 const PROMOTION_CONFIDENCE: f64 = 0.95;
+const ASSISTANT_BASE_CONFIDENCE: f64 = 0.5;
+const SEVERE_CHALLENGE_MULTIPLIER: f64 = 0.2;
 
 pub struct LearningStore {
     connection: Connection,
@@ -90,6 +92,23 @@ pub struct ScholarJob {
     pub status: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoutInvestigation {
+    pub trigger_kind: String,
+    pub topic_key: String,
+    pub trigger_ref: String,
+    pub question: String,
+    pub scholar_job_id: String,
+}
+
+pub struct ModelConsolidation {
+    pub id: i64,
+    pub claim_id: i64,
+    pub source_checkpoint: String,
+    pub output_checkpoint: String,
+    pub training_loss: f32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScholarFinding {
     pub subject: String,
@@ -112,7 +131,263 @@ pub struct StoredScholarFinding {
     pub decision_reason: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssistantReplyJob {
+    pub id: String,
+    pub reply_text: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssistantClaim {
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub evidence_text: String,
+    pub extraction_confidence: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClaimJudgment {
+    pub claim: AssistantClaim,
+    pub verdict: String,
+    pub challenge_type: Option<String>,
+    pub reason: String,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredAssistantClaim {
+    pub id: i64,
+    pub reply_id: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub evidence_text: String,
+    pub verdict: String,
+    pub reason: String,
+    pub evidence_refs: Vec<String>,
+    pub confidence_before: f64,
+    pub confidence_after: f64,
+}
+
 impl LearningStore {
+    pub fn stage_assistant_reply(
+        &self,
+        conversation_id: &str,
+        turn_number: usize,
+        reply_text: &str,
+    ) -> io::Result<()> {
+        let turn_number =
+            i64::try_from(turn_number).map_err(|_| invalid("turn number too large"))?;
+        self.connection
+            .execute(
+                "INSERT INTO assistant_replies
+             (id, conversation_id, turn_number, reply_text, status, created_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending',
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(conversation_id, turn_number) DO NOTHING",
+                params![conversation_id, turn_number, reply_text],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn claim_assistant_reply(&mut self) -> io::Result<Option<AssistantReplyJob>> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let job = tx.query_row(
+            "SELECT id, reply_text, status FROM assistant_replies
+             WHERE status = 'pending' OR
+               (status = 'processing' AND claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-600 seconds'))
+             ORDER BY created_at, rowid LIMIT 1",
+            [],
+            |row| Ok(AssistantReplyJob { id: row.get(0)?, reply_text: row.get(1)?, status: row.get(2)? }),
+        ).optional().map_err(database_error)?;
+        if let Some(job) = &job {
+            tx.execute(
+                "UPDATE assistant_replies SET status = 'processing',
+                 claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                [&job.id],
+            )
+            .map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(job)
+    }
+
+    pub fn finish_assistant_reply(
+        &mut self,
+        job_id: &str,
+        judgments: &[ClaimJudgment],
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        for judgment in judgments {
+            let confidence_before = ASSISTANT_BASE_CONFIDENCE;
+            let confidence_after = if judgment.verdict == "challenged" {
+                confidence_before * SEVERE_CHALLENGE_MULTIPLIER
+            } else {
+                confidence_before
+            };
+            tx.execute(
+                "INSERT INTO assistant_claims
+                 (reply_id, subject, relation, object, evidence_text, extraction_confidence,
+                  confidence_before, confidence_after, verdict, challenge_type, reason, evidence_refs, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![job_id, judgment.claim.subject, judgment.claim.relation,
+                    judgment.claim.object, judgment.claim.evidence_text,
+                    judgment.claim.extraction_confidence, confidence_before,
+                    confidence_after, judgment.verdict, judgment.challenge_type,
+                    judgment.reason, serde_json::to_string(&judgment.evidence_refs).map_err(invalid_json)?],
+            ).map_err(database_error)?;
+        }
+        let status = if judgments.iter().any(|item| item.verdict == "challenged") {
+            "challenged"
+        } else if judgments.is_empty() {
+            "no_claims"
+        } else {
+            "inconclusive"
+        };
+        let changed = tx
+            .execute(
+                "UPDATE assistant_replies SET status = ?2, claimed_at = NULL, last_error = NULL
+             WHERE id = ?1 AND status = 'processing'",
+                params![job_id, status],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(invalid("assistant reply is not processing"));
+        }
+        tx.commit().map_err(database_error)
+    }
+
+    pub fn hold_assistant_reply(&self, job_id: &str, reason: &str) -> io::Result<()> {
+        self.connection.execute(
+            "UPDATE assistant_replies SET status = 'needs_review', claimed_at = NULL, last_error = ?2
+             WHERE id = ?1 AND status = 'processing'",
+            params![job_id, reason],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn assistant_claims(&self, limit: usize) -> io::Result<Vec<StoredAssistantClaim>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, reply_id, subject, relation, object, evidence_text,
+                    verdict, reason, evidence_refs, confidence_before, confidence_after
+             FROM assistant_claims ORDER BY id DESC LIMIT ?1",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(
+                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
+                read_assistant_claim,
+            )
+            .map_err(database_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
+    }
+
+    pub fn assistant_reply_attention(&self) -> io::Result<Vec<(String, String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, status, COALESCE(last_error, '') FROM assistant_replies
+             WHERE status IN ('pending', 'processing', 'needs_review')
+             ORDER BY created_at DESC LIMIT 20",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn relevant_assistant_challenges(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> io::Result<Vec<StoredAssistantClaim>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let terms = relevant_words(query);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, reply_id, subject, relation, object, evidence_text,
+                    verdict, reason, evidence_refs, confidence_before, confidence_after
+             FROM assistant_claims WHERE verdict = 'challenged'",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], read_assistant_claim)
+            .map_err(database_error)?;
+        let mut claims = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?
+            .into_iter()
+            .filter_map(|claim| {
+                let content = format!("{} {} {}", claim.subject, claim.relation, claim.object);
+                let score = lexical_overlap(&terms, &relevant_words(&content));
+                (score > 0).then_some((score, claim))
+            })
+            .collect::<Vec<_>>();
+        claims.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(claims
+            .into_iter()
+            .take(limit)
+            .map(|(_, claim)| claim)
+            .collect())
+    }
+
+    pub fn active_semantic_claim_ids(&self) -> io::Result<std::collections::HashSet<i64>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM semantic_claims WHERE retracted_by IS NULL")
+            .map_err(database_error)?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<Result<std::collections::HashSet<i64>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn latest_reply_challenges(
+        &self,
+        conversation_id: &str,
+    ) -> io::Result<Vec<StoredAssistantClaim>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.id, c.reply_id, c.subject, c.relation, c.object, c.evidence_text,
+                    c.verdict, c.reason, c.evidence_refs, c.confidence_before, c.confidence_after
+             FROM assistant_claims c WHERE c.verdict = 'challenged' AND c.reply_id = (
+                SELECT id FROM assistant_replies WHERE conversation_id = ?1
+                ORDER BY turn_number DESC LIMIT 1
+             ) ORDER BY c.id",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([conversation_id], read_assistant_claim)
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
     pub fn enqueue_research(
         &self,
         conversation_id: &str,
@@ -127,6 +402,182 @@ impl LearningStore {
             params![conversation_id, i64::try_from(turn_number).map_err(|_| invalid("turn number too large"))?, question],
         ).map_err(database_error)?;
         Ok(())
+    }
+
+    /// Atomically record Scout's reason and enqueue the corresponding Scholar job.
+    /// One question per topic is enough for this first autonomous research pass.
+    pub fn enqueue_scout_research(
+        &mut self,
+        trigger_kind: &str,
+        topic_key: &str,
+        trigger_ref: &str,
+        question: &str,
+    ) -> io::Result<bool> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let recent: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM scout_investigations
+             WHERE created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if recent > 0 {
+            return Ok(false);
+        }
+        let exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scout_investigations
+             WHERE trigger_kind = ?1 AND topic_key = ?2)",
+                params![trigger_kind, topic_key],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if exists {
+            return Ok(false);
+        }
+        let job_id: String = tx
+            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+            .map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO scholar_jobs
+             (id, conversation_id, turn_number, question, status, created_at)
+             VALUES (?1, ?2, 0, ?3, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![job_id, format!("scout:{job_id}"), question],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO scout_investigations
+             (trigger_kind, topic_key, trigger_ref, question, scholar_job_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![trigger_kind, topic_key, trigger_ref, question, job_id],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        Ok(true)
+    }
+
+    pub fn scout_investigations(&self) -> io::Result<Vec<ScoutInvestigation>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT trigger_kind, topic_key, trigger_ref, question, scholar_job_id
+             FROM scout_investigations ORDER BY created_at DESC LIMIT 30",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([], |row| {
+                Ok(ScoutInvestigation {
+                    trigger_kind: row.get(0)?,
+                    topic_key: row.get(1)?,
+                    trigger_ref: row.get(2)?,
+                    question: row.get(3)?,
+                    scholar_job_id: row.get(4)?,
+                })
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn scout_topic_exists(&self, trigger_kind: &str, topic_key: &str) -> io::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scout_investigations
+             WHERE trigger_kind = ?1 AND topic_key = ?2)",
+                params![trigger_kind, topic_key],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn approve_model_claim(&self, claim_id: i64, reason: &str) -> io::Result<()> {
+        if reason.trim().is_empty()
+            || reason.chars().count() > 500
+            || reason.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "model approval needs a printable reason (1 to 500 characters)",
+            ));
+        }
+        let changed = self.connection.execute(
+            "INSERT INTO model_claim_approvals (claim_id, reason, approved_at)
+             SELECT id, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             FROM semantic_claims WHERE id = ?1 AND retracted_by IS NULL
+             ON CONFLICT(claim_id) DO UPDATE SET reason = excluded.reason, approved_at = excluded.approved_at",
+            params![claim_id, reason.trim()],
+        ).map_err(database_error)?;
+        if changed == 0 {
+            return Err(invalid("no active semantic claim with that ID"));
+        }
+        Ok(())
+    }
+
+    pub fn approved_model_claim(&self, claim_id: i64) -> io::Result<SemanticClaim> {
+        self.connection
+            .query_row(
+                "SELECT c.id, c.subject, c.relation, c.object, c.source, c.source_observation_id
+             FROM semantic_claims c JOIN model_claim_approvals a ON a.claim_id = c.id
+             WHERE c.id = ?1 AND c.retracted_by IS NULL",
+                [claim_id],
+                |row| {
+                    Ok(SemanticClaim {
+                        id: row.get(0)?,
+                        subject: row.get(1)?,
+                        relation: row.get(2)?,
+                        object: row.get(3)?,
+                        source: row.get(4)?,
+                        source_observation_id: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| invalid("claim is inactive or has not been approved for model training"))
+    }
+
+    pub fn record_model_consolidation(
+        &self,
+        claim_id: i64,
+        source: &str,
+        output: &str,
+        loss: f32,
+    ) -> io::Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO model_consolidations
+             (claim_id, source_checkpoint, output_checkpoint, training_loss, created_at)
+             VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![claim_id, source, output, loss],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn model_consolidations(&self) -> io::Result<Vec<ModelConsolidation>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, claim_id, source_checkpoint, output_checkpoint, training_loss
+             FROM model_consolidations ORDER BY id DESC LIMIT 30",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([], |row| {
+                Ok(ModelConsolidation {
+                    id: row.get(0)?,
+                    claim_id: row.get(1)?,
+                    source_checkpoint: row.get(2)?,
+                    output_checkpoint: row.get(3)?,
+                    training_loss: row.get(4)?,
+                })
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
     }
 
     pub fn claim_scholar_job(&mut self) -> io::Result<Option<ScholarJob>> {
@@ -1319,6 +1770,92 @@ impl LearningStore {
                 .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 6 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE assistant_replies (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    turn_number INTEGER NOT NULL,
+                    reply_text TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('pending', 'processing', 'challenged', 'inconclusive', 'no_claims', 'needs_review')),
+                    created_at TEXT NOT NULL,
+                    claimed_at TEXT,
+                    last_error TEXT,
+                    UNIQUE(conversation_id, turn_number)
+                );
+                CREATE INDEX assistant_replies_by_status ON assistant_replies(status, created_at);
+                CREATE TABLE assistant_claims (
+                    id INTEGER PRIMARY KEY,
+                    reply_id TEXT NOT NULL REFERENCES assistant_replies(id),
+                    subject TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    object TEXT NOT NULL,
+                    evidence_text TEXT NOT NULL,
+                    extraction_confidence REAL NOT NULL,
+                    confidence_before REAL NOT NULL,
+                    confidence_after REAL NOT NULL,
+                    verdict TEXT NOT NULL CHECK (verdict IN ('challenged', 'inconclusive')),
+                    challenge_type TEXT,
+                    reason TEXT NOT NULL,
+                    evidence_refs TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX assistant_claims_by_reply ON assistant_claims(reply_id);"
+            ).map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 6)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 7 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE scout_investigations (
+                    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('challenged', 'uncertain', 'sparse')),
+                    topic_key TEXT NOT NULL,
+                    trigger_ref TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    scholar_job_id TEXT NOT NULL REFERENCES scholar_jobs(id),
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (trigger_kind, topic_key)
+                );"
+            ).map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 7)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 8 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE model_claim_approvals (
+                    claim_id INTEGER PRIMARY KEY REFERENCES semantic_claims(id),
+                    reason TEXT NOT NULL,
+                    approved_at TEXT NOT NULL
+                );
+                CREATE TABLE model_consolidations (
+                    id INTEGER PRIMARY KEY,
+                    claim_id INTEGER NOT NULL REFERENCES semantic_claims(id),
+                    source_checkpoint TEXT NOT NULL,
+                    output_checkpoint TEXT NOT NULL,
+                    training_loss REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                );",
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 8)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }
@@ -1495,6 +2032,26 @@ fn canonical(value: &str) -> String {
     normalize(value).to_lowercase()
 }
 
+fn read_assistant_claim(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAssistantClaim> {
+    let refs: String = row.get(8)?;
+    let evidence_refs = serde_json::from_str(&refs).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(StoredAssistantClaim {
+        id: row.get(0)?,
+        reply_id: row.get(1)?,
+        subject: row.get(2)?,
+        relation: row.get(3)?,
+        object: row.get(4)?,
+        evidence_text: row.get(5)?,
+        verdict: row.get(6)?,
+        reason: row.get(7)?,
+        evidence_refs,
+        confidence_before: row.get(9)?,
+        confidence_after: row.get(10)?,
+    })
+}
+
 fn evidence_supports_claim(finding: &ScholarFinding) -> bool {
     let evidence = canonical(&finding.evidence_text);
     if !evidence.contains(&canonical(&finding.subject))
@@ -1608,7 +2165,8 @@ fn lexical_overlap(
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateClaim, ImportSummary, LearningStore, ScholarFinding, evidence_supports_claim,
+        AssistantClaim, CandidateClaim, ClaimJudgment, ImportSummary, LearningStore,
+        ScholarFinding, evidence_supports_claim,
     };
     use crate::knowledge::KnowledgeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1621,6 +2179,119 @@ mod tests {
             std::process::id(),
             NEXT_DB.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn assistant_challenge_is_durable_and_policy_reduces_usable_confidence() {
+        let path = temp_path();
+        let mut store = LearningStore::open(&path).unwrap();
+        store
+            .stage_assistant_reply("conversation", 1, "A cricket bat is 400m long.")
+            .unwrap();
+        store
+            .stage_assistant_reply("conversation", 1, "A cricket bat is 400m long.")
+            .unwrap();
+        let job = store.claim_assistant_reply().unwrap().unwrap();
+        assert!(store.claim_assistant_reply().unwrap().is_none());
+        store
+            .finish_assistant_reply(
+                &job.id,
+                &[ClaimJudgment {
+                    claim: AssistantClaim {
+                        subject: "cricket bat".into(),
+                        relation: "length".into(),
+                        object: "400m".into(),
+                        evidence_text: "A cricket bat is 400m long.".into(),
+                        extraction_confidence: 0.8,
+                    },
+                    verdict: "challenged".into(),
+                    challenge_type: Some("magnitude_inconsistency".into()),
+                    reason: "Compared with sourced bat length".into(),
+                    evidence_refs: vec!["db:7".into()],
+                }],
+            )
+            .unwrap();
+        let stored = store.assistant_claims(10).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].confidence_before, 0.5);
+        assert_eq!(stored[0].confidence_after, 0.1);
+        assert_eq!(stored[0].evidence_refs, ["db:7"]);
+        assert_eq!(
+            store
+                .relevant_assistant_challenges("cricket bat length", 5)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.latest_reply_challenges("conversation").unwrap().len(),
+            1
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scout_investigation_and_scholar_job_commit_together_without_duplicates() {
+        let path = temp_path();
+        let mut store = LearningStore::open(&path).unwrap();
+        assert!(
+            store
+                .enqueue_scout_research(
+                    "challenged",
+                    "hagia sophia|height",
+                    "assistant_claim:42",
+                    "What is the height of Hagia Sophia?",
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .enqueue_scout_research(
+                    "challenged",
+                    "hagia sophia|height",
+                    "assistant_claim:43",
+                    "What is the height of Hagia Sophia?",
+                )
+                .unwrap()
+        );
+        let records = store.scout_investigations().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].trigger_ref, "assistant_claim:42");
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        assert_eq!(job.id, records[0].scholar_job_id);
+        assert_eq!(job.question, records[0].question);
+        assert!(store.claim_scholar_job().unwrap().is_none());
+        drop(store);
+        let reopened = LearningStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .scout_topic_exists("challenged", "hagia sophia|height")
+                .unwrap()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn only_active_explicitly_approved_claims_can_train_the_model() {
+        let path = temp_path();
+        let mut map = KnowledgeMap::default();
+        map.add("Auric fern", "has test colour", "violet", "review source")
+            .unwrap();
+        let mut store = LearningStore::open(&path).unwrap();
+        store.import_knowledge(&map).unwrap();
+        assert!(store.approved_model_claim(1).is_err());
+        assert!(store.approve_model_claim(2, "reviewed").is_err());
+        store
+            .approve_model_claim(1, "I checked the source")
+            .unwrap();
+        assert_eq!(store.approved_model_claim(1).unwrap().object, "violet");
+        drop(store);
+        let reopened = LearningStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.approved_model_claim(1).unwrap().subject,
+            "Auric fern"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

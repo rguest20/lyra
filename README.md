@@ -76,6 +76,58 @@ whole web, and Lyra does not use web results to establish personal facts about
 the user. The search phrase is sent to Wikipedia; conversation history stays
 local. Internet access and `curl` are required for the scholar worker.
 
+## Curmudgeon consistency audit
+
+Lyra's replies are now staged separately as **untrusted assistant claims**.
+After a reply, Curmudgeon extracts factual assertions and compares each with
+active sourced claims in both the JSON and SQLite maps. A different value for
+the same subject and relation can raise a cited challenge. For measurements,
+the first check normalizes common length units and challenges gaps of 3× or
+more. Without a directly comparable claim, the result is **inconclusive**, not
+verified. Curmudgeon never promotes its own claims or invents a correction.
+
+The SQLite policy assigns an unverified assistant claim a usable confidence of
+0.50; a severe challenge reduces that to 0.10. These values are experimental
+usage weights, not probabilities of truth. The challenge and comparison claim
+IDs are retained, and relevant challenges are supplied to Lyra on later turns.
+Challenges whose comparison claims have since been retracted are omitted from
+later prompts.
+The current reply is delivered before its background audit finishes.
+
+```sh
+cargo run --release -- curmudgeon
+cargo run --release -- curmudgeon audit "A cricket bat is 400m long."
+cargo run --release -- curmudgeon-once
+```
+
+The `audit` command is for trying deliberately false or unusual statements
+without waiting for Lyra to say them. Curmudgeon can only challenge against
+facts already in the map. The local model may also miss a claim during
+extraction; simple length and height sentences have a deterministic fallback.
+
+## Scout knowledge gaps
+
+Scout runs after Curmudgeon and chooses one public topic for Scholar: first a
+challenged claim, then an assistant claim with no comparable map evidence, then
+a map subject with only one known relation. It asks a neutral question rather
+than treating Lyra's disputed value as a fact. Each investigation records the
+triggering assistant claim or map claim and the resulting Scholar job ID in
+SQLite. The same topic is queued once per trigger type, and Scout spaces new
+jobs by at least five minutes to avoid continuous background research. Personal
+facts such as the user's name or address are excluded from autonomous web
+research.
+
+```sh
+cargo run --release -- scout
+cargo run --release -- scout-once
+cargo run --release -- scholar
+```
+
+`scout-once` selects and queues a question without loading the model or using
+the network. Scholar performs the later lookup. A sparse map is a lead for
+investigation, not evidence that its existing claim is false. Scholar's normal
+source checks and review rules still decide whether a finding enters the map.
+
 ## Update the model
 
 The BF16 checkpoint is an ordinary weight checkpoint. This first training path
@@ -102,6 +154,34 @@ observation context when room remains, and is always bounded by the model's
 context window. If the prompt itself exceeds the supported limit, the app
 reports an error instead of dropping conversation history. Long prompts take
 more memory and time on the Mac.
+
+### Consolidate a reviewed SQLite claim into Qwen3-0.6B
+
+The direct `train` command writes a separate adapter. For a durable model
+checkpoint, approve an active SQLite semantic claim and consolidate it:
+
+```sh
+cargo run --release -- knowledge
+cargo run --release -- model approve 12 "Checked the cited evidence"
+cargo run --release -- model consolidate 12
+cargo run --release -- model history
+COMMUNITY_MODEL_DIR=models/qwen3-0.6b-claim-12-... cargo run --release -- model probe "What is known about the subject?"
+```
+
+Consolidation trains the small output adapter on the approved claim, checks
+that a short probe recalls its value, then folds the learned output weights
+into `lm_head.weight` in a **new** `model.safetensors`. It writes matching
+`config.json` and `tokenizer.json` alongside the new checkpoint. The original
+model directory remains the rollback copy. Set `COMMUNITY_MODEL_DIR` to the
+printed new directory to use it; unset the variable to return to the original.
+The new directory starts with no separate adapter, avoiding a double
+application of the old one. Approval and the source and destination checkpoint
+paths are recorded in SQLite. Claims that are retracted cannot be consolidated.
+
+The recall check covers the training question. It does not establish broad
+generalization or guarantee that later model replies will always use the
+stored fact. SQLite remains the auditable source of truth; the checkpoint is
+a learned copy of one reviewed claim at a time.
 
 ## Edit the knowledge map
 

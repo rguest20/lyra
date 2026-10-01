@@ -11,6 +11,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::storage::LearningStore;
+
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const PAGE: &str = include_str!("../web/index.html");
 
@@ -54,7 +56,13 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
             }
         };
         stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-        match handle_request(&mut stream, &executable, address, &session_state_directory) {
+        match handle_request(
+            &mut stream,
+            &executable,
+            address,
+            &session_state_directory,
+            Path::new(database_path),
+        ) {
             Ok(should_curate) if should_curate => {
                 match Command::new(&executable)
                     .arg("curate-once")
@@ -81,6 +89,7 @@ fn handle_request(
     executable: &std::path::Path,
     address: SocketAddr,
     session_state_directory: &Path,
+    database_path: &Path,
 ) -> io::Result<bool> {
     let request = read_request(stream)?;
     let mut lines = request.split(|byte| *byte == b'\n');
@@ -127,12 +136,49 @@ fn handle_request(
         )?;
         return Ok(false);
     }
-    if method == b"GET" && path == b"/api/ready" {
+    if method == b"GET" && (path == b"/api/ready" || path.starts_with(b"/api/ready?session_id=")) {
+        let mut challenges = Vec::new();
+        if let Some(session_id) = path.strip_prefix(b"/api/ready?session_id=") {
+            let session_id = std::str::from_utf8(session_id).unwrap_or_default();
+            if !valid_session_id(session_id) {
+                respond(
+                    stream,
+                    "400 Bad Request",
+                    "application/json",
+                    br#"{"error":"invalid session ID"}"#,
+                )?;
+                return Ok(false);
+            }
+            let state_path = session_state_directory.join(format!("{session_id}.json"));
+            if state_path.exists() {
+                let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let conversation_id = state["conversation_id"]
+                    .as_str()
+                    .unwrap_or_else(|| state_path.to_str().unwrap_or_default());
+                let store = LearningStore::open(database_path)?;
+                challenges = store.latest_reply_challenges(conversation_id)?;
+            }
+        }
+        let notices = challenges
+            .iter()
+            .map(|claim| {
+                json!({
+                    "subject": claim.subject,
+                    "relation": claim.relation,
+                    "object": claim.object,
+                    "reason": claim.reason,
+                    "evidence_refs": claim.evidence_refs,
+                })
+            })
+            .collect::<Vec<_>>();
         respond(
             stream,
             "200 OK",
             "application/json; charset=utf-8",
-            br#"{"ready":true}"#,
+            &json!({"ready": true, "challenges": notices})
+                .to_string()
+                .into_bytes(),
         )?;
         return Ok(false);
     }
@@ -296,6 +342,7 @@ fn respond(
 #[cfg(test)]
 mod tests {
     use super::{handle_request, read_request, serve, valid_session_id};
+    use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -343,6 +390,7 @@ mod tests {
                 std::path::Path::new("unused"),
                 address,
                 std::path::Path::new("/tmp"),
+                std::path::Path::new("/tmp/unused-learning.db"),
             )
             .unwrap();
         });
@@ -354,6 +402,80 @@ mod tests {
         assert!(response.contains("<title>Community Lab</title>"));
         assert!(response.contains("Show model thinking (debug)"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn ready_endpoint_reports_latest_challenge_for_browser_session() {
+        let unique = format!(
+            "community-web-audit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let session_id = "0123456789abcdef0123456789abcdef";
+        let state_path = directory.join(format!("{session_id}.json"));
+        let conversation_id = format!("{}::conversation:changed", state_path.to_string_lossy());
+        std::fs::write(
+            &state_path,
+            serde_json::json!({"conversation_id": conversation_id}).to_string(),
+        )
+        .unwrap();
+        let db_path = directory.join("learning.db");
+        let mut store = LearningStore::open(&db_path).unwrap();
+        store
+            .stage_assistant_reply(&conversation_id, 1, "A cricket bat is 400m long.")
+            .unwrap();
+        let job = store.claim_assistant_reply().unwrap().unwrap();
+        store
+            .finish_assistant_reply(
+                &job.id,
+                &[ClaimJudgment {
+                    claim: AssistantClaim {
+                        subject: "cricket bat".into(),
+                        relation: "length".into(),
+                        object: "400m".into(),
+                        evidence_text: "A cricket bat is 400m long.".into(),
+                        extraction_confidence: 0.8,
+                    },
+                    verdict: "challenged".into(),
+                    challenge_type: Some("magnitude_inconsistency".into()),
+                    reason: "Conflicts with known bat length".into(),
+                    evidence_refs: vec!["json:1".into()],
+                }],
+            )
+            .unwrap();
+        drop(store);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let directory_for_server = directory.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            handle_request(
+                &mut stream,
+                std::path::Path::new("unused"),
+                address,
+                &directory_for_server,
+                &directory_for_server.join("learning.db"),
+            )
+            .unwrap();
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(
+            client,
+            "GET /api/ready?session_id={session_id} HTTP/1.1\r\nHost: {address}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"ready\":true"));
+        assert!(response.contains("cricket bat"));
+        assert!(response.contains("json:1"));
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

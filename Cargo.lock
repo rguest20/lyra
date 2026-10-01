@@ -237,6 +237,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "rusqlite",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "tokenizers",

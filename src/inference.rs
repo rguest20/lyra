@@ -6,6 +6,10 @@ use candle_transformers::{
     generation::{LogitsProcessor, Sampling},
     models::qwen3::{Config, Model},
 };
+use safetensors::{
+    Dtype, SafeTensors,
+    tensor::{TensorView, serialize_to_file},
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -25,7 +29,8 @@ const PREFILL_CHUNK: usize = 256;
 pub struct LocalModel {
     base: Model,
     fresh_base: Model,
-    embedding: Tensor,
+    output_weight: Tensor,
+    consolidated_head: bool,
     down: Tensor,
     up: Tensor,
     vars: VarMap,
@@ -39,6 +44,16 @@ pub struct LocalModel {
 
 impl LocalModel {
     pub fn load(dir: &Path, adapter_path: &Path, cpu: bool) -> io::Result<Self> {
+        let checkpoint = dir.join("model.safetensors");
+        Self::load_checkpoint(dir, &checkpoint, adapter_path, cpu)
+    }
+
+    pub fn load_checkpoint(
+        dir: &Path,
+        checkpoint: &Path,
+        adapter_path: &Path,
+        cpu: bool,
+    ) -> io::Result<Self> {
         let device = if cpu {
             Device::Cpu
         } else {
@@ -46,28 +61,25 @@ impl LocalModel {
         };
         let config: Config =
             serde_json::from_slice(&fs::read(dir.join("config.json"))?).map_err(other)?;
-        if !config.tie_word_embeddings {
-            return Err(invalid("this backend requires tied Qwen3 embeddings"));
-        }
         let max_context = config.max_position_embeddings;
         let max_prompt = max_context
             .checked_sub(MIN_REPLY)
             .ok_or_else(|| invalid("model context is smaller than the minimum reply reserve"))?;
         // SAFETY: Candle keeps the mapped checkpoint alive through the builder.
-        let weights = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[dir.join("model.safetensors")],
-                DType::BF16,
-                &device,
-            )
-        }
-        .map_err(other)?;
+        let weights =
+            unsafe { VarBuilder::from_mmaped_safetensors(&[checkpoint], DType::BF16, &device) }
+                .map_err(other)?;
         let base = Model::new(&config, weights.clone()).map_err(other)?;
-        let embedding = weights
-            .get(
-                (config.vocab_size, config.hidden_size),
-                "model.embed_tokens.weight",
-            )
+        let output_name = if weights.contains_tensor("lm_head.weight") {
+            "lm_head.weight"
+        } else {
+            if !config.tie_word_embeddings {
+                return Err(invalid("untied checkpoint is missing lm_head.weight"));
+            }
+            "model.embed_tokens.weight"
+        };
+        let output_weight = weights
+            .get((config.vocab_size, config.hidden_size), output_name)
             .map_err(other)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(other)?;
         for token in ["<|im_end|>", "<|endoftext|>"] {
@@ -97,7 +109,8 @@ impl LocalModel {
         Ok(Self {
             base,
             fresh_base,
-            embedding,
+            output_weight,
+            consolidated_head: output_name == "lm_head.weight",
             down,
             up,
             vars,
@@ -125,7 +138,9 @@ impl LocalModel {
 
     fn logits(&self, hidden: &Tensor) -> candle_core::Result<Tensor> {
         let hidden = hidden.squeeze(1)?;
-        let baseline = hidden.matmul(&self.embedding.t()?)?.to_dtype(DType::F32)?;
+        let baseline = hidden
+            .matmul(&self.output_weight.t()?)?
+            .to_dtype(DType::F32)?;
         let delta = hidden
             .to_dtype(DType::F32)?
             .matmul(&self.down)?
@@ -139,11 +154,46 @@ impl LocalModel {
         extra_prompt_tokens: usize,
         show_thinking: bool,
     ) -> io::Result<String> {
-        self.chat_with_reply_cap(messages, extra_prompt_tokens, MAX_REPLY, 0.7, show_thinking)
+        let temperature = if self.consolidated_head { 0.1 } else { 0.7 };
+        self.chat_with_reply_cap(
+            messages,
+            extra_prompt_tokens,
+            MAX_REPLY,
+            temperature,
+            show_thinking,
+        )
     }
 
     pub fn chat_for_extraction(&mut self, messages: &[Message]) -> io::Result<String> {
         self.chat_with_reply_cap(messages, 0, MAX_EXTRACTION_REPLY, 0.1, false)
+    }
+
+    pub fn probe(&mut self, prompt: &str) -> io::Result<String> {
+        let messages = [
+            Message {
+                role: "system".into(),
+                content: "/no_think\nAnswer the question briefly.".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: prompt.into(),
+            },
+        ];
+        self.chat_with_reply_cap(&messages, 0, 80, 0.1, false)
+    }
+
+    pub fn probe_chat(&mut self, prompt: &str) -> io::Result<String> {
+        let messages = [
+            Message {
+                role: "system".into(),
+                content: crate::agent::SYSTEM_PROMPT.into(),
+            },
+            Message {
+                role: "user".into(),
+                content: prompt.into(),
+            },
+        ];
+        self.chat_with_reply_cap(&messages, 0, 128, 0.1, false)
     }
 
     /// Ask the local model whether the latest user message starts a separate
@@ -300,13 +350,22 @@ impl LocalModel {
 
     /// Train the output adapter on one reviewed prompt/answer pair and persist it.
     pub fn train(&mut self, prompt: &str, answer: &str) -> io::Result<(usize, f32)> {
+        self.train_with_system("/no_think", prompt, answer)
+    }
+
+    pub fn train_with_system(
+        &mut self,
+        system: &str,
+        prompt: &str,
+        answer: &str,
+    ) -> io::Result<(usize, f32)> {
         if prompt.trim().is_empty() || answer.trim().is_empty() {
             return Err(invalid("training prompt and answer must be nonempty"));
         }
         let messages = [
             Message {
                 role: "system".into(),
-                content: "/no_think".into(),
+                content: system.into(),
             },
             Message {
                 role: "user".into(),
@@ -375,6 +434,91 @@ impl LocalModel {
         fs::rename(temp, &self.adapter_path)?;
         Ok(result)
     }
+
+    /// Fold the trained output adapter into an independent output head in a
+    /// new checkpoint. The source checkpoint is never modified.
+    pub fn save_merged_checkpoint(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        if destination.exists() {
+            return Err(invalid("destination checkpoint already exists"));
+        }
+        let down = self
+            .down
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(other)?;
+        let up = self
+            .up
+            .flatten_all()
+            .and_then(|tensor| tensor.to_vec1::<f32>())
+            .map_err(other)?;
+        let source_bytes = fs::read(source)?;
+        let tensors = SafeTensors::deserialize(&source_bytes).map_err(other)?;
+        let original_head = tensors
+            .tensor("lm_head.weight")
+            .or_else(|_| tensors.tensor("model.embed_tokens.weight"))
+            .map_err(other)?;
+        if original_head.dtype() != Dtype::BF16 {
+            return Err(invalid("checkpoint output head must be BF16"));
+        }
+        let shape = original_head.shape().to_vec();
+        if shape.len() != 2 {
+            return Err(invalid("checkpoint output head must be a matrix"));
+        }
+        let mut merged = original_head.data().to_vec();
+        merge_output_head(&mut merged, shape[0], shape[1], &down, &up)?;
+        let mut output = tensors
+            .tensors()
+            .into_iter()
+            .filter(|(name, _)| name != "lm_head.weight")
+            .collect::<Vec<_>>();
+        output.push((
+            "lm_head.weight".to_owned(),
+            TensorView::new(Dtype::BF16, shape, &merged).map_err(other)?,
+        ));
+        if let Some(parent) = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let temporary = destination.with_extension("safetensors.tmp");
+        if temporary.exists() {
+            return Err(invalid("temporary checkpoint already exists"));
+        }
+        serialize_to_file(output, None, &temporary).map_err(other)?;
+        fs::rename(temporary, destination)
+    }
+}
+
+fn merge_output_head(
+    head: &mut [u8],
+    vocab: usize,
+    hidden: usize,
+    down: &[f32],
+    up: &[f32],
+) -> io::Result<()> {
+    if head.len() != vocab * hidden * 2 || down.len() != hidden * RANK || up.len() != RANK * vocab {
+        return Err(invalid("adapter and output head shapes do not match"));
+    }
+    for token in 0..vocab {
+        for dimension in 0..hidden {
+            let index = (token * hidden + dimension) * 2;
+            let previous =
+                f32::from_bits((u16::from_le_bytes([head[index], head[index + 1]]) as u32) << 16);
+            let mut delta = 0.0;
+            for rank in 0..RANK {
+                delta += down[dimension * RANK + rank] * up[rank * vocab + token];
+            }
+            let value = previous + delta;
+            if !value.is_finite() {
+                return Err(invalid("merged checkpoint has nonfinite weights"));
+            }
+            let bits = value.to_bits();
+            let rounded = ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16;
+            head[index..index + 2].copy_from_slice(&rounded.to_le_bytes());
+        }
+    }
+    Ok(())
 }
 
 fn obvious_knowledge_gap(question: &str, answer: &str) -> bool {
@@ -485,10 +629,20 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_decision, boundary_messages, format_prompt, obvious_knowledge_gap, reply_budget,
-        split_thinking, visible_reply,
+        boundary_decision, boundary_messages, format_prompt, merge_output_head,
+        obvious_knowledge_gap, reply_budget, split_thinking, visible_reply,
     };
     use crate::agent::Message;
+    #[test]
+    fn adapter_delta_is_folded_into_bf16_output_head() {
+        let mut head = 0x3f80u16.to_le_bytes().to_vec(); // 1.0
+        let mut down = [0.0f32; 8];
+        let mut up = [0.0f32; 8];
+        down[0] = 1.0;
+        up[0] = 0.25;
+        merge_output_head(&mut head, 1, 1, &down, &up).unwrap();
+        assert_eq!(u16::from_le_bytes([head[0], head[1]]), 0x3fa0); // 1.25
+    }
     #[test]
     fn unanswered_public_question_queues_research_without_personal_lookup() {
         assert!(obvious_knowledge_gap(
