@@ -4,6 +4,7 @@ mod curator;
 mod curmudgeon;
 mod inference;
 mod knowledge;
+mod maintenance;
 mod scholar;
 mod scout;
 mod storage;

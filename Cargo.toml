@@ -9,6 +9,7 @@ license = "MIT"
 candle-core = { version = "0.11.0", features = ["metal"] }
 candle-nn = { version = "0.11.0", features = ["metal"] }
 candle-transformers = { version = "0.11.0", features = ["metal"] }
+ctrlc = { version = "3.5", features = ["termination"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 safetensors = "0.8.0"
 sha2 = "0.10"

@@ -48,13 +48,14 @@ Scout now queues challenged claims and claims whose explicit review date has
 passed. Curmudgeon still audits queued assistant replies, not every stored map
 claim.
 
-SQLite schema version 17 stores claim lifecycle, temporal metadata,
+SQLite schema version 18 stores claim lifecycle, temporal metadata,
 role-proposal/policy-decision history, and Scholar source-quality/freshness
 metadata alongside first-class evidence links for Scholar sources and
 user observations. The
 `maintenance` CLI lists active SQLite claims, their review state, due status,
-and linked evidence. It can record a review state or set volatility and the
-next review date. Age alone does not change a claim's status.
+linked evidence, queue health, and the latest recorded maintenance pass. It can
+record a review state or set volatility and the next review date. Age alone
+does not change a claim's status.
 
 Examples:
 

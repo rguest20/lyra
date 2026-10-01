@@ -428,6 +428,59 @@ impl LearningStore {
                 .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 18 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE maintenance_passes (
+                    id INTEGER PRIMARY KEY,
+                    mode TEXT NOT NULL,
+                    worker_pid INTEGER NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('running', 'completed', 'partial_error', 'interrupted')),
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    duration_ms INTEGER
+                 );
+                 CREATE TABLE maintenance_role_runs (
+                    id INTEGER PRIMARY KEY,
+                    pass_id INTEGER NOT NULL REFERENCES maintenance_passes(id) ON DELETE CASCADE,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (status IN ('work', 'idle', 'held', 'error', 'skipped')),
+                    processed INTEGER NOT NULL DEFAULT 0,
+                    detail TEXT,
+                    duration_ms INTEGER,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE INDEX maintenance_role_runs_by_pass ON maintenance_role_runs(pass_id, id);
+                 ALTER TABLE scout_investigations RENAME TO scout_investigations_old;
+                 CREATE TABLE scout_investigations (
+                    id INTEGER PRIMARY KEY,
+                    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('challenged', 'uncertain', 'sparse', 'stale')),
+                    topic_key TEXT NOT NULL,
+                    trigger_ref TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    scholar_job_id TEXT NOT NULL UNIQUE REFERENCES scholar_jobs(id),
+                    selection_reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 INSERT INTO scout_investigations
+                    (trigger_kind, topic_key, trigger_ref, question, scholar_job_id, selection_reason, created_at)
+                 SELECT trigger_kind, topic_key, trigger_ref, question, scholar_job_id,
+                        'Migrated investigation: ' || trigger_kind, created_at
+                 FROM scout_investigations_old;
+                 DROP TABLE scout_investigations_old;
+                 CREATE INDEX scout_investigations_by_topic
+                    ON scout_investigations(trigger_kind, topic_key, id DESC);
+                 CREATE INDEX scout_investigations_by_created
+                    ON scout_investigations(created_at);",
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 18)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

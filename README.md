@@ -34,9 +34,10 @@ cargo run --release -- serve
 
 The server accepts connections only on a loopback address. Each prompt launches
 the existing `say` command as a short-lived process, so its model is unloaded
-after the reply. The server then runs one bounded curation pass before handling
-the next prompt. This lets the curator update SQLite between turns without
-keeping the reply agent loaded. Each browser tab gets a separate conversation
+after the reply. A bounded maintenance subprocess runs after chat activity and
+on an idle timer; the next browser prompt waits for an active pass to finish.
+This lets the roles update SQLite between turns without keeping the reply agent
+loaded. Each browser tab gets a separate conversation
 history under `state/web-sessions/`. Reloading a tab keeps its session; a new
 tab or **Start a new conversation** begins a fresh history. Learned knowledge
 is shared across sessions. The agent also starts a fresh history when you
@@ -60,7 +61,7 @@ adds high confidence, nonconflicting claims to the SQLite semantic map.
 Unsupported, low confidence, and conflicting claims stay in the scholar queue
 for review. A web reply shows when research was
 queued; the lookup runs after the reply and may inform later prompts. In the
-CLI, the background worker checks the queue between turns.
+CLI, the background worker checks the queue between turns and on idle ticks.
 
 ```sh
 cargo run --release -- scholar
@@ -112,8 +113,10 @@ challenged claim, then an assistant claim with no comparable map evidence, then
 a map subject with only one known relation. It asks a neutral question rather
 than treating Lyra's disputed value as a fact. Each investigation records the
 triggering assistant claim or map claim and the resulting Scholar job ID in
-SQLite. The same topic is queued once per trigger type, and Scout spaces new
-jobs by at least five minutes to avoid continuous background research. Personal
+SQLite. Scout records why it selected each gap and spaces new jobs by at least
+five minutes. A topic with no result can be retried after one day; a finding
+held for review can be retried after seven days. Three attempts is the limit.
+Personal
 facts such as the user's name or address are excluded from autonomous web
 research.
 
@@ -129,6 +132,44 @@ investigation, not evidence that its existing claim is false. Scholar's normal
 source checks and review rules still decide whether a finding enters the map.
 For the current architecture and maintenance ideas, see
 [Agentic Semantic Map Maintenance](docs/agentic-map-maintenance.md).
+
+## Autonomous maintenance
+
+Keep `chat` or `serve` running to let Curator, Curmudgeon, Scout, and Scholar
+check for work without another prompt. The default idle interval is 20 seconds.
+Both modes write the last 200 maintenance passes, including each role's work,
+idle, held, skipped, or error outcome, to SQLite. Inspect them with:
+
+```sh
+cargo run --release -- maintenance
+cargo run --release -- maintenance runs 10
+cargo run --release -- scout
+cargo run --release -- scholar
+```
+
+The browser header shows a short upkeep summary. `GET /status` (also
+`/api/status`) returns the latest pass, queue depths and oldest ages, Scout's
+scan cursor, and its priority order as JSON. A pass with an error is recorded
+as `partial_error`; the other roles still run when their budgets allow it.
+The terminal logs role errors to stderr, and `serve` reports background worker
+exits there. Ctrl-C or a termination signal lets `serve` wait for an active
+maintenance subprocess.
+
+Configuration:
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `COMMUNITY_MAINTENANCE_INTERVAL_SECS` | `20` | Idle interval, 1–3600 seconds. |
+| `COMMUNITY_MAINTENANCE_MAX_MS` | `120000` | Time budget checked between roles, 1000–600000 ms. It does not interrupt a model call already running. |
+| `COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` | `6` | Maximum inference jobs admitted per pass, 1–16. |
+| `COMMUNITY_AUTONOMOUS_RESEARCH` | on | Set to `off` or `0` to skip automatic Scout and Scholar work while local curation and audits continue. |
+| `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 0–200. |
+
+Autonomous research currently contacts only English Wikipedia through the
+MediaWiki API. Scholar uses its source and review rules before a claim enters
+the map; personal facts are excluded. Model checkpoint training and approval
+remain manual. See [Autonomous Knowledge Maintenance](docs/autonomous-knowledge-maintenance.md)
+for the implementation and verification details.
 
 ## Update the model
 

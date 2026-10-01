@@ -1,6 +1,6 @@
 # Autonomous Knowledge Maintenance
 
-**Status:** core loop is implemented; reliability and visibility work remains
+**Status:** implemented and verified (SQLite schema 18)
 
 This document describes what happens after Community starts, what the current
 autonomous loop can change, and the remaining work to make unattended
@@ -33,70 +33,100 @@ still requires explicit approval and a separate command. Existing Scholar
 policy also holds unsupported or consequential claims for review rather than
 promoting them automatically.
 
-## What is still needed
+## Implemented controls
 
-The roles and scheduler exist, so the next work should make the loop observable,
-recoverable, configurable, and demonstrably safe. It should not add another
-agent merely to coordinate the existing ones.
+The roles share one recorded pass runner. A failed role is recorded and later
+roles still run when their budgets allow it. No extra coordinating agent is
+needed for these scheduling decisions.
 
 ### 1. Make maintenance status visible
 
-- [ ] Show the last pass time, duration, and per-role outcome (work completed,
+- [x] Show the last pass time, duration, and per-role outcome (work completed,
   no work, held for review, or error).
-- [ ] Show queue depth and oldest-item age for Curator, Scout, and Scholar.
-- [ ] Surface this status through `maintenance` and a small `/status` response
+- [x] Show queue depth and oldest-item age for Curator, Scout, and Scholar.
+- [x] Surface this status through `maintenance` and a small `/status` response
   in the web UI.
-- [ ] Keep a bounded run history in SQLite so a restart does not erase the
+- [x] Keep a bounded run history in SQLite so a restart does not erase the
   operational record.
 
 **Acceptance:** after an idle tick, status distinguishes “checked and found no
 work” from “did not run”; a failed role includes a useful error and does not
 hide successful work by other roles.
 
+`maintenance runs [LIMIT]` shows past passes. The browser header summarizes
+the latest pass, and `/status` (also `/api/status`) returns its full JSON view.
+The last 200 completed or interrupted passes are retained. Scout's queue count
+is the number of challenged or due claims available for consideration; its
+rotating scan cursor and priority order are shown separately.
+
 ### 2. Make the scheduler resilient
 
-- [ ] Record a pass before starting work and its completion state afterward.
-- [ ] Ensure a failed role does not prevent later roles from running.
-- [ ] Verify expired leases are reclaimed after a process crash and that retry
+- [x] Record a pass before starting work and its completion state afterward.
+- [x] Ensure a failed role does not prevent later roles from running.
+- [x] Verify expired leases are reclaimed after a process crash and that retry
   behavior does not create duplicate claims or Scholar jobs.
-- [ ] Add a configurable per-pass time or inference budget as well as the
+- [x] Add a configurable per-pass time or inference budget as well as the
   existing item-count bounds.
-- [ ] Avoid launching overlapping maintenance subprocesses in `serve`; make
+- [x] Avoid launching overlapping maintenance subprocesses in `serve`; make
   shutdown wait for or safely stop an active pass.
 
 **Acceptance:** killing a worker mid-pass leaves queued work recoverable, and
 repeating a pass cannot duplicate its durable effects.
 
+`serve` coalesces pending wakeups while one worker runs and waits for that
+worker on Ctrl-C or termination. A worker that exits unexpectedly is marked interrupted by
+its process ID; stale running passes are shown as interrupted after ten
+minutes. SQLite leases reclaim unfinished observation, assistant-audit, and
+Scholar jobs. The time budget is checked between roles; a model call already
+running is allowed to finish. The default inference budget admits six jobs
+per pass: up to four Curator observations, one audit, and one Scholar job.
+
 ### 3. Make autonomous exploration deliberate
 
-- [ ] Keep Scout's rotating bounded scan and priority order visible in status.
-- [ ] Record why each gap was selected and avoid repeatedly researching the
+- [x] Keep Scout's rotating bounded scan and priority order visible in status.
+- [x] Record why each gap was selected and avoid repeatedly researching the
   same unresolved gap when previous searches found no usable evidence.
-- [ ] Add a cooldown or retry policy for gaps with no result, stale sources, or
+- [x] Add a cooldown or retry policy for gaps with no result, stale sources, or
   already-open Scholar work.
-- [ ] Define practical limits for research volume, network access, and source
+- [x] Define practical limits for research volume, network access, and source
   domains; preserve a way to disable external research while leaving local
   maintenance enabled.
 
 **Acceptance:** a seeded sparse map eventually produces a focused Scholar job;
 an unanswered or repeatedly unsupported gap does not cause a request loop.
 
+Each Scout attempt keeps its own reason and Scholar job. Pending or processing
+jobs block another attempt. A `no_result` waits one day; a finding held for
+review, including stale evidence, waits seven days. A promoted topic is done,
+and any topic stops after three attempts. Scout also spaces investigations by
+five minutes and accepts at most 20 per rolling day by default. Automatic
+Scout and Scholar work can be disabled with `COMMUNITY_AUTONOMOUS_RESEARCH=off`.
+The sole network provider remains English Wikipedia, with article URLs checked
+against that domain before extraction.
+
 ### 4. Verify the whole loop end to end
 
-- [ ] Add an integration test that seeds a sparse or challenged claim, runs a
+- [x] Add an integration test that seeds a sparse or challenged claim, runs a
   maintenance pass, and verifies Scout's job and Scholar's resulting evidence
   or held finding.
-- [ ] Test that unsupported, stale, conflicting, and consequential findings
+- [x] Test that unsupported, stale, conflicting, and consequential findings
   remain held or challenged according to policy.
-- [ ] Test both `chat` and `serve` scheduling paths with a short test interval
+- [x] Test both `chat` and `serve` scheduling paths with a short test interval
   and no user message after startup.
-- [ ] Document the expected startup mode, environment settings, logs, and
+- [x] Document the expected startup mode, environment settings, logs, and
   commands for inspecting and reviewing the resulting claims.
 
 **Acceptance:** the test suite proves that unattended ticks can discover and
 research a map gap, while existing evidence gates still control promotion.
 
-## Suggested order
+The integration test runs the real Scout selector and a local Scholar fixture
+without network access. Existing Scholar policy tests cover unsupported,
+stale, conflicting, and consequential findings. Live smoke checks observed two
+completed `chat` passes without input and a `serve` pass after one idle second;
+the latter exposed its error in `/status` when given a missing model and exited
+cleanly on Ctrl-C. A live Wikipedia lookup was not part of the smoke test.
+
+## Implementation order followed
 
 1. Add maintenance run status and persisted pass history.
 2. Harden retries, lease recovery, and subprocess shutdown.
@@ -118,7 +148,16 @@ cargo run --release -- serve
 ```
 
 Keep the selected process running. To inspect current work and claim state, use
-`cargo run --release -- maintenance`; to inspect queued investigations, use
-`cargo run --release -- scout`. Use `maintenance resolve` or
+`cargo run --release -- maintenance`; use `maintenance runs 10` for pass history
+and `cargo run --release -- scout` for queued investigations. Use
+`maintenance resolve` or
 `maintenance supersede` for explicit claim decisions. The scheduler does not
 approve model-weight consolidation on its own.
+
+Settings: `COMMUNITY_MAINTENANCE_INTERVAL_SECS` defaults to `20` (1–3600);
+`COMMUNITY_MAINTENANCE_MAX_MS` defaults to `120000` (1000–600000);
+`COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` defaults to `6` (1–16);
+`COMMUNITY_MAX_RESEARCH_PER_DAY` defaults to `20` (0–200). The terminal logs
+role errors to stderr; the browser server logs worker exits there and shows
+the latest upkeep state in the page header. See the README for the operator
+commands and settings table.

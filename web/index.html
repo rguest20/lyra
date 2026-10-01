@@ -46,6 +46,7 @@
     <header>
       <h1>Community Lab</h1>
       <p>Each browser tab has its own conversation. New tabs start fresh; learned knowledge is shared.</p>
+      <p id="maintenance-status">Checking knowledge upkeep…</p>
       <button id="new-chat" type="button">Start a new conversation</button>
     </header>
     <section id="messages" aria-live="polite" aria-label="Conversation"></section>
@@ -66,6 +67,7 @@
     const newChat = document.querySelector('#new-chat');
     const status = document.querySelector('#status');
     const showThinking = document.querySelector('#show-thinking');
+    const maintenanceStatus = document.querySelector('#maintenance-status');
     const sessionKey = 'community-session-id';
     function newSessionId() {
       return crypto.randomUUID().replaceAll('-', '');
@@ -95,6 +97,21 @@
       detail.append(summary, content);
       messages.append(detail);
       messages.scrollTop = messages.scrollHeight;
+    }
+
+    async function refreshMaintenance() {
+      try {
+        const response = await fetch('/api/status');
+        if (!response.ok) throw new Error('status unavailable');
+        const upkeep = await response.json();
+        const pass = upkeep.last_pass;
+        const last = pass
+          ? `${pass.status} at ${new Date(pass.started_at).toLocaleTimeString()}`
+          : 'waiting for its first pass';
+        maintenanceStatus.textContent = `Knowledge upkeep: ${last} · Scout ${upkeep.scout.pending} candidate(s) · Scholar ${upkeep.scholar.pending} queued`;
+      } catch {
+        maintenanceStatus.textContent = 'Knowledge upkeep status unavailable';
+      }
     }
 
     form.addEventListener('submit', async event => {
@@ -132,6 +149,7 @@
           addMessage(`Curmudgeon challenged “${challenge.subject} — ${challenge.relation} — ${challenge.object}”. ${challenge.reason} Compared with ${challenge.evidence_refs.join(', ')}.`, 'system-note');
         }
         status.textContent = 'Ready';
+        refreshMaintenance();
       } catch (error) {
         addMessage(error.message, 'error');
         status.textContent = 'Ready';
@@ -157,6 +175,8 @@
       }
     });
     status.textContent = 'Ready';
+    refreshMaintenance();
+    setInterval(refreshMaintenance, 20000);
   </script>
 </body>
 </html>

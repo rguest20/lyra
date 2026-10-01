@@ -21,18 +21,20 @@ pub fn process_once(database_path: &Path, knowledge_path: &Path) -> io::Result<u
     // Advance background coverage on every pass, including passes where an
     // urgent challenged or due claim is handled first.
     let review_batch = store.next_claims_for_maintenance(8)?;
-    if let Some((id, subject, relation, object)) =
-        store.challenged_claim_topics(8)?.into_iter().next()
-    {
+    for (id, subject, relation, object) in store.challenged_claim_topics(8)? {
         let key = format!("claim:{id}");
+        if store.scout_topic_exists("challenged", &key)? {
+            continue;
+        }
         let question = format!(
             "Investigate the unresolved challenge to the claim that {subject} {relation} {object}. Find independent, trustworthy evidence and report whether it supports, contradicts, or qualifies this claim."
         );
-        return Ok(usize::from(store.enqueue_scout_research(
+        return Ok(usize::from(store.enqueue_scout_research_with_reason(
             "challenged",
             &key,
             &format!("db:{id}"),
             &question,
+            "Unresolved challenge on an active map claim",
         )?));
     }
     for (id, subject, relation, object) in store.due_claim_topics(8)? {
@@ -43,11 +45,12 @@ pub fn process_once(database_path: &Path, knowledge_path: &Path) -> io::Result<u
         let question = format!(
             "Find current, trustworthy evidence for whether {subject} {relation} {object} remains accurate. Report evidence that supports or contradicts the claim."
         );
-        return Ok(usize::from(store.enqueue_scout_research(
+        return Ok(usize::from(store.enqueue_scout_research_with_reason(
             "stale",
             &key,
             &format!("db:{id}"),
             &question,
+            "Claim has passed its scheduled review date",
         )?));
     }
     for claim in &review_batch {
@@ -64,11 +67,12 @@ pub fn process_once(database_path: &Path, knowledge_path: &Path) -> io::Result<u
             "Find another trustworthy source or an important missing relation about {}. Existing claim: {} {} {}.",
             claim.subject, claim.subject, claim.relation, claim.object
         );
-        return Ok(usize::from(store.enqueue_scout_research(
+        return Ok(usize::from(store.enqueue_scout_research_with_reason(
             "sparse",
             &key,
             &format!("db:{}", claim.id),
             &question,
+            "Rotating map scan found one relation or sparse evidence",
         )?));
     }
     let active_refs: HashSet<String> = map
@@ -89,11 +93,16 @@ pub fn process_once(database_path: &Path, knowledge_path: &Path) -> io::Result<u
         if store.scout_topic_exists(gap.kind, &gap.key)? {
             continue;
         }
-        return Ok(usize::from(store.enqueue_scout_research(
+        return Ok(usize::from(store.enqueue_scout_research_with_reason(
             gap.kind,
             &gap.key,
             &gap.reference,
             &gap.question,
+            match gap.kind {
+                "challenged" => "Assistant claim conflicts with active evidence",
+                "uncertain" => "Assistant claim lacks comparable map evidence",
+                _ => "Subject has too few known relations",
+            },
         )?));
     }
     Ok(0)

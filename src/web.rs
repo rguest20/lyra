@@ -6,16 +6,20 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::maintenance;
 use crate::storage::LearningStore;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const PAGE: &str = include_str!("../web/index.html");
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static SIGNAL_HANDLER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
 
 #[derive(Deserialize)]
 struct ChatRequest {
@@ -32,6 +36,16 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
             "web server must bind to a loopback address",
         ));
     }
+    let registration = SIGNAL_HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| SHUTDOWN.store(true, Ordering::SeqCst))
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = registration {
+        return Err(io::Error::other(format!(
+            "could not install shutdown handler: {error}"
+        )));
+    }
+    SHUTDOWN.store(false, Ordering::SeqCst);
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
@@ -43,32 +57,47 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
     let mut curator: Option<Child> = None;
-    let interval = maintenance_interval();
+    let mut pending_maintenance = false;
+    let interval = maintenance::interval();
     let mut next_tick = Instant::now() + interval;
 
-    loop {
-        if let Some(mut child) = curator.take() {
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        if let Some(child) = curator.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
                         eprintln!("background maintenance process exited with {status}");
+                        let store = LearningStore::open(Path::new(database_path))?;
+                        store.mark_maintenance_worker_interrupted(child.id())?;
                     }
+                    curator = None;
+                    next_tick = Instant::now() + interval;
                 }
                 Ok(None) => {
-                    curator = Some(child);
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
-                Err(error) => eprintln!("could not poll background maintenance process: {error}"),
+                Err(error) => {
+                    eprintln!("could not poll background maintenance process: {error}");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let store = LearningStore::open(Path::new(database_path))?;
+                    store.mark_maintenance_worker_interrupted(child.id())?;
+                    curator = None;
+                    next_tick = Instant::now() + interval;
+                }
             }
         }
 
-        if Instant::now() >= next_tick {
+        if tick_due(Instant::now(), &mut next_tick, interval) {
+            pending_maintenance = true;
+        }
+        if pending_maintenance && curator.is_none() {
             match spawn_maintenance(&executable, database_path) {
                 Ok(child) => curator = Some(child),
                 Err(error) => eprintln!("could not start scheduled maintenance: {error}"),
             }
-            next_tick = Instant::now() + interval;
+            pending_maintenance = false;
         }
 
         let (mut stream, _) = match listener.accept() {
@@ -91,31 +120,36 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
             Path::new(database_path),
         ) {
             Ok(should_curate) if should_curate => {
-                match spawn_maintenance(&executable, database_path) {
-                    Ok(child) => curator = Some(child),
-                    Err(error) => eprintln!("could not start background curation: {error}"),
-                }
+                pending_maintenance = true;
                 next_tick = Instant::now() + interval;
             }
             Ok(_) => {}
             Err(error) => eprintln!("could not handle web request: {error}"),
         }
     }
+    if let Some(mut child) = curator {
+        let status = child.wait()?;
+        if !status.success() {
+            let store = LearningStore::open(Path::new(database_path))?;
+            store.mark_maintenance_worker_interrupted(child.id())?;
+        }
+    }
+    Ok(())
 }
 
-fn maintenance_interval() -> Duration {
-    let seconds = std::env::var("COMMUNITY_MAINTENANCE_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (1..=3600).contains(value))
-        .unwrap_or(20);
-    Duration::from_secs(seconds)
+fn tick_due(now: Instant, next_tick: &mut Instant, interval: Duration) -> bool {
+    if now < *next_tick {
+        return false;
+    }
+    *next_tick = now + interval;
+    true
 }
 
 fn spawn_maintenance(executable: &Path, database_path: &str) -> io::Result<Child> {
     Command::new(executable)
         .arg("curate-once")
         .env("COMMUNITY_DB", database_path)
+        .env("COMMUNITY_MAINTENANCE_MODE", "serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -172,6 +206,18 @@ fn handle_request(
             "200 OK",
             "text/html; charset=utf-8",
             PAGE.as_bytes(),
+        )?;
+        return Ok(false);
+    }
+    if method == b"GET" && (path == b"/api/status" || path == b"/status") {
+        let store = LearningStore::open(database_path)?;
+        let status = store.maintenance_status()?;
+        respond(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &serde_json::to_vec(&status)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
         )?;
         return Ok(false);
     }
@@ -380,10 +426,20 @@ fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_request, read_request, serve, valid_session_id};
+    use super::{handle_request, read_request, serve, tick_due, valid_session_id};
     use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn browser_maintenance_tick_fires_without_chat_activity() {
+        let now = std::time::Instant::now();
+        let interval = std::time::Duration::from_millis(10);
+        let mut next = now + interval;
+        assert!(!tick_due(now, &mut next, interval));
+        assert!(tick_due(now + interval, &mut next, interval));
+        assert!(!tick_due(now + interval, &mut next, interval));
+    }
 
     #[test]
     fn reads_a_json_post_body() {
@@ -441,6 +497,60 @@ mod tests {
         assert!(response.contains("<title>Community Lab</title>"));
         assert!(response.contains("Show model thinking (debug)"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn status_endpoint_distinguishes_no_pass_from_completed_idle_pass() {
+        let directory = std::env::temp_dir().join(format!(
+            "community-web-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("learning.db");
+        let mut store = LearningStore::open(&database_path).unwrap();
+        let status_before = store.maintenance_status().unwrap();
+        assert!(status_before.last_pass.is_none());
+        let pass_id = store.start_maintenance_pass("serve").unwrap();
+        for role in ["curator", "curmudgeon", "scout", "scholar"] {
+            store
+                .record_maintenance_role(pass_id, role, "idle", 0, None, 0)
+                .unwrap();
+        }
+        store.finish_maintenance_pass(pass_id).unwrap();
+        drop(store);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn({
+            let database_path = database_path.clone();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                handle_request(
+                    &mut stream,
+                    std::path::Path::new("unused"),
+                    address,
+                    std::path::Path::new("/tmp"),
+                    &database_path,
+                )
+                .unwrap();
+            }
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(
+            client,
+            "GET /api/status HTTP/1.1\r\nHost: {address}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"status\":\"completed\""));
+        assert!(response.contains("\"role\":\"scout\""));
+        assert!(response.contains("\"pending\":0"));
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

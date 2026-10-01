@@ -70,21 +70,23 @@ fn scout_investigation_and_scholar_job_commit_together_without_duplicates() {
     let mut store = LearningStore::open(&path).unwrap();
     assert!(
         store
-            .enqueue_scout_research(
+            .enqueue_scout_research_with_reason(
                 "challenged",
                 "hagia sophia|height",
                 "assistant_claim:42",
                 "What is the height of Hagia Sophia?",
+                "Challenged claim",
             )
             .unwrap()
     );
     assert!(
         !store
-            .enqueue_scout_research(
+            .enqueue_scout_research_with_reason(
                 "challenged",
                 "hagia sophia|height",
                 "assistant_claim:43",
                 "What is the height of Hagia Sophia?",
+                "Challenged claim",
             )
             .unwrap()
     );
@@ -102,6 +104,283 @@ fn scout_investigation_and_scholar_job_commit_together_without_duplicates() {
             .scout_topic_exists("challenged", "hagia sophia|height")
             .unwrap()
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn scout_retries_no_result_after_cooldown_and_stops_after_three_attempts() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    for attempt in 0..3 {
+        assert!(
+            store
+                .enqueue_scout_research_with_reason(
+                    "sparse",
+                    "mars",
+                    "db:1",
+                    "Find evidence about Mars",
+                    "Sparse map coverage",
+                )
+                .unwrap()
+        );
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        assert!(store.scout_topic_exists("sparse", "mars").unwrap());
+        store
+            .finish_scholar_job(&job.id, "", "", "", None, Some("no useful result"))
+            .unwrap();
+        assert!(store.scout_topic_exists("sparse", "mars").unwrap());
+        store
+            .connection
+            .execute(
+                "UPDATE scout_investigations SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 days')
+                 WHERE scholar_job_id = ?1",
+                [&job.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.scout_topic_exists("sparse", "mars").unwrap(),
+            attempt == 2
+        );
+    }
+    assert!(
+        !store
+            .enqueue_scout_research_with_reason(
+                "sparse",
+                "mars",
+                "db:1",
+                "Find evidence about Mars",
+                "Sparse map coverage",
+            )
+            .unwrap()
+    );
+    assert_eq!(store.scout_investigations().unwrap().len(), 3);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn scout_holds_reviewed_source_for_a_week_before_retry() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_scout_research_with_reason(
+            "stale",
+            "claim:1",
+            "db:1",
+            "Check current evidence",
+            "Review date passed",
+        )
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    store.hold_scholar_job(&job.id, "source was stale").unwrap();
+    assert!(store.scout_topic_exists("stale", "claim:1").unwrap());
+    store.connection.execute(
+        "UPDATE scout_investigations SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days') WHERE scholar_job_id = ?1",
+        [&job.id],
+    ).unwrap();
+    assert!(!store.scout_topic_exists("stale", "claim:1").unwrap());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn maintenance_history_survives_restart_and_marks_stale_runs_interrupted() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let first = store.start_maintenance_pass("chat").unwrap();
+    store
+        .record_maintenance_role(first, "curator", "idle", 0, None, 1)
+        .unwrap();
+    store
+        .record_maintenance_role(first, "curmudgeon", "error", 0, Some("test failure"), 2)
+        .unwrap();
+    store.finish_maintenance_pass(first).unwrap();
+    let crashed = store.start_maintenance_pass("serve").unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE maintenance_passes SET started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-11 minutes') WHERE id = ?1",
+            [crashed],
+        )
+        .unwrap();
+    drop(store);
+    let mut reopened = LearningStore::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .maintenance_status()
+            .unwrap()
+            .last_pass
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    let next = reopened.start_maintenance_pass("chat").unwrap();
+    reopened.finish_maintenance_pass(next).unwrap();
+    let history = reopened.maintenance_recent_passes(3).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|run| run.status.as_str())
+            .collect::<Vec<_>>(),
+        ["completed", "interrupted", "partial_error"]
+    );
+    assert_eq!(history[2].roles[1].detail.as_deref(), Some("test failure"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn maintenance_pass_history_is_bounded() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    for _ in 0..205 {
+        let pass = store.start_maintenance_pass("once").unwrap();
+        store.finish_maintenance_pass(pass).unwrap();
+    }
+    assert_eq!(store.maintenance_recent_passes(300).unwrap().len(), 200);
+    let count: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM maintenance_passes", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 200);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn failed_worker_process_marks_its_running_pass_interrupted() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let pass = store.start_maintenance_pass("serve").unwrap();
+    store
+        .mark_maintenance_worker_interrupted(std::process::id())
+        .unwrap();
+    assert_eq!(
+        store
+            .maintenance_status()
+            .unwrap()
+            .last_pass
+            .unwrap()
+            .status,
+        "interrupted"
+    );
+    assert!(store.finish_maintenance_pass(pass).is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn version_17_migration_keeps_scout_jobs_and_adds_operational_history() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_scout_research_with_reason(
+            "sparse",
+            "mars",
+            "db:1",
+            "What is Mars?",
+            "Sparse map coverage",
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "DROP TABLE maintenance_role_runs;
+         DROP TABLE maintenance_passes;
+         ALTER TABLE scout_investigations RENAME TO scout_investigations_new;
+         CREATE TABLE scout_investigations (
+             trigger_kind TEXT NOT NULL,
+             topic_key TEXT NOT NULL,
+             trigger_ref TEXT NOT NULL,
+             question TEXT NOT NULL,
+             scholar_job_id TEXT NOT NULL REFERENCES scholar_jobs(id),
+             created_at TEXT NOT NULL,
+             PRIMARY KEY (trigger_kind, topic_key)
+         );
+         INSERT INTO scout_investigations
+             SELECT trigger_kind, topic_key, trigger_ref, question, scholar_job_id, created_at
+             FROM scout_investigations_new;
+         DROP TABLE scout_investigations_new;
+         PRAGMA user_version = 17;",
+        )
+        .unwrap();
+    drop(store);
+    let mut upgraded = LearningStore::open(&path).unwrap();
+    let investigations = upgraded.scout_investigations().unwrap();
+    assert_eq!(investigations.len(), 1);
+    assert_eq!(investigations[0].topic_key, "mars");
+    assert!(investigations[0].selection_reason.contains("Migrated"));
+    let job = upgraded.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(job.id, investigations[0].scholar_job_id);
+    let pass = upgraded.start_maintenance_pass("once").unwrap();
+    upgraded.finish_maintenance_pass(pass).unwrap();
+    assert_eq!(
+        upgraded
+            .maintenance_status()
+            .unwrap()
+            .last_pass
+            .unwrap()
+            .status,
+        "completed"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn expired_scholar_lease_reclaims_once_and_duplicate_finish_rolls_back() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("lease-test", 1, "Mars planet")
+        .unwrap();
+    let first = store.claim_scholar_job().unwrap().unwrap();
+    store.connection.execute(
+        "UPDATE scholar_jobs SET claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-11 minutes') WHERE id = ?1",
+        [&first.id],
+    ).unwrap();
+    let reclaimed = store.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(first.id, reclaimed.id);
+    store
+        .finish_scholar_job(
+            &first.id,
+            "Mars",
+            "https://en.wikipedia.org/wiki/Mars",
+            "Mars is a planet.",
+            Some(ScholarFinding {
+                subject: "Mars".into(),
+                relation: "is a".into(),
+                object: "planet".into(),
+                evidence_text: "Mars is a planet.".into(),
+                confidence: 0.99,
+                valid_from: None,
+                valid_until: None,
+                source_quality: "reference".into(),
+                source_updated_at: None,
+            }),
+            None,
+        )
+        .unwrap();
+    assert!(
+        store
+            .finish_scholar_job(
+                &first.id,
+                "Mars",
+                "https://en.wikipedia.org/wiki/Mars",
+                "Mars is a planet.",
+                Some(ScholarFinding {
+                    subject: "Mars".into(),
+                    relation: "is a".into(),
+                    object: "planet".into(),
+                    evidence_text: "Mars is a planet.".into(),
+                    confidence: 0.99,
+                    valid_from: None,
+                    valid_until: None,
+                    source_quality: "reference".into(),
+                    source_updated_at: None,
+                }),
+                None,
+            )
+            .is_err()
+    );
+    assert_eq!(store.scholar_findings(&first.id).unwrap().len(), 1);
+    assert!(store.claim_scholar_job().unwrap().is_none());
     let _ = std::fs::remove_file(path);
 }
 

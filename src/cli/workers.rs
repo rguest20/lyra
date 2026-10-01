@@ -1,5 +1,5 @@
 use super::Cli;
-use crate::{curator, curmudgeon, inference::LocalModel, scholar, scout, storage};
+use crate::{curmudgeon, inference::LocalModel, maintenance, scholar, scout, storage};
 
 impl Cli {
     pub(super) fn curate_once(&mut self, args: Vec<String>) -> Result<(), String> {
@@ -12,18 +12,25 @@ impl Cli {
         if args.next().is_some() {
             return Err("curate-once takes no arguments".into());
         }
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-            .map_err(|e| format!("could not load local model for curation: {e}"))?;
-        let processed = curator::process_once(&database_path.to_string_lossy(), &mut backend)
-            .map_err(|e| format!("curation failed: {e}"))?;
-        let audited = curmudgeon::process_once(database_path, knowledge_path, &mut backend)
-            .map_err(|e| format!("curmudgeon failed: {e}"))?;
-        let scouted = scout::process_once(database_path, knowledge_path)
-            .map_err(|e| format!("scout failed: {e}"))?;
-        let researched = scholar::process_once(database_path, &mut backend)
-            .map_err(|e| format!("scholar failed: {e}"))?;
+        let mode = if std::env::var("COMMUNITY_MAINTENANCE_MODE").as_deref() == Ok("serve") {
+            "serve"
+        } else {
+            "once"
+        };
+        let mut backend = LocalModel::load(model_dir, adapter_path, cpu).map_err(|error| {
+            let reason = format!("could not load local model for maintenance: {error}");
+            if let Err(record_error) =
+                maintenance::record_startup_failure(database_path, mode, &reason)
+            {
+                return format!("{reason}; could not record failed pass: {record_error}");
+            }
+            reason
+        })?;
+        let summary = maintenance::run_pass(database_path, knowledge_path, &mut backend, mode)
+            .map_err(|e| format!("maintenance failed: {e}"))?;
         println!(
-            "Curated {processed} observation(s); audited {audited} assistant reply/replies; queued {scouted} Scout investigation(s); processed {researched} Scholar job(s)"
+            "Curated {} observation(s); audited {} assistant reply/replies; queued {} Scout investigation(s); processed {} Scholar job(s); {} role error(s)",
+            summary.curated, summary.audited, summary.scouted, summary.researched, summary.errors
         );
         Ok(())
     }

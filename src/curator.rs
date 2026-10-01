@@ -5,20 +5,16 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::agent::Message;
-use crate::curmudgeon;
 use crate::inference::LocalModel;
-use crate::scholar;
-use crate::scout;
+use crate::maintenance;
 use crate::storage::{CandidateClaim, LearningStore, Observation, valid_claim_period};
 
 const LEASE_SECONDS: u64 = 600;
-const DEFAULT_MAINTENANCE_INTERVAL: u64 = 20;
 const MAX_BATCH: usize = 4;
 const MAX_CANDIDATES: usize = 16;
 
@@ -32,12 +28,16 @@ pub struct CuratorHandle {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Process one bounded batch. The web frontend calls this in a short-lived
-/// subprocess after each reply so model memory is available between turns.
-pub fn process_once(database_path: &str, model: &mut LocalModel) -> io::Result<usize> {
+/// Process a bounded batch. The browser invokes this through a short-lived
+/// maintenance subprocess so model memory is available between turns.
+pub fn process_once_limited(
+    database_path: &str,
+    model: &mut LocalModel,
+    limit: usize,
+) -> io::Result<usize> {
     let mut store = LearningStore::open(Path::new(database_path))?;
     let mut processed = 0;
-    for _ in 0..MAX_BATCH {
+    for _ in 0..limit.min(MAX_BATCH) {
         let Some(observation) = store.claim_next_observation(LEASE_SECONDS)? else {
             break;
         };
@@ -116,95 +116,35 @@ fn run(
     model: Arc<Mutex<LocalModel>>,
     receiver: mpsc::Receiver<Command>,
 ) {
-    let mut store = match LearningStore::open(Path::new(&database_path)) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("semantic curator could not open its database: {error}");
-            return;
-        }
-    };
     loop {
-        let mut stopping = false;
-        for _ in 0..MAX_BATCH {
-            if drain_commands(&receiver) {
-                stopping = true;
-                break;
-            }
-            let observation = match store.claim_next_observation(LEASE_SECONDS) {
-                Ok(Some(observation)) => observation,
-                Ok(None) => break,
-                Err(error) => {
-                    eprintln!("semantic curator could not claim an observation: {error}");
-                    break;
-                }
-            };
-            let result = {
-                let mut model = match model.lock() {
-                    Ok(model) => model,
-                    Err(_) => {
-                        let _ = store
-                            .hold_observation(&observation.id, "shared model lock was poisoned");
-                        continue;
-                    }
-                };
-                extract_observation(&mut model, &observation)
-            };
-            match result {
-                Ok(extraction) => {
-                    if let Err(error) = store.finish_extraction(
-                        &observation.id,
-                        &extraction.claims,
-                        extraction.review_reason.as_deref(),
-                    ) {
-                        eprintln!("semantic curator could not save candidates: {error}");
-                        let _ = store.hold_observation(&observation.id, &error.to_string());
-                    }
-                }
-                Err(error) => {
-                    eprintln!(
-                        "semantic curator held observation {}: {error}",
-                        observation.id
-                    );
-                    let _ = store.hold_observation(&observation.id, &error.to_string());
-                }
-            }
-        }
-        if stopping {
+        if drain_commands(&receiver) {
             break;
         }
-
-        if let Ok(mut model) = model.lock() {
-            if let Err(error) = curmudgeon::process_once(
-                Path::new(&database_path),
-                Path::new(&knowledge_path),
-                &mut model,
-            ) {
-                eprintln!("curmudgeon worker failed: {error}");
+        match model.lock() {
+            Ok(mut guard) => {
+                if let Err(error) = maintenance::run_pass(
+                    Path::new(&database_path),
+                    Path::new(&knowledge_path),
+                    &mut guard,
+                    "chat",
+                ) {
+                    eprintln!("semantic maintenance pass failed: {error}");
+                }
             }
-            if let Err(error) =
-                scout::process_once(Path::new(&database_path), Path::new(&knowledge_path))
-            {
-                eprintln!("scout worker failed: {error}");
-            }
-            if let Err(error) = scholar::process_once(Path::new(&database_path), &mut model) {
-                eprintln!("scholar worker failed: {error}");
-            }
+            Err(_) => eprintln!("semantic maintenance model lock was poisoned"),
         }
 
-        match receiver.recv_timeout(maintenance_interval()) {
-            Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        if !wait_for_next_pass(&receiver, maintenance::interval()) {
+            break;
         }
     }
 }
 
-fn maintenance_interval() -> Duration {
-    let seconds = std::env::var("COMMUNITY_MAINTENANCE_INTERVAL_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| (1..=3600).contains(value))
-        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
-    Duration::from_secs(seconds)
+fn wait_for_next_pass(receiver: &mpsc::Receiver<Command>, interval: std::time::Duration) -> bool {
+    matches!(
+        receiver.recv_timeout(interval),
+        Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout)
+    )
 }
 
 fn drain_commands(receiver: &mpsc::Receiver<Command>) -> bool {
@@ -555,10 +495,24 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtractedClaim, contains_reference_pronoun, is_confirmation_response, load_context,
-        parse_response, validate_candidate,
+        Command, ExtractedClaim, contains_reference_pronoun, is_confirmation_response,
+        load_context, parse_response, validate_candidate, wait_for_next_pass,
     };
     use crate::storage::Observation;
+
+    #[test]
+    fn terminal_maintenance_wakes_on_an_idle_interval() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        assert!(wait_for_next_pass(
+            &receiver,
+            std::time::Duration::from_millis(1)
+        ));
+        sender.send(Command::Stop).unwrap();
+        assert!(!wait_for_next_pass(
+            &receiver,
+            std::time::Duration::from_secs(1)
+        ));
+    }
 
     fn observation() -> Observation {
         Observation {

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const PROMOTION_CONFIDENCE: f64 = 0.95;
 const ASSISTANT_BASE_CONFIDENCE: f64 = 0.5;
 const SEVERE_CHALLENGE_MULTIPLIER: f64 = 0.2;
@@ -151,6 +151,44 @@ pub struct ScoutInvestigation {
     pub trigger_ref: String,
     pub question: String,
     pub scholar_job_id: String,
+    pub selection_reason: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MaintenanceRoleRun {
+    pub role: String,
+    pub status: String,
+    pub processed: usize,
+    pub detail: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MaintenancePass {
+    pub id: i64,
+    pub mode: String,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub roles: Vec<MaintenanceRoleRun>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MaintenanceQueue {
+    pub pending: usize,
+    pub oldest_age_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MaintenanceStatus {
+    pub last_pass: Option<MaintenancePass>,
+    pub curator: MaintenanceQueue,
+    pub scout: MaintenanceQueue,
+    pub scholar: MaintenanceQueue,
+    pub scan_cursor: i64,
+    pub scout_priority_order: Vec<&'static str>,
+    pub latest_scout_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +345,7 @@ mod candidate_review;
 mod maintenance;
 mod model_lineage;
 mod observations;
+mod operations;
 mod queries;
 mod research;
 mod schema;

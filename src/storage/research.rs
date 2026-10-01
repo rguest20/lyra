@@ -18,18 +18,21 @@ impl LearningStore {
     }
 
     /// Atomically record Scout's reason and enqueue the corresponding Scholar job.
-    /// One question per topic is enough for this first autonomous research pass.
-    pub fn enqueue_scout_research(
+    pub fn enqueue_scout_research_with_reason(
         &mut self,
         trigger_kind: &str,
         topic_key: &str,
         trigger_ref: &str,
         question: &str,
+        selection_reason: &str,
     ) -> io::Result<bool> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
+        if scout_topic_blocked(&tx, trigger_kind, topic_key)? {
+            return Ok(false);
+        }
         let recent: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM scout_investigations
@@ -41,15 +44,20 @@ impl LearningStore {
         if recent > 0 {
             return Ok(false);
         }
-        let exists: bool = tx
+        let daily: i64 = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM scout_investigations
-             WHERE trigger_kind = ?1 AND topic_key = ?2)",
-                params![trigger_kind, topic_key],
+                "SELECT COUNT(*) FROM scout_investigations
+                 WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')",
+                [],
                 |row| row.get(0),
             )
             .map_err(database_error)?;
-        if exists {
+        let daily_limit = std::env::var("COMMUNITY_MAX_RESEARCH_PER_DAY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value <= 200)
+            .unwrap_or(20);
+        if daily >= i64::try_from(daily_limit).unwrap_or(20) {
             return Ok(false);
         }
         let job_id: String = tx
@@ -64,9 +72,9 @@ impl LearningStore {
         .map_err(database_error)?;
         tx.execute(
             "INSERT INTO scout_investigations
-             (trigger_kind, topic_key, trigger_ref, question, scholar_job_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            params![trigger_kind, topic_key, trigger_ref, question, job_id],
+             (trigger_kind, topic_key, trigger_ref, question, scholar_job_id, selection_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            params![trigger_kind, topic_key, trigger_ref, question, job_id, selection_reason],
         )
         .map_err(database_error)?;
         let evidence_refs = serde_json::to_string(&[trigger_ref]).map_err(invalid_json)?;
@@ -75,6 +83,7 @@ impl LearningStore {
             "topic_key": topic_key,
             "question": question,
             "scholar_job_id": job_id,
+            "selection_reason": selection_reason,
         }))
         .map_err(invalid_json)?;
         let proposal_id = record_role_proposal(
@@ -109,8 +118,8 @@ impl LearningStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT trigger_kind, topic_key, trigger_ref, question, scholar_job_id
-             FROM scout_investigations ORDER BY created_at DESC LIMIT 30",
+                "SELECT trigger_kind, topic_key, trigger_ref, question, scholar_job_id, selection_reason
+             FROM scout_investigations ORDER BY id DESC LIMIT 30",
             )
             .map_err(database_error)?;
         statement
@@ -121,6 +130,7 @@ impl LearningStore {
                     trigger_ref: row.get(2)?,
                     question: row.get(3)?,
                     scholar_job_id: row.get(4)?,
+                    selection_reason: row.get(5)?,
                 })
             })
             .map_err(database_error)?
@@ -129,14 +139,7 @@ impl LearningStore {
     }
 
     pub fn scout_topic_exists(&self, trigger_kind: &str, topic_key: &str) -> io::Result<bool> {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM scout_investigations
-             WHERE trigger_kind = ?1 AND topic_key = ?2)",
-                params![trigger_kind, topic_key],
-                |row| row.get(0),
-            )
-            .map_err(database_error)
+        scout_topic_blocked(&self.connection, trigger_kind, topic_key)
     }
 
     pub fn claim_scholar_job(&mut self) -> io::Result<Option<ScholarJob>> {
@@ -678,4 +681,41 @@ impl LearningStore {
         }
         tx.commit().map_err(database_error)
     }
+}
+
+fn scout_topic_blocked(
+    connection: &Connection,
+    trigger_kind: &str,
+    topic_key: &str,
+) -> io::Result<bool> {
+    let latest: Option<(String, Option<f64>, i64)> = connection
+        .query_row(
+            "SELECT j.status, (julianday('now') - julianday(s.created_at)) * 86400,
+                (SELECT COUNT(*) FROM scout_investigations attempts
+                 WHERE attempts.trigger_kind = s.trigger_kind AND attempts.topic_key = s.topic_key)
+             FROM scout_investigations s JOIN scholar_jobs j ON j.id = s.scholar_job_id
+             WHERE s.trigger_kind = ?1 AND s.topic_key = ?2
+             ORDER BY s.id DESC LIMIT 1",
+            params![trigger_kind, topic_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(match latest {
+        None => false,
+        Some((_, _, attempts)) if attempts >= 3 => true,
+        Some((status, _, _))
+            if matches!(status.as_str(), "pending" | "processing" | "promoted") =>
+        {
+            true
+        }
+        Some((status, age, _)) => {
+            let cooldown_seconds = if status == "no_result" {
+                86_400.0
+            } else {
+                604_800.0
+            };
+            age.is_none_or(|value| value < cooldown_seconds)
+        }
+    })
 }

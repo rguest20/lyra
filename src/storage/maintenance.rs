@@ -137,10 +137,6 @@ impl LearningStore {
              WHERE retracted_by IS NULL AND status IN ('active', 'uncertain', 'challenged')
                AND next_review_at IS NOT NULL
                AND next_review_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               AND NOT EXISTS (
-                   SELECT 1 FROM scout_investigations s
-                   WHERE s.trigger_kind = 'stale' AND s.topic_key = 'claim:' || semantic_claims.id
-               )
              ORDER BY next_review_at, id LIMIT ?1",
             )
             .map_err(database_error)?;
@@ -161,15 +157,14 @@ impl LearningStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
-        let mut statement = self.connection.prepare(
-            "SELECT id, subject, relation, object FROM semantic_claims
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, subject, relation, object FROM semantic_claims
              WHERE retracted_by IS NULL AND status = 'challenged'
-               AND NOT EXISTS (
-                   SELECT 1 FROM scout_investigations s
-                   WHERE s.trigger_kind = 'challenged' AND s.topic_key = 'claim:' || semantic_claims.id
-               )
              ORDER BY id LIMIT ?1",
-        ).map_err(database_error)?;
+            )
+            .map_err(database_error)?;
         statement
             .query_map(
                 [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],

@@ -55,6 +55,36 @@ impl Cli {
         let database_path = &self.database_path;
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         let values = args.collect::<Vec<_>>();
+        if values.first().is_some_and(|value| value == "runs") {
+            if values.len() > 2 {
+                return Err("maintenance runs accepts one optional LIMIT".into());
+            }
+            let limit = values.get(1).map_or(Ok(10usize), |value| {
+                value.parse().map_err(|_| "LIMIT must be an integer")
+            })?;
+            for pass in store
+                .maintenance_recent_passes(limit)
+                .map_err(|e| e.to_string())?
+            {
+                println!(
+                    "Pass #{} [{}; {}] started {}; duration {:?} ms",
+                    pass.id, pass.mode, pass.status, pass.started_at, pass.duration_ms
+                );
+                for role in pass.roles {
+                    println!(
+                        "  {}: {} ({} item(s), {:?} ms){}",
+                        role.role,
+                        role.status,
+                        role.processed,
+                        role.duration_ms,
+                        role.detail
+                            .map(|value| format!(": {value}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            return Ok(());
+        }
         if values.first().is_some_and(|value| value == "history") {
             if values.len() > 2 {
                 return Err("maintenance history accepts one optional LIMIT".into());
@@ -161,7 +191,44 @@ impl Cli {
             return Ok(());
         }
         if !values.is_empty() {
-            return Err("usage: maintenance [history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-]".into());
+            return Err("usage: maintenance [runs [LIMIT] | history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-]".into());
+        }
+        let status = store.maintenance_status().map_err(|e| e.to_string())?;
+        if let Some(pass) = status.last_pass {
+            println!(
+                "Latest maintenance pass #{} [{}; {}] started {}; duration {:?} ms",
+                pass.id, pass.mode, pass.status, pass.started_at, pass.duration_ms
+            );
+            for role in pass.roles {
+                println!(
+                    "  {}: {} ({} item(s)){}",
+                    role.role,
+                    role.status,
+                    role.processed,
+                    role.detail
+                        .map(|value| format!(": {value}"))
+                        .unwrap_or_default()
+                );
+            }
+        } else {
+            println!("Maintenance has not run yet");
+        }
+        println!(
+            "Queues: Curator {} (oldest {:?}s), Scout {} candidate claim(s) (oldest {:?}s), Scholar {} (oldest {:?}s)",
+            status.curator.pending,
+            status.curator.oldest_age_seconds,
+            status.scout.pending,
+            status.scout.oldest_age_seconds,
+            status.scholar.pending,
+            status.scholar.oldest_age_seconds,
+        );
+        println!("Scout scan cursor: db#{}", status.scan_cursor);
+        println!(
+            "Scout priority: {}",
+            status.scout_priority_order.join(" → ")
+        );
+        if let Some(reason) = status.latest_scout_reason {
+            println!("Latest Scout selection: {reason}");
         }
         let work = store.maintenance_work_counts().map_err(|e| e.to_string())?;
         println!(
