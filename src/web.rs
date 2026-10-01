@@ -6,7 +6,8 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
@@ -32,6 +33,7 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         ));
     }
     let listener = TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
     println!("Community web UI: http://{address}");
     let executable = std::env::current_exe()?;
@@ -41,15 +43,40 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
     let mut curator: Option<Child> = None;
+    let interval = maintenance_interval();
+    let mut next_tick = Instant::now() + interval;
 
-    for incoming in listener.incoming() {
-        if let Some(mut child) = curator.take()
-            && let Err(error) = child.wait()
-        {
-            eprintln!("background curation process failed: {error}");
+    loop {
+        if let Some(mut child) = curator.take() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        eprintln!("background maintenance process exited with {status}");
+                    }
+                }
+                Ok(None) => {
+                    curator = Some(child);
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(error) => eprintln!("could not poll background maintenance process: {error}"),
+            }
         }
-        let mut stream = match incoming {
+
+        if Instant::now() >= next_tick {
+            match spawn_maintenance(&executable, database_path) {
+                Ok(child) => curator = Some(child),
+                Err(error) => eprintln!("could not start scheduled maintenance: {error}"),
+            }
+            next_tick = Instant::now() + interval;
+        }
+
+        let (mut stream, _) = match listener.accept() {
             Ok(stream) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(error) => {
                 eprintln!("web request failed: {error}");
                 continue;
@@ -64,23 +91,35 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
             Path::new(database_path),
         ) {
             Ok(should_curate) if should_curate => {
-                match Command::new(&executable)
-                    .arg("curate-once")
-                    .env("COMMUNITY_DB", database_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit())
-                    .spawn()
-                {
+                match spawn_maintenance(&executable, database_path) {
                     Ok(child) => curator = Some(child),
                     Err(error) => eprintln!("could not start background curation: {error}"),
                 }
+                next_tick = Instant::now() + interval;
             }
             Ok(_) => {}
             Err(error) => eprintln!("could not handle web request: {error}"),
         }
     }
-    Ok(())
+}
+
+fn maintenance_interval() -> Duration {
+    let seconds = std::env::var("COMMUNITY_MAINTENANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=3600).contains(value))
+        .unwrap_or(20);
+    Duration::from_secs(seconds)
+}
+
+fn spawn_maintenance(executable: &Path, database_path: &str) -> io::Result<Child> {
+    Command::new(executable)
+        .arg("curate-once")
+        .env("COMMUNITY_DB", database_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
 }
 
 /// Returns true after a chat request, which triggers one curation pass.

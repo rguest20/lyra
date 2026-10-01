@@ -127,6 +127,8 @@ cargo run --release -- scholar
 the network. Scholar performs the later lookup. A sparse map is a lead for
 investigation, not evidence that its existing claim is false. Scholar's normal
 source checks and review rules still decide whether a finding enters the map.
+For the current architecture and maintenance ideas, see
+[Agentic Semantic Map Maintenance](docs/agentic-map-maintenance.md).
 
 ## Update the model
 
@@ -165,6 +167,7 @@ cargo run --release -- knowledge
 cargo run --release -- model approve 12 "Checked the cited evidence"
 cargo run --release -- model consolidate 12
 cargo run --release -- model history
+cargo run --release -- model rebuild 1
 COMMUNITY_MODEL_DIR=models/qwen3-0.6b-claim-12-... cargo run --release -- model probe "What is known about the subject?"
 ```
 
@@ -177,11 +180,15 @@ printed new directory to use it; unset the variable to return to the original.
 The new directory starts with no separate adapter, avoiding a double
 application of the old one. Approval and the source and destination checkpoint
 paths are recorded in SQLite. Claims that are retracted cannot be consolidated.
+Each consolidation writes a manifest with the SHA-256 of its root checkpoint and
+the exact approved claim revisions included. `model rebuild RUN_ID` verifies
+the recorded base and rebuilds from the claims that remain active and approved.
 
 The recall check covers the training question. It does not establish broad
 generalization or guarantee that later model replies will always use the
-stored fact. SQLite remains the auditable source of truth; the checkpoint is
-a learned copy of one reviewed claim at a time.
+stored fact. SQLite remains the auditable source of truth. Each consolidation
+adds one reviewed claim; a later rebuild can replay the recorded claim set
+from its original base checkpoint.
 
 ## Edit the knowledge map
 

@@ -15,7 +15,7 @@ use crate::storage::{
 };
 
 const STATE_VERSION: u64 = 1;
-pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
+pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. For semantic claims, extraction confidence describes only how confidently the extractor mapped text into a claim; it is not truth probability or evidence strength. Source quality is a categorical assessment of the cited source, and freshness describes that source's recency for time-sensitive information; neither alone proves a claim. Claim status controls answer use: active means eligible with source attribution, not verified; uncertain means qualify and seek corroboration; challenged means do not present as established and explain the disagreement if relevant. Treat unknown assessments as unknown, not as strong evidence. User-reported information is evidence of what the user said, not independent verification. Ask a brief confirmation question when the user's intent or a material fact remains unclear. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
@@ -396,16 +396,24 @@ impl Agent {
             .collect::<Vec<_>>();
         if !curated.is_empty() {
             let mut context = String::from(
-                "Relevant curated semantic claims. Sources may be user observations or external pages; cite the source when relying on a claim and do not treat a web page as evidence about the user:\n",
+                "Relevant curated semantic claims. Extraction confidence is about claim extraction only, never truth probability. Source quality is categorical, freshness applies to time-sensitive source material, and claim status controls answer use. Cite the source; do not treat a web page as evidence about the user:\n",
             );
             for claim in curated {
                 context.push_str(&format!(
-                    "#{}: {} — {} — {} [source: {}{}]\n",
+                    "#{} [{}; answer use: {}]: {} — {} — {} [source: {}; source quality: {}; freshness: {}; extraction confidence: {}; valid {:?} to {:?}; checked {:?}{}]\n",
                     claim.id,
+                    claim.status,
+                    claim_answer_use(claim),
                     claim.subject,
                     claim.relation,
                     claim.object,
                     claim.source,
+                    claim.source_quality.as_deref().unwrap_or("unknown"),
+                    claim.freshness.as_deref().unwrap_or("unknown"),
+                    claim.extraction_confidence.map_or_else(|| "unknown".into(), |value| format!("{value:.2} (extractor only)")),
+                    claim.valid_from,
+                    claim.valid_until,
+                    claim.checked_at,
                     claim
                         .source_observation_id
                         .as_deref()
@@ -517,6 +525,15 @@ impl Agent {
         let temporary = path.with_extension("json.tmp");
         fs::write(&temporary, serde_json::to_vec_pretty(&state)?)?;
         fs::rename(temporary, path)
+    }
+}
+
+fn claim_answer_use(claim: &SemanticClaim) -> &'static str {
+    match claim.status.as_str() {
+        "active" => "eligible with attribution",
+        "uncertain" => "qualify and seek corroboration",
+        "challenged" => "do not present as established",
+        _ => "not eligible",
     }
 }
 
@@ -730,6 +747,10 @@ mod tests {
                     evidence_text: "Photosynthesis converts light energy into chemical energy."
                         .into(),
                     confidence: 0.98,
+                    valid_from: None,
+                    valid_until: None,
+                    source_quality: "reference".into(),
+                    source_updated_at: None,
                 }),
                 None,
             )
@@ -762,6 +783,19 @@ mod tests {
             prompt[1]
                 .content
                 .contains("https://en.wikipedia.org/wiki/Photosynthesis")
+        );
+        assert!(prompt[0].content.contains("not truth probability"));
+        assert!(prompt[1].content.contains("source quality: reference"));
+        assert!(prompt[1].content.contains("freshness: not_time_sensitive"));
+        assert!(
+            prompt[1]
+                .content
+                .contains("extraction confidence: 0.98 (extractor only)")
+        );
+        assert!(
+            prompt[1]
+                .content
+                .contains("answer use: eligible with attribution")
         );
         assert!(!adapter.exists());
         assert!(!checkpoint.exists());
@@ -863,6 +897,7 @@ mod tests {
             object: "Ryan".into(),
             source: "user observation abc".into(),
             source_observation_id: Some("abc".into()),
+            ..SemanticClaim::default()
         };
         let messages = agent.prompt_messages(
             "Do you know my name?",
@@ -893,6 +928,8 @@ mod tests {
             status: "needs_review".into(),
             decision_reason: Some("extractor omitted confidence".into()),
             semantic_claim_id: None,
+            valid_from: None,
+            valid_until: None,
         };
         let messages = agent.prompt_messages(
             "Do you know my name?",

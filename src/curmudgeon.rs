@@ -19,6 +19,8 @@ struct ReferenceClaim {
     subject: String,
     relation: String,
     object: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +50,7 @@ pub fn process_once(
     let result = (|| {
         let claims = extract_claims(model, &job.reply_text)?;
         let map = KnowledgeMap::load(knowledge_path)?;
+        let today = store.utc_date()?;
         let mut references = map
             .entries()
             .iter()
@@ -57,16 +60,42 @@ pub fn process_once(
                 subject: claim.subject.clone(),
                 relation: claim.relation.clone(),
                 object: claim.object.clone(),
+                valid_from: None,
+                valid_until: None,
             })
             .collect::<Vec<_>>();
-        references.extend(store.active_semantic_claims()?.into_iter().map(|detail| {
-            ReferenceClaim {
-                id: format!("db:{}", detail.claim.id),
-                subject: detail.claim.subject,
-                relation: detail.claim.relation,
-                object: detail.claim.object,
-            }
-        }));
+        references.extend(
+            store
+                .active_semantic_claims()?
+                .into_iter()
+                .filter(|detail| {
+                    detail
+                        .claim
+                        .valid_from
+                        .as_deref()
+                        .is_none_or(|from| from <= today.as_str())
+                        && detail
+                            .claim
+                            .valid_until
+                            .as_deref()
+                            .is_none_or(|until| until >= today.as_str())
+                })
+                .map(|detail| ReferenceClaim {
+                    id: format!("db:{}", detail.claim.id),
+                    subject: detail.claim.subject,
+                    relation: detail.claim.relation,
+                    object: detail.claim.object,
+                    valid_from: detail.claim.valid_from,
+                    valid_until: detail.claim.valid_until,
+                }),
+        );
+        references.retain(|claim| {
+            is_current_on(
+                claim.valid_from.as_deref(),
+                claim.valid_until.as_deref(),
+                &today,
+            )
+        });
         Ok::<_, io::Error>(
             claims
                 .iter()
@@ -270,6 +299,10 @@ fn judge(claim: &AssistantClaim, references: &[ReferenceClaim]) -> ClaimJudgment
     }
 }
 
+fn is_current_on(valid_from: Option<&str>, valid_until: Option<&str>, today: &str) -> bool {
+    valid_from.is_none_or(|from| from <= today) && valid_until.is_none_or(|until| until >= today)
+}
+
 fn measurement(text: &str) -> Option<(f64, &'static str)> {
     let lower = text.trim().to_lowercase();
     let split_at = lower.find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))?;
@@ -322,7 +355,26 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{AssistantClaim, ReferenceClaim, fallback_measurement_claims, judge, measurement};
+    use super::{
+        AssistantClaim, ReferenceClaim, fallback_measurement_claims, is_current_on, judge,
+        measurement,
+    };
+
+    #[test]
+    fn map_claims_outside_the_current_validity_period_are_not_conflict_evidence() {
+        assert!(!is_current_on(
+            Some("2000-01-01"),
+            Some("2010-12-31"),
+            "2026-10-01"
+        ));
+        assert!(!is_current_on(Some("2027-01-01"), None, "2026-10-01"));
+        assert!(is_current_on(
+            Some("2020-01-01"),
+            Some("2030-01-01"),
+            "2026-10-01"
+        ));
+        assert!(is_current_on(None, None, "2026-10-01"));
+    }
 
     fn claim(subject: &str, relation: &str, object: &str) -> AssistantClaim {
         AssistantClaim {
@@ -339,6 +391,8 @@ mod tests {
             subject: subject.into(),
             relation: relation.into(),
             object: object.into(),
+            valid_from: None,
+            valid_until: None,
         }
     }
 

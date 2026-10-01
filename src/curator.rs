@@ -15,10 +15,10 @@ use crate::curmudgeon;
 use crate::inference::LocalModel;
 use crate::scholar;
 use crate::scout;
-use crate::storage::{CandidateClaim, LearningStore, Observation};
+use crate::storage::{CandidateClaim, LearningStore, Observation, valid_claim_period};
 
 const LEASE_SECONDS: u64 = 600;
-const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+const DEFAULT_MAINTENANCE_INTERVAL: u64 = 20;
 const MAX_BATCH: usize = 4;
 const MAX_CANDIDATES: usize = 16;
 
@@ -191,11 +191,20 @@ fn run(
             }
         }
 
-        match receiver.recv_timeout(IDLE_SCAN_INTERVAL) {
+        match receiver.recv_timeout(maintenance_interval()) {
             Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn maintenance_interval() -> Duration {
+    let seconds = std::env::var("COMMUNITY_MAINTENANCE_INTERVAL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=3600).contains(value))
+        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
+    Duration::from_secs(seconds)
 }
 
 fn drain_commands(receiver: &mpsc::Receiver<Command>) -> bool {
@@ -235,6 +244,10 @@ fn extract_observation(
                 "/no_think\nExtract every explicit factual claim asserted by the user in the final observation, including claims about the user. Do not skip first-person statements. Examples: `I am Ryan` -> subject `the user`, relation `is named`, object `Ryan`, evidence_text `I am Ryan`; `I live in Bristol` -> subject `the user`, relation `lives in`, object `Bristol`, evidence_text `I live in Bristol`; `I prefer tea` -> subject `the user`, relation `prefers`, object `tea`, evidence_text `I prefer tea`. These examples show the general transformation; use open relation text for other claims. If the final observation is an affirmative confirmation (such as `yes`, `that's right`, or `correct`) to the immediately preceding assistant message explicitly asking the user to confirm a user fact, extract that confirmed fact too. Use the exact confirmation as evidence_text, cite the relevant available user and assistant context IDs, and explain the confirmation in resolution. Do not infer confirmation from an unrelated yes/no question or from an assistant assertion without a direct confirmation request. Return strict JSON exactly shaped like {{\"claims\":[{{\"subject\":\"...\",\"relation\":\"...\",\"object\":\"...\",\"confidence\":0.0,\"evidence_text\":\"exact substring from the final observation\",\"context_message_ids\":[],\"resolution\":null}}],\"review_reason\":null}}. Include every field, especially confidence, for each claim. Do not infer plausible facts. Do not treat earlier assistant statements as evidence; use earlier messages only to resolve an unambiguous reference in the user observation. If a factual claim appears intended but is ambiguous or cannot be resolved, set review_reason to a short explanation. For ordinary messages with no factual claim, return an empty claims array and null review_reason. Available context IDs: {}. Return no markdown or commentary.",
                 available_ids.join(", ")
             ),
+        },
+        Message {
+            role: "system".into(),
+            content: "/no_think\nFor each claim, also return valid_from and valid_until as ISO YYYY-MM-DD only when the exact date appears in the final user observation. Set both to null when the claim has no explicitly stated validity period. Do not infer that an old or current user fact continues beyond what they said.".into(),
         },
         Message {
             role: "user".into(),
@@ -295,6 +308,10 @@ struct ExtractedClaim {
     resolution: Option<String>,
     #[serde(default)]
     confidence: f64,
+    #[serde(default)]
+    valid_from: Option<String>,
+    #[serde(default)]
+    valid_until: Option<String>,
 }
 
 fn parse_response(reply: &str) -> io::Result<ExtractionResponse> {
@@ -318,6 +335,16 @@ fn validate_candidate(
     }
     let invalid_evidence = candidate.evidence_text.is_empty()
         || !observation.raw_text.contains(&candidate.evidence_text);
+    let invalid_period = !valid_claim_period(
+        candidate.valid_from.as_deref(),
+        candidate.valid_until.as_deref(),
+    ) || [
+        candidate.valid_from.as_deref(),
+        candidate.valid_until.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|date| !observation.raw_text.contains(date));
     let evidence_text = if invalid_evidence {
         observation.raw_text.chars().take(500).collect()
     } else {
@@ -348,6 +375,11 @@ fn validate_candidate(
                 "extractor evidence was not an exact source span; stored source excerpt for review",
             ),
         )
+    } else if invalid_period {
+        (
+            "needs_review",
+            Some("claim dates are invalid or not explicit in the observation"),
+        )
     } else if candidate.confidence < 0.80 {
         ("needs_review", Some("extractor confidence below 0.80"))
     } else if !known_context {
@@ -367,6 +399,8 @@ fn validate_candidate(
         confidence: candidate.confidence,
         status: status.into(),
         decision_reason: reason.map(str::to_owned),
+        valid_from: candidate.valid_from,
+        valid_until: candidate.valid_until,
     })
 }
 
@@ -564,6 +598,8 @@ mod tests {
             context_message_ids: Vec::new(),
             resolution: None,
             confidence: 0.99,
+            valid_from: None,
+            valid_until: None,
         };
         let claim = validate_candidate(bad_evidence, &observation(), &[]).unwrap();
         assert_eq!(claim.status, "needs_review");
@@ -577,6 +613,8 @@ mod tests {
             context_message_ids: Vec::new(),
             resolution: None,
             confidence: 0.99,
+            valid_from: None,
+            valid_until: None,
         };
         let claim = validate_candidate(unresolved, &observation(), &[]).unwrap();
         assert_eq!(claim.status, "needs_review");
@@ -598,6 +636,8 @@ mod tests {
             context_message_ids,
             resolution: resolution.map(str::to_owned),
             confidence: 0.99,
+            valid_from: None,
+            valid_until: None,
         };
         let unsupported = validate_candidate(
             claim(vec!["turn:2:user".into()], Some("Confirms location.")),

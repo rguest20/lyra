@@ -18,20 +18,73 @@ struct Gap {
 pub fn process_once(database_path: &Path, knowledge_path: &Path) -> io::Result<usize> {
     let mut store = LearningStore::open(database_path)?;
     let map = KnowledgeMap::load(knowledge_path)?;
-    let db_claims = store.active_semantic_claims()?;
+    // Advance background coverage on every pass, including passes where an
+    // urgent challenged or due claim is handled first.
+    let review_batch = store.next_claims_for_maintenance(8)?;
+    if let Some((id, subject, relation, object)) =
+        store.challenged_claim_topics(8)?.into_iter().next()
+    {
+        let key = format!("claim:{id}");
+        let question = format!(
+            "Investigate the unresolved challenge to the claim that {subject} {relation} {object}. Find independent, trustworthy evidence and report whether it supports, contradicts, or qualifies this claim."
+        );
+        return Ok(usize::from(store.enqueue_scout_research(
+            "challenged",
+            &key,
+            &format!("db:{id}"),
+            &question,
+        )?));
+    }
+    for (id, subject, relation, object) in store.due_claim_topics(8)? {
+        let key = format!("claim:{id}");
+        if store.scout_topic_exists("stale", &key)? {
+            continue;
+        }
+        let question = format!(
+            "Find current, trustworthy evidence for whether {subject} {relation} {object} remains accurate. Report evidence that supports or contradicts the claim."
+        );
+        return Ok(usize::from(store.enqueue_scout_research(
+            "stale",
+            &key,
+            &format!("db:{id}"),
+            &question,
+        )?));
+    }
+    for claim in &review_batch {
+        if !public_topic(&claim.subject, &claim.relation)
+            || (claim.relation_count > 1 && claim.evidence_count >= 2)
+        {
+            continue;
+        }
+        let key = format!("claim:{}", claim.id);
+        if store.scout_topic_exists("sparse", &key)? {
+            continue;
+        }
+        let question = format!(
+            "Find another trustworthy source or an important missing relation about {}. Existing claim: {} {} {}.",
+            claim.subject, claim.subject, claim.relation, claim.object
+        );
+        return Ok(usize::from(store.enqueue_scout_research(
+            "sparse",
+            &key,
+            &format!("db:{}", claim.id),
+            &question,
+        )?));
+    }
     let active_refs: HashSet<String> = map
         .entries()
         .iter()
         .filter(|claim| claim.retracted_by.is_none())
         .map(|claim| format!("json:{}", claim.id))
         .chain(
-            db_claims
-                .iter()
-                .map(|detail| format!("db:{}", detail.claim.id)),
+            store
+                .active_semantic_claim_ids()?
+                .into_iter()
+                .map(|id| format!("db:{id}")),
         )
         .collect();
     let assistant_claims = store.assistant_claims(500)?;
-    let gaps = select_gaps(&assistant_claims, &map, &db_claims, &active_refs);
+    let gaps = select_gaps(&assistant_claims, &map, &[], &active_refs);
     for gap in gaps {
         if store.scout_topic_exists(gap.kind, &gap.key)? {
             continue;
@@ -217,6 +270,7 @@ mod tests {
                     object: "Istanbul".into(),
                     source: "source".into(),
                     source_observation_id: None,
+                    ..SemanticClaim::default()
                 },
                 sources: vec![],
             },
@@ -228,6 +282,7 @@ mod tests {
                     object: "sport".into(),
                     source: "source".into(),
                     source_observation_id: None,
+                    ..SemanticClaim::default()
                 },
                 sources: vec![],
             },
@@ -239,6 +294,7 @@ mod tests {
                     object: "bat".into(),
                     source: "source".into(),
                     source_observation_id: None,
+                    ..SemanticClaim::default()
                 },
                 sources: vec![],
             },
