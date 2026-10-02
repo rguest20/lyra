@@ -48,7 +48,7 @@ Scout now queues challenged claims and claims whose explicit review date has
 passed. Curmudgeon still audits queued assistant replies, not every stored map
 claim.
 
-SQLite schema version 18 stores claim lifecycle, temporal metadata,
+SQLite schema version 19 stores claim lifecycle, temporal metadata,
 role-proposal/policy-decision history, and Scholar source-quality/freshness
 metadata alongside first-class evidence links for Scholar sources and
 user observations. The

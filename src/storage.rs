@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const PROMOTION_CONFIDENCE: f64 = 0.95;
 const ASSISTANT_BASE_CONFIDENCE: f64 = 0.5;
 const SEVERE_CHALLENGE_MULTIPLIER: f64 = 0.2;

@@ -252,6 +252,33 @@ impl LocalModel {
             .map(str::to_owned))
     }
 
+    pub fn scout_question(
+        &mut self,
+        subject: &str,
+        known_claims: &[String],
+        previous_questions: &[String],
+    ) -> io::Result<String> {
+        let messages = [
+            Message {
+                role: "system".into(),
+                content: "/no_think\nYou are checking encyclopedia claims for one concrete missing detail. Write one focused factual research question whose answer would add a new fact about the named subject. Use the known claims as clues, but do not assume unstated details are true. Do not ask about a detail already answered in the known claims or repeat previous questions. Avoid broad questions such as 'What are the key facts?' or 'What is it?'. The question must name the subject. Return only QUESTION: followed by the question, with no explanation. Example: subject 'Chicken soup', known summary 'usually with various other ingredients' -> QUESTION: What other ingredients are commonly used in chicken soup?".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: format!(
+                    "Subject: {subject}\nKnown claims: {}\nPrevious research questions: {}",
+                    known_claims.join(" | "),
+                    if previous_questions.is_empty() {
+                        "none".into()
+                    } else {
+                        previous_questions.join(" | ")
+                    }
+                ),
+            },
+        ];
+        self.chat_with_reply_cap(&messages, 0, MAX_RESEARCH_REPLY, 0.1, false)
+    }
+
     fn chat_with_reply_cap(
         &mut self,
         messages: &[Message],

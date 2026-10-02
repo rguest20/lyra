@@ -1,6 +1,62 @@
 use super::*;
 
 impl LearningStore {
+    pub fn scout_questions_for_subject(&self, subject: &str) -> io::Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT s.question FROM scout_investigations s
+             JOIN semantic_claims c ON s.trigger_ref = 'db:' || c.id
+             WHERE lower(trim(c.subject)) = lower(trim(?1))
+             ORDER BY s.id DESC LIMIT 10",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([subject], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn scout_expansion_count_for_subject(&self, subject: &str) -> io::Result<usize> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scout_investigations s
+             JOIN semantic_claims c ON s.trigger_ref = 'db:' || c.id
+             WHERE s.trigger_kind = 'expansion' AND lower(trim(c.subject)) = lower(trim(?1))",
+                [subject],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    pub fn scout_known_claims_for_subject(&self, subject: &str) -> io::Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT relation || ': ' || object FROM semantic_claims
+             WHERE retracted_by IS NULL AND status IN ('active', 'uncertain', 'challenged')
+               AND lower(trim(subject)) = lower(trim(?1))
+             ORDER BY id DESC LIMIT 8",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([subject], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn scholar_job_is_expansion(&self, job_id: &str) -> io::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scout_investigations WHERE scholar_job_id = ?1 AND trigger_kind = 'expansion')",
+            [job_id],
+            |row| row.get(0),
+        ).map_err(database_error)
+    }
+
     pub fn enqueue_research(
         &self,
         conversation_id: &str,
@@ -226,8 +282,10 @@ impl LearningStore {
                 && safe_field(&finding.relation)
                 && safe_field(&finding.object)
                 && (evidence_supports_claim(&finding)
-                    || (finding.relation == "has encyclopedia summary"
-                        && canonical(&finding.subject) == canonical(source_title)
+                    || (matches!(
+                        finding.relation.as_str(),
+                        "has encyclopedia summary" | "has encyclopedia detail"
+                    ) && canonical(&finding.subject) == canonical(source_title)
                         && finding.object == finding.evidence_text))
                 && finding.confidence.is_finite()
                 && (0.0..=1.0).contains(&finding.confidence)
@@ -300,7 +358,9 @@ impl LearningStore {
                         finding_status = "promoted";
                         break;
                     }
-                    if canonical(&object) != canonical(&finding.object) {
+                    if canonical(&object) != canonical(&finding.object)
+                        && finding.relation != "has encyclopedia detail"
+                    {
                         conflicting_claim_id = Some(id);
                         reason = Some(format!("conflicts with overlapping semantic claim #{id}"));
                         break;

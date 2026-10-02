@@ -43,7 +43,7 @@ fn inference_budget() -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| (1..=16).contains(value))
-        .unwrap_or(6)
+        .unwrap_or(8)
 }
 
 fn autonomous_research_enabled() -> bool {
@@ -89,7 +89,7 @@ impl Roles for ModelRoles<'_> {
     }
 
     fn scout(&mut self) -> io::Result<usize> {
-        scout::process_once(self.database_path, self.knowledge_path)
+        scout::process_once(self.database_path, self.knowledge_path, self.model)
     }
 
     fn research(&mut self) -> io::Result<usize> {
@@ -209,10 +209,11 @@ fn run_pass_with_roles(
 
     if !config.research_enabled {
         skip_role(&store, pass_id, "scout", "autonomous research disabled")?;
-    } else if started.elapsed() >= config.max_duration {
-        skip_role(&store, pass_id, "scout", "pass time budget exhausted")?;
+    } else if budget == 0 || started.elapsed() >= config.max_duration {
+        skip_role(&store, pass_id, "scout", "pass budget exhausted")?;
     } else {
         let result = run_role(&store, pass_id, "scout", || roles.scout())?;
+        budget = budget.saturating_sub(2);
         summary.scouted = result.processed;
         summary.errors += usize::from(result.error);
     }
@@ -258,7 +259,9 @@ mod tests {
         }
 
         fn scout(&mut self) -> io::Result<usize> {
-            scout::process_once(self.database_path, self.knowledge_path)
+            scout::process_once_with(self.database_path, self.knowledge_path, |_, _, _| {
+                Ok("QUESTION: What is the atmosphere of Mars?".into())
+            })
         }
 
         fn research(&mut self) -> io::Result<usize> {
@@ -316,7 +319,7 @@ mod tests {
         };
         let config = PassConfig {
             max_duration: Duration::from_secs(10),
-            inference_budget: 2,
+            inference_budget: 4,
             research_enabled: true,
         };
         let first = run_pass_with_roles(&database_path, "chat", &mut roles, config).unwrap();

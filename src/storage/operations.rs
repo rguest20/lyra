@@ -214,6 +214,7 @@ impl LearningStore {
             scout_priority_order: vec![
                 "challenged claims",
                 "due reviews",
+                "encyclopedia claim expansion",
                 "sparse map claims",
                 "unresolved assistant claims",
             ],

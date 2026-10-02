@@ -61,7 +61,11 @@ pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<
     let Some(job) = store.claim_scholar_job()? else {
         return Ok(0);
     };
-    let result = research(&job.question, model);
+    let result = research(
+        &job.question,
+        model,
+        store.scholar_job_is_expansion(&job.id)?,
+    );
     match result {
         Ok(Some((page, excerpt, finding))) => store.finish_scholar_job(
             &job.id,
@@ -90,6 +94,7 @@ pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<
 fn research(
     question: &str,
     model: &mut LocalModel,
+    expansion: bool,
 ) -> io::Result<Option<(SearchPage, String, Option<ScholarFinding>)>> {
     let search_phrase = model
         .search_phrase(question)?
@@ -160,31 +165,130 @@ fn research(
             content: format!("Research question: {question}\nSource title: {}\nSource excerpt:\n{excerpt}", page.title),
         },
     ];
-    let extracted = model
-        .chat_for_extraction(&messages)
+    let raw = model.chat_for_extraction(&messages);
+    let parsed = raw
         .and_then(|raw| parse_extraction(&raw))
         .ok()
-        .and_then(|parsed| parsed.claim)
-        .filter(|claim| claim.confidence >= 0.95 && excerpt.contains(&claim.evidence_text));
+        .and_then(|parsed| parsed.claim);
+    let selected_evidence = parsed.as_ref().map(|claim| claim.evidence_text.clone());
+    let extracted =
+        parsed.filter(|claim| claim.confidence >= 0.95 && excerpt.contains(&claim.evidence_text));
     let source_updated_at = page
         .revisions
         .as_ref()
         .and_then(|revisions| revisions.first())
         .and_then(|revision| revision.timestamp.clone());
-    let finding = extracted
-        .map(|claim| ScholarFinding {
-            subject: claim.subject,
-            relation: claim.relation,
-            object: claim.object,
-            evidence_text: claim.evidence_text,
-            confidence: claim.confidence,
-            valid_from: claim.valid_from,
-            valid_until: claim.valid_until,
-            source_quality: "reference".into(),
-            source_updated_at: source_updated_at.clone(),
-        })
-        .or_else(|| summary_finding(&page.title, &excerpt, source_updated_at));
+    let extracted = extracted.map(|claim| ScholarFinding {
+        subject: claim.subject,
+        relation: claim.relation,
+        object: claim.object,
+        evidence_text: claim.evidence_text,
+        confidence: claim.confidence,
+        valid_from: claim.valid_from,
+        valid_until: claim.valid_until,
+        source_quality: "reference".into(),
+        source_updated_at: source_updated_at.clone(),
+    });
+    let finding = select_finding(
+        extracted,
+        selected_evidence.as_deref(),
+        question,
+        &page.title,
+        &excerpt,
+        source_updated_at,
+        expansion,
+    );
     Ok(Some((page, excerpt, finding)))
+}
+
+fn select_finding(
+    extracted: Option<ScholarFinding>,
+    selected_evidence: Option<&str>,
+    question: &str,
+    title: &str,
+    excerpt: &str,
+    source_updated_at: Option<String>,
+    expansion: bool,
+) -> Option<ScholarFinding> {
+    extracted
+        .filter(|claim| !expansion || claim.relation != "has encyclopedia summary")
+        .or_else(|| {
+            if expansion {
+                selected_evidence
+                    .and_then(|selected| {
+                        quoted_detail_finding(title, excerpt, selected, source_updated_at.clone())
+                    })
+                    .or_else(|| relevant_quoted_detail(title, excerpt, question, source_updated_at))
+            } else {
+                summary_finding(title, excerpt, source_updated_at)
+            }
+        })
+}
+
+fn relevant_quoted_detail(
+    title: &str,
+    excerpt: &str,
+    question: &str,
+    source_updated_at: Option<String>,
+) -> Option<ScholarFinding> {
+    let terms = |text: &str| -> std::collections::HashSet<String> {
+        let lower = text.to_lowercase();
+        lower
+            .split(|ch: char| !ch.is_alphanumeric())
+            .filter(|word| word.len() >= 6)
+            .map(|word| word.chars().take(6).collect())
+            .collect()
+    };
+    let title_terms = terms(title);
+    let question_terms = terms(question)
+        .difference(&title_terms)
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let selected = excerpt
+        .split(". ")
+        .skip(1)
+        .filter_map(|sentence| {
+            let sentence_terms = terms(sentence);
+            let score = question_terms.intersection(&sentence_terms).count();
+            (score > 0).then_some((score, sentence))
+        })
+        .max_by_key(|(score, _)| *score)?;
+    quoted_detail_finding(title, excerpt, selected.1, source_updated_at)
+}
+
+fn quoted_detail_finding(
+    title: &str,
+    excerpt: &str,
+    selected: &str,
+    source_updated_at: Option<String>,
+) -> Option<ScholarFinding> {
+    if selected.chars().count() < 8 {
+        return None;
+    }
+    let at = excerpt.find(selected)?;
+    let start = excerpt[..at].rfind(". ").map(|index| index + 2)?;
+    let end = excerpt[at..]
+        .find(". ")
+        .map(|index| at + index + 1)
+        .unwrap_or(excerpt.len());
+    let sentence = excerpt.get(start..end)?.trim();
+    if !sentence.to_lowercase().contains(&title.to_lowercase())
+        || sentence.chars().count() > 500
+        || sentence.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(ScholarFinding {
+        subject: title.to_owned(),
+        relation: "has encyclopedia detail".into(),
+        object: sentence.to_owned(),
+        evidence_text: sentence.to_owned(),
+        confidence: 0.99,
+        valid_from: None,
+        valid_until: None,
+        source_quality: "reference".into(),
+        source_updated_at,
+    })
 }
 
 fn summary_finding(
@@ -254,7 +358,7 @@ fn invalid(message: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchPage, parse_extraction, relevant_page, summary_finding};
+    use super::{SearchPage, parse_extraction, relevant_page, select_finding, summary_finding};
 
     #[test]
     fn parses_supported_claim_or_no_result() {
@@ -297,5 +401,72 @@ mod tests {
             finding.evidence_text,
             "Photosynthesis converts light to chemical energy."
         );
+    }
+
+    #[test]
+    fn expansion_does_not_fall_back_to_the_same_summary() {
+        let excerpt = "Chicken soup is a soup made from chicken, usually with other ingredients. Chicken soup includes noodles.";
+        assert!(
+            select_finding(
+                None,
+                None,
+                "What ingredients?",
+                "Chicken soup",
+                excerpt,
+                None,
+                true
+            )
+            .is_none()
+        );
+        assert!(
+            select_finding(
+                None,
+                None,
+                "What ingredients?",
+                "Chicken soup",
+                excerpt,
+                None,
+                false
+            )
+            .is_some()
+        );
+        let summary = summary_finding("Chicken soup", excerpt, None);
+        assert!(
+            select_finding(
+                summary,
+                None,
+                "What ingredients?",
+                "Chicken soup",
+                excerpt,
+                None,
+                true
+            )
+            .is_none()
+        );
+        let detail = select_finding(
+            None,
+            Some("Chicken soup includes noodles"),
+            "What ingredients are in Chicken soup?",
+            "Chicken soup",
+            excerpt,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(detail.relation, "has encyclopedia detail");
+        assert_eq!(detail.object, "Chicken soup includes noodles.");
+
+        let longer = "Chicken soup is a soup made from chicken, usually with other ingredients. The classic Chicken soup commonly includes noodles and carrots.";
+        let detail = select_finding(
+            None,
+            None,
+            "What ingredients are commonly used in Chicken soup?",
+            "Chicken soup",
+            longer,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(detail.object.contains("noodles and carrots"));
     }
 }

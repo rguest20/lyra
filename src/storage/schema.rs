@@ -481,6 +481,38 @@ impl LearningStore {
                 .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 19 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "ALTER TABLE scout_investigations RENAME TO scout_investigations_old;
+                 CREATE TABLE scout_investigations (
+                    id INTEGER PRIMARY KEY,
+                    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('challenged', 'uncertain', 'sparse', 'stale', 'expansion')),
+                    topic_key TEXT NOT NULL,
+                    trigger_ref TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    scholar_job_id TEXT NOT NULL UNIQUE REFERENCES scholar_jobs(id),
+                    selection_reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 INSERT INTO scout_investigations
+                    (id, trigger_kind, topic_key, trigger_ref, question, scholar_job_id, selection_reason, created_at)
+                 SELECT id, trigger_kind, topic_key, trigger_ref, question, scholar_job_id, selection_reason, created_at
+                 FROM scout_investigations_old;
+                 DROP TABLE scout_investigations_old;
+                 CREATE INDEX scout_investigations_by_topic
+                    ON scout_investigations(trigger_kind, topic_key, id DESC);
+                 CREATE INDEX scout_investigations_by_created
+                    ON scout_investigations(created_at);",
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 19)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

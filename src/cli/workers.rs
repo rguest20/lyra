@@ -42,7 +42,9 @@ impl Cli {
         if args.next().is_some() {
             return Err("scout-once takes no arguments".into());
         }
-        let queued = scout::process_once(database_path, knowledge_path)
+        let mut backend = LocalModel::load(&self.model_dir, &self.adapter_path, self.cpu)
+            .map_err(|e| format!("could not load local model for Scout: {e}"))?;
+        let queued = scout::process_once(database_path, knowledge_path, &mut backend)
             .map_err(|e| format!("Scout failed: {e}"))?;
         println!("Queued {queued} Scout investigation(s)");
         Ok(())

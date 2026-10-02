@@ -1,6 +1,6 @@
 # Autonomous Knowledge Maintenance
 
-**Status:** implemented and verified (SQLite schema 18)
+**Status:** implemented and verified (SQLite schema 19)
 
 This document describes what happens after Community starts, what the current
 autonomous loop can change, and the remaining work to make unattended
@@ -22,9 +22,14 @@ The loop stops when the process exits. One-shot CLI commands such as
 `scout-once` and `scholar-once` run only when explicitly invoked.
 
 In a maintenance pass, Scout scans a bounded, rotating portion of the map and
-can queue a focused research question. Scholar can process a queued question
+can queue a focused research question. Encyclopedia summaries and details are
+interrogated for a specific unanswered detail, using the local model and prior
+questions about the subject. Scholar can process a queued question
 and add supported claims with source evidence to SQLite. Curmudgeon audits
 queued assistant claims for conflicts. Curator handles user observations.
+Expansion questions have a five-per-subject limit; near-duplicate wording is
+rejected. A sourced passage that answers the question can be kept as an exact
+encyclopedia detail when the small model cannot extract a reliable triple.
 Queue leases and bounded batches limit duplicate or monopolizing work.
 
 Automatic maintenance does **not** mean automatic model-weight training. New
@@ -78,8 +83,9 @@ worker on Ctrl-C or termination. A worker that exits unexpectedly is marked inte
 its process ID; stale running passes are shown as interrupted after ten
 minutes. SQLite leases reclaim unfinished observation, assistant-audit, and
 Scholar jobs. The time budget is checked between roles; a model call already
-running is allowed to finish. The default inference budget admits six jobs
-per pass: up to four Curator observations, one audit, and one Scholar job.
+running is allowed to finish. The default inference budget admits eight jobs
+per pass: up to four Curator observations, one audit, up to two Scout question
+attempts, and one Scholar job.
 
 ### 3. Make autonomous exploration deliberate
 

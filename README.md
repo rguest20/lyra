@@ -109,15 +109,15 @@ extraction; simple length and height sentences have a deterministic fallback.
 ## Scout knowledge gaps
 
 Scout runs after Curmudgeon and chooses one public topic for Scholar: first a
-challenged claim, then an assistant claim with no comparable map evidence, then
-a map subject with only one known relation. It asks a neutral question rather
-than treating Lyra's disputed value as a fact. Each investigation records the
+challenged or due claim, then a specific unanswered detail in an encyclopedia
+claim, then a sparse map claim or unsupported assistant claim. It asks a
+neutral question rather than treating Lyra's disputed value as a fact. Each investigation records the
 triggering assistant claim or map claim and the resulting Scholar job ID in
 SQLite. Scout records why it selected each gap and spaces new jobs by at least
 five minutes. A topic with no result can be retried after one day; a finding
-held for review can be retried after seven days. Three attempts is the limit.
-Personal
-facts such as the user's name or address are excluded from autonomous web
+held for review can be retried after seven days. Three attempts is the limit
+for one question, and Scout asks at most five expansion questions per subject.
+Personal facts such as the user's name or address are excluded from autonomous web
 research.
 
 ```sh
@@ -126,8 +126,11 @@ cargo run --release -- scout-once
 cargo run --release -- scholar
 ```
 
-`scout-once` selects and queues a question without loading the model or using
-the network. Scholar performs the later lookup. A sparse map is a lead for
+`scout-once` loads the local model to formulate a focused question from known
+encyclopedia claims. It does not use the network. Scholar performs the later
+lookup. When a precise fact cannot be extracted but Scholar can locate a
+different, relevant sentence in the source, it keeps that sentence as a sourced
+encyclopedia detail. A sparse map is a lead for
 investigation, not evidence that its existing claim is false. Scholar's normal
 source checks and review rules still decide whether a finding enters the map.
 For the current architecture and maintenance ideas, see
@@ -161,7 +164,7 @@ Configuration:
 | --- | --- | --- |
 | `COMMUNITY_MAINTENANCE_INTERVAL_SECS` | `20` | Idle interval, 1–3600 seconds. |
 | `COMMUNITY_MAINTENANCE_MAX_MS` | `120000` | Time budget checked between roles, 1000–600000 ms. It does not interrupt a model call already running. |
-| `COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` | `6` | Maximum inference jobs admitted per pass, 1–16. |
+| `COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` | `8` | Maximum inference jobs admitted per pass, 1–16. |
 | `COMMUNITY_AUTONOMOUS_RESEARCH` | on | Set to `off` or `0` to skip automatic Scout and Scholar work while local curation and audits continue. |
 | `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 0–200. |
 
