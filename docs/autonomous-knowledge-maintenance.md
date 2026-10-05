@@ -34,9 +34,12 @@ Queue leases and bounded batches limit duplicate or monopolizing work.
 
 Automatic maintenance does **not** mean automatic model-weight training. New
 knowledge remains in SQLite and is retrieved at reply time. Model consolidation
-still requires explicit approval and a separate command. Existing Scholar
-policy also holds unsupported or consequential claims for review rather than
-promoting them automatically.
+still requires explicit approval and a separate command. Flagged user
+observations and Scholar findings receive an AI review with a recorded
+rationale. Evidence, confidence, provenance, freshness, and conflict gates still
+control promotion; rejected and unresolved decisions remain inspectable in
+SQLite and the JSON-line stderr diagnostics. Operator review commands remain
+available as overrides, but normal maintenance does not wait for a human.
 
 ## Implemented controls
 
@@ -47,7 +50,7 @@ needed for these scheduling decisions.
 ### 1. Make maintenance status visible
 
 - [x] Show the last pass time, duration, and per-role outcome (work completed,
-  no work, held for review, or error).
+  no work, AI review or corroboration queued, or error).
 - [x] Show queue depth and oldest-item age for Curator, Scout, and Scholar.
 - [x] Surface this status through `maintenance` and a small `/status` response
   in the web UI.
@@ -102,8 +105,10 @@ attempts, and one Scholar job.
 an unanswered or repeatedly unsupported gap does not cause a request loop.
 
 Each Scout attempt keeps its own reason and Scholar job. Pending or processing
-jobs block another attempt. A `no_result` waits one day; a finding held for
-review, including stale evidence, waits seven days. A promoted topic is done,
+jobs block another attempt. A `no_result` waits one day; an AI-reviewed finding
+awaiting independent corroboration waits seven days. Unsupported or stale
+findings receive an AI rejection and can be investigated again through Scout.
+A promoted topic is done,
 and any topic stops after three attempts. Scout also spaces investigations by
 five minutes and accepts at most 20 per rolling day by default. Automatic
 Scout and Scholar work can be disabled with `COMMUNITY_AUTONOMOUS_RESEARCH=off`.
@@ -114,9 +119,9 @@ against that domain before extraction.
 
 - [x] Add an integration test that seeds a sparse or challenged claim, runs a
   maintenance pass, and verifies Scout's job and Scholar's resulting evidence
-  or held finding.
+  or staged finding.
 - [x] Test that unsupported, stale, conflicting, and consequential findings
-  remain held or challenged according to policy.
+  are kept out of promotion by automated policy.
 - [x] Test both `chat` and `serve` scheduling paths with a short test interval
   and no user message after startup.
 - [x] Document the expected startup mode, environment settings, logs, and

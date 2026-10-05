@@ -362,6 +362,7 @@ impl LearningStore {
             .query_row(
                 "SELECT id FROM scholar_provenance_reviews
                  WHERE status = 'pending'
+                    OR (status = 'failed' AND completed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes'))
                     OR (status = 'processing' AND claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-15 minutes'))
                  ORDER BY id LIMIT 1",
                 [],
@@ -377,6 +378,7 @@ impl LearningStore {
             "UPDATE scholar_provenance_reviews SET status = 'processing',
                 claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1 AND (status = 'pending'
+                OR (status = 'failed' AND completed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes'))
                 OR (status = 'processing' AND claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-15 minutes'))) ",
             [id],
         )
@@ -1223,6 +1225,20 @@ impl LearningStore {
             params![job_id, provider, trigger_reason, query, status,
                 result_count.and_then(|v| i64::try_from(v).ok()), error],
         ).map_err(database_error)?;
+        let logged_query = query.chars().take(500).collect::<String>();
+        crate::diagnostics::event(
+            "internet.search",
+            serde_json::json!({
+                "job_id": job_id,
+                "provider": provider,
+                "trigger": trigger_reason,
+                "query": logged_query,
+                "query_truncated": query.chars().count() > 500,
+                "outcome": status,
+                "result_count": result_count,
+                "error": error,
+            }),
+        );
         Ok(())
     }
 
@@ -1468,12 +1484,14 @@ impl LearningStore {
         Ok(job)
     }
 
-    pub fn hold_scholar_job(&self, job_id: &str, reason: &str) -> io::Result<()> {
-        self.connection.execute(
-            "UPDATE scholar_jobs SET status = 'needs_review', last_error = ?2, claimed_at = NULL
-             WHERE id = ?1 AND status = 'processing'",
-            params![job_id, reason],
-        ).map_err(database_error)?;
+    pub fn fail_scholar_job(&self, job_id: &str, reason: &str) -> io::Result<()> {
+        self.connection
+            .execute(
+                "UPDATE scholar_jobs SET status = 'no_result', last_error = ?2, claimed_at = NULL
+                 WHERE id = ?1 AND status = 'processing'",
+                params![job_id, reason.chars().take(500).collect::<String>()],
+            )
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1563,6 +1581,156 @@ impl LearningStore {
             .map_err(database_error)
     }
 
+    pub fn scholar_review_context(&self, finding_id: i64) -> io::Result<Option<serde_json::Value>> {
+        let mut context = self
+            .connection
+            .query_row(
+                "SELECT f.id, f.job_id, j.question, f.source_title, f.source_url,
+                    f.source_excerpt, f.subject, f.relation, f.object, f.evidence_text,
+                    f.confidence, f.valid_from, f.valid_until, f.source_quality,
+                    a.direct_support, a.gate_status, a.reason, a.research_relevance,
+                    f.freshness, f.source_updated_at, a.topic_class
+                 FROM scholar_findings f
+                 JOIN scholar_jobs j ON j.id = f.job_id
+                 JOIN scholar_source_assessments a ON a.finding_id = f.id
+                 WHERE f.id = ?1 AND f.status = 'needs_review'
+                   AND (NOT EXISTS (
+                          SELECT 1 FROM scholar_source_expertise_reviews er
+                          WHERE er.finding_id = f.id AND er.review_method = 'automatic'
+                        ) OR a.gate_status = 'conflict')",
+                [finding_id],
+                |row| {
+                    Ok(serde_json::json!({
+                        "finding_id": row.get::<_, i64>(0)?,
+                        "job_id": row.get::<_, String>(1)?,
+                        "question": row.get::<_, String>(2)?,
+                        "source_title": row.get::<_, String>(3)?,
+                        "source_url": row.get::<_, String>(4)?,
+                        "source_excerpt": row.get::<_, String>(5)?,
+                        "subject": row.get::<_, String>(6)?,
+                        "relation": row.get::<_, String>(7)?,
+                        "object": row.get::<_, String>(8)?,
+                        "evidence_text": row.get::<_, String>(9)?,
+                        "confidence": row.get::<_, f64>(10)?,
+                        "valid_from": row.get::<_, Option<String>>(11)?,
+                        "valid_until": row.get::<_, Option<String>>(12)?,
+                        "source_quality": row.get::<_, String>(13)?,
+                        "direct_support": row.get::<_, Option<i64>>(14)? == Some(1),
+                        "gate_status": row.get::<_, String>(15)?,
+                        "gate_reason": row.get::<_, String>(16)?,
+                        "research_relevance": row.get::<_, String>(17)?,
+                        "freshness": row.get::<_, String>(18)?,
+                        "source_updated_at": row.get::<_, Option<String>>(19)?,
+                        "topic_class": row.get::<_, String>(20)?,
+                    }))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some(context) = context.as_mut() {
+            let subject = context["subject"].as_str().unwrap_or_default().to_owned();
+            let relation = context["relation"].as_str().unwrap_or_default().to_owned();
+            let object = context["object"].as_str().unwrap_or_default().to_owned();
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT id, object, source, status, valid_from, valid_until
+                     FROM semantic_claims WHERE retracted_by IS NULL
+                       AND lower(trim(subject)) = lower(trim(?1))
+                       AND lower(trim(relation)) = lower(trim(?2))
+                       AND lower(trim(object)) <> lower(trim(?3))",
+                )
+                .map_err(database_error)?;
+            let conflicts = statement
+                .query_map(params![&subject, &relation, &object], |row| {
+                    Ok(serde_json::json!({
+                        "claim_id": row.get::<_, i64>(0)?,
+                        "object": row.get::<_, String>(1)?,
+                        "source": row.get::<_, String>(2)?,
+                        "status": row.get::<_, String>(3)?,
+                        "valid_from": row.get::<_, Option<String>>(4)?,
+                        "valid_until": row.get::<_, Option<String>>(5)?,
+                    }))
+                })
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            context["conflicting_active_claims"] = serde_json::json!(conflicts);
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT f.id, f.source_url, f.source_excerpt, f.evidence_text,
+                        f.confidence, a.independence_key, a.gate_status
+                     FROM scholar_findings f
+                     JOIN scholar_source_assessments a ON a.finding_id = f.id
+                     WHERE f.id <> ?1
+                       AND lower(trim(f.subject)) = lower(trim(?2))
+                       AND lower(trim(f.relation)) = lower(trim(?3))
+                       AND lower(trim(f.object)) = lower(trim(?4))
+                       AND f.status IN ('needs_review', 'promoted')
+                       AND a.direct_support = 1
+                     ORDER BY f.id DESC LIMIT 4",
+                )
+                .map_err(database_error)?;
+            let other_support = statement
+                .query_map(params![finding_id, &subject, &relation, &object], |row| {
+                    Ok(serde_json::json!({
+                        "finding_id": row.get::<_, i64>(0)?,
+                        "source_url": row.get::<_, String>(1)?,
+                        "source_excerpt": row.get::<_, String>(2)?,
+                        "evidence_text": row.get::<_, String>(3)?,
+                        "confidence": row.get::<_, f64>(4)?,
+                        "independence_key": row.get::<_, Option<String>>(5)?,
+                        "gate_status": row.get::<_, String>(6)?,
+                    }))
+                })
+                .map_err(database_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(database_error)?;
+            context["other_supporting_findings"] = serde_json::json!(other_support);
+        }
+        Ok(context)
+    }
+
+    pub fn scholar_corroboration_exhausted(&self, finding_id: i64) -> io::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scholar_corroboration_queue
+                 WHERE finding_id = ?1 AND status = 'exhausted')",
+                [finding_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn scholar_ai_review_queue(&self) -> io::Result<Vec<(i64, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.job_id FROM scholar_findings f
+                 WHERE f.status = 'needs_review'
+                   AND EXISTS (SELECT 1 FROM scholar_source_assessments a
+                               WHERE a.finding_id = f.id)
+                   AND (NOT EXISTS (
+                          SELECT 1 FROM scholar_source_expertise_reviews er
+                          WHERE er.finding_id = f.id AND er.review_method = 'automatic'
+                        ) OR EXISTS (
+                          SELECT 1 FROM scholar_source_assessments a
+                          WHERE a.finding_id = f.id AND a.gate_status = 'conflict'
+                        ) OR EXISTS (
+                          SELECT 1 FROM scholar_corroboration_queue q
+                          WHERE q.finding_id = f.id AND q.status = 'exhausted'
+                        ))
+                 ORDER BY f.id LIMIT 1000",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
     pub fn review_scholar_source_expertise(
         &mut self,
         finding_id: i64,
@@ -1570,6 +1738,43 @@ impl LearningStore {
         suitable_for_topic: bool,
         published_at: Option<&str>,
         rationale: &str,
+    ) -> io::Result<()> {
+        self.review_scholar_source_expertise_with_method(
+            finding_id,
+            source_kind,
+            suitable_for_topic,
+            published_at,
+            rationale,
+            "human",
+        )
+    }
+
+    pub fn review_scholar_source_expertise_ai(
+        &mut self,
+        finding_id: i64,
+        source_kind: &str,
+        suitable_for_topic: bool,
+        published_at: Option<&str>,
+        rationale: &str,
+    ) -> io::Result<()> {
+        self.review_scholar_source_expertise_with_method(
+            finding_id,
+            source_kind,
+            suitable_for_topic,
+            published_at,
+            rationale,
+            "automatic",
+        )
+    }
+
+    fn review_scholar_source_expertise_with_method(
+        &mut self,
+        finding_id: i64,
+        source_kind: &str,
+        suitable_for_topic: bool,
+        published_at: Option<&str>,
+        rationale: &str,
+        review_method: &str,
     ) -> io::Result<()> {
         if !matches!(source_kind, "primary" | "secondary") {
             return Err(invalid("source kind must be primary or secondary"));
@@ -1633,9 +1838,9 @@ impl LearningStore {
         tx.execute(
             "INSERT INTO scholar_source_expertise_reviews
                 (finding_id, source_kind, suitable_for_topic, published_at,
-                 evidence_text, rationale, reviewed_at)
+                 evidence_text, rationale, reviewed_at, review_method)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?7)",
             params![
                 finding_id,
                 source_kind,
@@ -1643,6 +1848,7 @@ impl LearningStore {
                 published_at,
                 evidence_text,
                 rationale,
+                review_method,
             ],
         )
         .map_err(database_error)?;
@@ -2017,6 +2223,25 @@ impl LearningStore {
         accept: bool,
         reason: &str,
     ) -> io::Result<()> {
+        self.review_scholar_finding_with_method(finding_id, accept, reason, "human")
+    }
+
+    pub fn review_scholar_finding_ai(
+        &mut self,
+        finding_id: i64,
+        accept: bool,
+        reason: &str,
+    ) -> io::Result<()> {
+        self.review_scholar_finding_with_method(finding_id, accept, reason, "ai")
+    }
+
+    fn review_scholar_finding_with_method(
+        &mut self,
+        finding_id: i64,
+        accept: bool,
+        reason: &str,
+        method: &str,
+    ) -> io::Result<()> {
         if reason.trim().is_empty()
             || reason.chars().count() > 500
             || reason.chars().any(char::is_control)
@@ -2217,9 +2442,17 @@ impl LearningStore {
             &tx,
             proposal_id,
             if accept {
-                "human_accepted"
+                if method == "ai" {
+                    "ai_accepted"
+                } else {
+                    "human_accepted"
+                }
             } else {
-                "human_rejected"
+                if method == "ai" {
+                    "ai_rejected"
+                } else {
+                    "human_rejected"
+                }
             },
             reason.trim(),
             semantic_id,

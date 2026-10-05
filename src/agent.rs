@@ -142,6 +142,16 @@ impl Agent {
             false
         };
         if new_conversation {
+            let archive_path = self.archive_history(services.state_path)?;
+            crate::diagnostics::event(
+                "conversation.history_archived",
+                json!({
+                    "conversation_id": self.conversation_id,
+                    "message_count": self.history.len(),
+                    "turn_count": self.turn_count(),
+                    "archive_path": archive_path,
+                }),
+            );
             let base = self
                 .conversation_id
                 .split_once("::conversation:")
@@ -620,6 +630,43 @@ impl Agent {
         fs::write(&temporary, serde_json::to_vec_pretty(&state)?)?;
         fs::rename(temporary, path)
     }
+
+    fn archive_history(&self, state_path: &Path) -> io::Result<std::path::PathBuf> {
+        let directory = state_path.with_extension("history");
+        fs::create_dir_all(&directory)?;
+        let key = self
+            .conversation_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let archive_path = directory.join(format!("conversation-{key}.json"));
+        if archive_path.exists() {
+            return Ok(archive_path);
+        }
+        let archived_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_millis();
+        let archive = json!({
+            "conversation_id": self.conversation_id,
+            "archived_at_unix_ms": archived_at_unix_ms,
+            "history": self.history.iter().map(|message| json!({
+                "role": message.role,
+                "content": message.content,
+            })).collect::<Vec<_>>(),
+        });
+        let temporary = directory.join(format!(".conversation-{key}-{}.tmp", std::process::id()));
+        fs::write(&temporary, serde_json::to_vec_pretty(&archive)?)?;
+        match fs::rename(&temporary, &archive_path) {
+            Ok(()) => Ok(archive_path),
+            Err(_error) if archive_path.exists() => {
+                let _ = fs::remove_file(&temporary);
+                Ok(archive_path)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 fn claim_answer_use(claim: &SemanticClaim) -> &'static str {
@@ -984,6 +1031,43 @@ mod tests {
         assert_eq!(loaded.conversation_id, agent.conversation_id);
         assert!(Agent::load(&path, "model-b").is_err());
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn completed_conversation_history_is_archived_once_before_reset() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("community-agent-{unique}.json"));
+        let agent = Agent {
+            model: "test".into(),
+            history: vec![
+                Message {
+                    role: "user".into(),
+                    content: "Remember this topic".into(),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: "I will keep the context.".into(),
+                },
+            ],
+            conversation_id: "conversation-to-archive".into(),
+        };
+
+        let archive_path = agent.archive_history(&path).unwrap();
+        let archive: Value = serde_json::from_slice(&fs::read(&archive_path).unwrap()).unwrap();
+        assert_eq!(archive["conversation_id"], "conversation-to-archive");
+        assert_eq!(archive["history"].as_array().unwrap().len(), 2);
+        assert_eq!(archive["history"][0]["content"], "Remember this topic");
+
+        let mut changed_agent = agent;
+        changed_agent.history.clear();
+        assert_eq!(changed_agent.archive_history(&path).unwrap(), archive_path);
+        let preserved: Value = serde_json::from_slice(&fs::read(&archive_path).unwrap()).unwrap();
+        assert_eq!(preserved["history"].as_array().unwrap().len(), 2);
+
+        fs::remove_dir_all(path.with_extension("history")).unwrap();
     }
 
     #[test]

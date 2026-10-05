@@ -333,6 +333,18 @@ fn ingest_source(
                     finding.valid_from, finding.valid_until, finding.source_quality, freshness, finding.source_updated_at],
             ).map_err(database_error)?;
     let finding_id = tx.last_insert_rowid();
+    crate::diagnostics::event(
+        "scholar.finding_disposition",
+        serde_json::json!({
+            "finding_id": finding_id,
+            "job_id": job_id,
+            "status": finding_status,
+            "gate_status": gate_status,
+            "confidence": finding.confidence,
+            "reason": reason,
+            "source_url": source_url,
+        }),
+    );
     super::evidence_policy::record_assessment(
         tx,
         finding_id,

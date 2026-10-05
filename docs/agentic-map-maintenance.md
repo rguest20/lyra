@@ -28,7 +28,7 @@ The current roles are:
 | Curator | Extracts candidate claims from user observations and promotes or holds them according to evidence and review rules. | Does not rewrite the original observation. |
 | Curmudgeon | Audits factual claims in Lyra's replies against comparable active map claims. | Can flag a conflict or leave it inconclusive; it does not research or correct the claim. |
 | Scout | Selects a research gap, prioritizing challenged claims, claims without a comparable map entry, and subjects with one known relation. | Queues a question for Scholar; it does not edit claims. |
-| Scholar | Searches English Wikipedia, extracts evidence, and adds supported findings to SQLite or holds them for review. | Its sources and provider are currently narrow; personal facts are excluded from web research. |
+| Scholar | Searches configured providers, extracts evidence, and sends findings through AI source review and automated evidence gates. | Its sources and provider are currently narrow; personal facts are excluded from web research. |
 
 Scholar can currently promote a directly supported, nonconflicting extraction
 when its extraction confidence meets the configured 0.95 threshold. That score
@@ -178,7 +178,7 @@ proposal; it should not erase the claim's history. Each role should return a
 structured proposal identifying the claim, evidence, provenance, suggested
 action, and reason. A deterministic policy layer then decides whether to attach
 evidence, queue research, challenge a claim, change its use policy, or request
-human review. The useful audit chain is:
+AI review. The useful audit chain is:
 
 ```text
 claim → evidence → role proposal → policy decision → map transition
@@ -251,7 +251,7 @@ through a policy rather than inventing its own state changes.
     review, and Curmudgeon's current-date filter.
 - [x] **B2. Add explicit proposal and policy-decision records.** Curator,
   Scholar, Curmudgeon, and Scout emit durable evidence-linked proposals.
-  Deterministic curation, conflict, queue, and human-review decisions are
+  Deterministic curation, conflict, queue, and AI-review decisions are
   recorded separately with reasons and resulting claim/state. Inspect the
   latest decisions with `maintenance history [LIMIT]`.
   - Done when role proposals and decisions can be queried and linked to their
@@ -259,11 +259,12 @@ through a policy rather than inventing its own state changes.
     and a fresh-database migration smoke check.
 - [x] **B3. Tighten Scholar acceptance.** Require directly supporting evidence;
   represent source quality and freshness separately from extraction confidence.
-  Wikipedia is recorded as reference quality; unknown-quality sources are held.
-  Time-sensitive claims are held when the page revision is stale or unknown,
-  and medical, legal, financial, safety, and similar consequential topics
-  require human review. The model's extraction score does not override these
-  gates. Review the fields with `scholar show JOB_ID`.
+  Wikipedia is recorded as reference quality. Unknown-quality sources are
+  rejected by AI source review; time-sensitive claims are rejected when the
+  page revision is stale or unknown. Medical, legal, financial, safety, and
+  similar consequential topics stay out of automatic promotion. The model's
+  extraction score does not override these gates. Review the fields with
+  `scholar show JOB_ID`.
   - Done when a high extraction score alone cannot make weak, stale, or
     consequential evidence appear established. Verified with focused release
     tests for unknown source quality, stale time-sensitive sources, and

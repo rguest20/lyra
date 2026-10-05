@@ -113,17 +113,33 @@ fn run_role(
     let started = Instant::now();
     let result = action();
     let after = store.maintenance_review_counts()?;
-    let held = match role {
+    let review_delta = match role {
         "curator" => after.0 > before.0,
         "scholar" => after.1 > before.1,
         _ => false,
     };
     let (status, processed, detail) = match result {
-        Ok(count) if held => ("held", count, None),
         Ok(0) => ("idle", 0, None),
-        Ok(count) => ("work", count, None),
+        Ok(count) => (
+            "work",
+            count,
+            review_delta.then(|| "items queued for AI review or corroboration".to_owned()),
+        ),
         Err(error) => ("error", 0, Some(error.to_string())),
     };
+    crate::diagnostics::event(
+        "maintenance.role_finished",
+        serde_json::json!({
+            "pass_id": pass_id,
+            "role": role,
+            "status": status,
+            "processed": processed,
+            "elapsed_ms": started.elapsed().as_millis(),
+            "review_counts_before": {"curator": before.0, "scholar": before.1},
+            "review_counts_after": {"curator": after.0, "scholar": after.1},
+            "error": detail,
+        }),
+    );
     store.record_maintenance_role(
         pass_id,
         role,
@@ -339,7 +355,11 @@ mod tests {
         assert_eq!(pass.roles.len(), 4);
         assert_eq!(pass.roles[1].status, "error");
         assert_eq!(pass.roles[2].status, "work");
-        assert_eq!(pass.roles[3].status, "held");
+        assert_eq!(pass.roles[3].status, "work");
+        assert_eq!(
+            pass.roles[3].detail.as_deref(),
+            Some("items queued for AI review or corroboration")
+        );
         assert_eq!(store.active_semantic_claims().unwrap().len(), 1);
         let investigation = store.scout_investigations().unwrap().remove(0);
         assert!(investigation.selection_reason.contains("Rotating map scan"));

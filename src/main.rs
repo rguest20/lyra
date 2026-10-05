@@ -2,6 +2,7 @@ mod agent;
 mod cli;
 mod curator;
 mod curmudgeon;
+mod diagnostics;
 mod inference;
 mod knowledge;
 mod maintenance;

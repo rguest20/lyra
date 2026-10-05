@@ -159,7 +159,7 @@ fn scout_retries_no_result_after_cooldown_and_stops_after_three_attempts() {
 }
 
 #[test]
-fn scout_holds_reviewed_source_for_a_week_before_retry() {
+fn scout_retries_no_result_after_cooldown() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();
     store
@@ -172,7 +172,9 @@ fn scout_holds_reviewed_source_for_a_week_before_retry() {
         )
         .unwrap();
     let job = store.claim_scholar_job().unwrap().unwrap();
-    store.hold_scholar_job(&job.id, "source was stale").unwrap();
+    store
+        .fail_scholar_job(&job.id, "source lookup returned no result")
+        .unwrap();
     assert!(store.scout_topic_exists("stale", "claim:1").unwrap());
     store.connection.execute(
         "UPDATE scout_investigations SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-8 days') WHERE scholar_job_id = ?1",
@@ -2948,6 +2950,67 @@ fn candidate_insert_and_observation_status_commit_together() {
     assert_eq!(observation_status, "needs_review");
     assert_eq!(candidate_status, "needs_review");
     assert_eq!(evidence, "I live in Bristol");
+
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[test]
+fn ai_review_resolves_a_held_candidate_and_records_no_human_hold() {
+    let path = temp_path();
+    let _ = std::fs::remove_file(&path);
+    let mut store = LearningStore::open(&path).unwrap();
+    let observation_id = store
+        .stage_observation("conversation-ai-review", 1, "I live in Bristol.")
+        .unwrap();
+    store.claim_next_observation(600).unwrap().unwrap();
+    let claim = CandidateClaim {
+        subject: "the user".into(),
+        relation: "lives in".into(),
+        object: "Bristol".into(),
+        evidence_text: "I live in Bristol.".into(),
+        context_message_ids: Vec::new(),
+        resolution: None,
+        confidence: 0.92,
+        status: "proposed".into(),
+        decision_reason: None,
+        valid_from: None,
+        valid_until: None,
+    };
+    store
+        .finish_extraction(&observation_id, &[claim], None)
+        .unwrap();
+    let candidate_id = store
+        .observation_detail(&observation_id)
+        .unwrap()
+        .unwrap()
+        .candidates[0]
+        .id
+        .clone();
+
+    store
+        .resolve_candidate_ai(
+            &candidate_id,
+            false,
+            "AI review rejected the low confidence claim.",
+        )
+        .unwrap();
+
+    let detail = store.observation_detail(&observation_id).unwrap().unwrap();
+    assert_eq!(detail.observation.status, "rejected");
+    assert_eq!(detail.candidates[0].status, "rejected");
+    let outcome: String = store
+        .connection
+        .query_row(
+            "SELECT outcome FROM policy_decisions ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outcome, "ai_rejected");
+    assert_eq!(store.inbox_summary().unwrap().needs_review, 0);
 
     drop(store);
     let _ = std::fs::remove_file(&path);

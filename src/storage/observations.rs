@@ -255,7 +255,9 @@ impl LearningStore {
                         .into_iter()
                         .flatten()
                         .all(|date| observation_text.contains(date));
-            let semantic_id = if !claim_period_valid {
+            let semantic_id = if claim.status == "rejected" {
+                None
+            } else if !claim_period_valid {
                 claim.status = "needs_review".into();
                 claim.decision_reason =
                     Some("claim dates are invalid or not explicit in the user observation".into());
@@ -332,20 +334,20 @@ impl LearningStore {
             record_policy_decision(
                 &tx,
                 proposal_id,
-                if claim.status == "promoted" {
-                    "applied"
-                } else {
-                    "deferred"
+                match claim.status.as_str() {
+                    "promoted" => "applied",
+                    "rejected" => "rejected",
+                    _ => "deferred",
                 },
                 claim
                     .decision_reason
                     .as_deref()
                     .unwrap_or("accepted by deterministic curation policy"),
                 semantic_id,
-                Some(if claim.status == "promoted" {
-                    "active"
-                } else {
-                    "needs_review"
+                Some(match claim.status.as_str() {
+                    "promoted" => "active",
+                    "rejected" => "rejected",
+                    _ => "needs_review",
                 }),
             )?;
             if claim.status == "promoted" {
@@ -364,8 +366,11 @@ impl LearningStore {
         });
         let (status, reason) = if let Some(reason) = review_summary.as_deref() {
             ("needs_review", Some(reason))
-        } else if claims.is_empty() {
-            ("rejected", Some("no supported claims extracted"))
+        } else if claims.is_empty() || claims.iter().all(|claim| claim.status == "rejected") {
+            (
+                "rejected",
+                Some("AI reviewer rejected all extracted claims"),
+            )
         } else {
             ("promoted", None)
         };
@@ -381,17 +386,5 @@ impl LearningStore {
             return Err(invalid("observation is not currently claimed by a worker"));
         }
         tx.commit().map_err(database_error)
-    }
-
-    pub fn hold_observation(&mut self, observation_id: &str, reason: &str) -> io::Result<()> {
-        self.connection
-            .execute(
-                "UPDATE observations
-                 SET status = 'needs_review', last_error = ?2, claimed_at = NULL
-                 WHERE id = ?1 AND status = 'processing'",
-                params![observation_id, reason],
-            )
-            .map_err(database_error)?;
-        Ok(())
     }
 }

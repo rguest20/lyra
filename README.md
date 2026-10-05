@@ -49,6 +49,12 @@ judgments keep it. The check adds a short local model pass to prompts that need
 it. Set `COMMUNITY_WEB_ADDR` to another loopback address if port 8080 is in
 use; non-loopback addresses are rejected.
 
+When Lyra starts a new thread automatically, the completed transcript is
+archived under `state/web-sessions/<session>.history/` before the active state
+file is replaced. The diagnostic log records `conversation.history_archived`
+with the archive path and message count. Starting a new browser conversation
+keeps the previous session file in place.
+
 ## Scholar research queue
 
 When Lyra's reply leaves a public factual question unanswered, a local model
@@ -67,10 +73,12 @@ same source also trigger a shared-origin review. Short shared facts such as
 chicken being an ingredient in chicken soup do not trigger a copy warning.
 Curmudgeon reviews provenance-linked pairs and records an advisory explanation;
 its assessment never clears the independence gate by itself.
-Headings followed by bullets can yield a
-source-specific list for review when the model cannot return a grounded claim.
-External pages with unknown expertise or unverified independence remain in
-review, even when their passages support a claim. A web reply shows when research was
+Headings followed by bullets can yield a source-specific list for the Scholar
+AI reviewer when the extractor cannot return a grounded claim. The reviewer
+assesses source suitability and direct support; suitable secondary findings
+continue through automatic independent-source corroboration. Unsupported,
+unsuitable, personal, conflicting, or below-threshold findings are rejected or
+kept out of promotion with the rationale recorded. A web reply shows when research was
 queued; the lookup runs after the reply and may inform later prompts. In the
 CLI, the background worker checks the queue between turns and on idle ticks.
 
@@ -118,9 +126,9 @@ Curmudgeon provenance warning must be resolved as possibly distinct reporting
 before the sources count. Personal facts about the user are never established
 from web evidence.
 
-`scholar source-review` and `scholar origin-review` remain available for manual
-review and correction of automatic assessments. `scholar review` can explicitly
-accept or reject a finding that remains staged.
+The source-review, origin-review, and finding-review commands remain available
+as explicit operator overrides. Normal maintenance uses AI review and automatic
+evidence gates; it does not require a human review step.
 
 ## Curmudgeon consistency audit
 
@@ -159,8 +167,9 @@ claim, then a sparse map claim or unsupported assistant claim. It asks a
 neutral question rather than treating Lyra's disputed value as a fact. Each investigation records the
 triggering assistant claim or map claim and the resulting Scholar job ID in
 SQLite. Scout records why it selected each gap and spaces new jobs by at least
-five minutes. A topic with no result can be retried after one day; a finding
-held for review can be retried after seven days. Three attempts is the limit
+five minutes. A topic with no result can be retried after one day; an
+AI-reviewed finding awaiting independent corroboration can be retried after
+seven days. Three attempts is the limit
 for one question, and Scout asks at most five expansion questions per subject.
 Personal facts such as the user's name or address are excluded from autonomous web
 research.
@@ -186,7 +195,7 @@ For the current architecture and maintenance ideas, see
 Keep `chat` or `serve` running to let Curator, Curmudgeon, Scout, and Scholar
 check for work without another prompt. The default idle interval is 20 seconds.
 Both modes write the last 200 maintenance passes, including each role's work,
-idle, held, skipped, or error outcome, to SQLite. Inspect them with:
+idle, AI-review-pending, skipped, or error outcome, to SQLite. Inspect them with:
 
 ```sh
 cargo run --release -- maintenance
@@ -202,6 +211,22 @@ as `partial_error`; the other roles still run when their budgets allow it.
 The terminal logs role errors to stderr, and `serve` reports background worker
 exits there. Ctrl-C or a termination signal lets `serve` wait for an active
 maintenance subprocess.
+
+Curator sends flagged extractions to an independent AI reviewer. Curmudgeon
+also resolves any candidate that remains flagged after deterministic conflict
+checks. Scholar findings receive an AI source and passage assessment; suitable
+secondary findings continue through independent-source corroboration. Review
+decisions and rationales are emitted as structured JSON lines to stderr and
+retained in SQLite. Internet searches emit an `internet.search` event with the
+provider, trigger, query, outcome, and result count; API credentials are not
+included. Capture the terminal log with:
+
+```sh
+cargo run --release -- serve 2>community-lab.log
+```
+
+The database at `state/learning.db` retains structured maintenance history and
+`maintenance runs 10`.
 
 Configuration:
 
@@ -325,8 +350,11 @@ from the same conversation are included as user-reported context; the latest
 input remains the final prompt message. Repeating an input for the same
 conversation turn after a failure reuses its observation. The `chat` command
 starts one asynchronous curator thread that shares the local model and extracts
-claims with source evidence. Claims at or above the 0.95 confidence threshold
-are curated into SQLite; lower confidence claims and conflicts wait for review.
+claims with source evidence. A second AI reviewer assesses flagged extractions;
+acceptance still requires the 0.95 confidence threshold, exact evidence, valid
+dates, and conflict checks. Curmudgeon resolves any remaining candidate
+conflicts through a separate AI review. Failed model reviews are logged and
+retried after the observation lease expires.
 Equivalent claims retain additional observation provenance without creating
 duplicates. Inputs sent with `say` remain pending until a later `chat` run.
 Older conversation history is not backfilled into the staging table.

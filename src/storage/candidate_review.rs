@@ -2,6 +2,20 @@ use super::*;
 
 impl LearningStore {
     pub fn resolve_candidate(&mut self, id: &str, accept: bool, reason: &str) -> io::Result<()> {
+        self.resolve_candidate_with_method(id, accept, reason, "human")
+    }
+
+    pub fn resolve_candidate_ai(&mut self, id: &str, accept: bool, reason: &str) -> io::Result<()> {
+        self.resolve_candidate_with_method(id, accept, reason, "ai")
+    }
+
+    fn resolve_candidate_with_method(
+        &mut self,
+        id: &str,
+        accept: bool,
+        reason: &str,
+        method: &str,
+    ) -> io::Result<()> {
         if reason.trim().is_empty()
             || reason.chars().count() > 500
             || reason.chars().any(char::is_control)
@@ -196,9 +210,17 @@ impl LearningStore {
             &tx,
             proposal_id,
             if accept {
-                "human_accepted"
+                if method == "ai" {
+                    "ai_accepted"
+                } else {
+                    "human_accepted"
+                }
             } else {
-                "human_rejected"
+                if method == "ai" {
+                    "ai_rejected"
+                } else {
+                    "human_rejected"
+                }
             },
             reason.trim(),
             semantic_id,
