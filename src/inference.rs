@@ -279,6 +279,26 @@ impl LocalModel {
         self.chat_with_reply_cap(&messages, 0, MAX_RESEARCH_REPLY, 0.1, false)
     }
 
+    /// Ask for a public research lead from pretrained knowledge. The reply is
+    /// only a question for Scholar; it is never evidence for a claim.
+    pub fn scout_model_lead(&mut self, previous_topics: &[String]) -> io::Result<String> {
+        let messages = [
+            Message {
+                role: "system".into(),
+                content: "/no_think\nSuggest one public historical, scientific, or technical topic worth researching that is absent from the excluded list. Do not mention any person in this conversation or private information. Return exactly two lines: TOPIC: a short topic name; QUESTION: one specific factual question about that topic. Use related wording naturally; the question need not repeat the full topic name. Make it answerable from an encyclopedia and do not include an asserted answer. Do not explain.".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: format!(
+                    "Excluded topics: {}",
+                    if previous_topics.is_empty() { "none".into() }
+                    else { previous_topics.join(" | ") }
+                ),
+            },
+        ];
+        self.chat_with_reply_cap(&messages, 0, MAX_RESEARCH_REPLY, 0.1, false)
+    }
+
     fn chat_with_reply_cap(
         &mut self,
         messages: &[Message],

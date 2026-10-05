@@ -19,6 +19,7 @@ struct Cli {
 }
 
 pub fn run() -> Result<(), String> {
+    let _ = dotenvy::dotenv();
     let mut args = env::args().skip(1);
     let command = args.next().unwrap_or_else(|| "chat".into());
     if matches!(command.as_str(), "help" | "--help" | "-h") {
@@ -98,7 +99,7 @@ impl Cli {
 
 fn usage() {
     println!(
-        "Usage: cargo run -- [chat | serve | say MESSAGE | train PROMPT ANSWER | model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | maintenance [runs [LIMIT] | history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-] | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | show JOB_ID | review FINDING_ID accept|reject REASON] | scholar-once | curmudgeon [audit REPLY_TEXT] | curmudgeon-once | scout | scout-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
+        "Usage: cargo run -- [chat | serve | say MESSAGE | train PROMPT ANSWER | model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | maintenance [runs [LIMIT] | history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-] | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | queue | show JOB_ID | sites [LIMIT] | blocked [LIMIT] | review FINDING_ID accept|reject REASON] | scholar-once | curmudgeon [audit REPLY_TEXT] | curmudgeon-once | scout | scout-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
         Environment: COMMUNITY_MODEL_DIR, COMMUNITY_ADAPTER, COMMUNITY_DEVICE, COMMUNITY_STATE, COMMUNITY_KNOWLEDGE, COMMUNITY_DB, COMMUNITY_MAINTENANCE_INTERVAL_SECS, COMMUNITY_MAINTENANCE_MAX_MS, COMMUNITY_MAINTENANCE_INFERENCE_BUDGET, COMMUNITY_AUTONOMOUS_RESEARCH, COMMUNITY_MAX_RESEARCH_PER_DAY"
     );
 }

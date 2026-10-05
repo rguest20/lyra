@@ -53,13 +53,24 @@ use; non-loopback addresses are rejected.
 
 When Lyra's reply leaves a public factual question unanswered, a local model
 check can queue a short search phrase for the scholar. The scholar has its own
-SQLite queue and looks up an English Wikipedia article through the MediaWiki
-API. It extracts one claim relevant to the question or keeps the article's
-first sentence as a sourced summary when the small model cannot extract a
-reliable triple. It stores the article URL and exact supporting excerpt, then
-adds high confidence, nonconflicting claims to the SQLite semantic map.
-Unsupported, low confidence, and conflicting claims stay in the scholar queue
-for review. A web reply shows when research was
+SQLite queue and researches an English Wikipedia article through the MediaWiki
+API. Configured SerpAPI and Tavily searches provide additional leads; Scholar
+checks site policies before fetching a small number of pages. It extracts
+claims only from exact source passages and records each source and assessment.
+`scholar show JOB_ID` displays the selected passages and why each extraction
+attempt succeeded or failed, plus page-declared author, publisher, publication
+date, canonical URL, and citations when present. These declarations are clues,
+not proof of independent reporting. Scholar flags substantial repeated passage
+wording across two findings and does not count it as independent corroboration;
+matching declared canonical URLs, a page citing the other, or both citing the
+same source also trigger a shared-origin review. Short shared facts such as
+chicken being an ingredient in chicken soup do not trigger a copy warning.
+Curmudgeon reviews provenance-linked pairs and records an advisory explanation;
+its assessment never clears the independence gate by itself.
+Headings followed by bullets can yield a
+source-specific list for review when the model cannot return a grounded claim.
+External pages with unknown expertise or unverified independence remain in
+review, even when their passages support a claim. A web reply shows when research was
 queued; the lookup runs after the reply and may inform later prompts. In the
 CLI, the background worker checks the queue between turns and on idle ticks.
 
@@ -68,14 +79,48 @@ cargo run --release -- scholar
 cargo run --release -- scholar ask "What is photosynthesis?"
 cargo run --release -- scholar-once
 cargo run --release -- scholar show JOB_ID
+cargo run --release -- scholar sites
+cargo run --release -- scholar blocked
+cargo run --release -- scholar queue
+cargo run --release -- scholar source-review FINDING_ID primary suitable - "Publisher is a specialist source for this subject"
+cargo run --release -- scholar origin-review FINDING_ID report:original-study-123 "The article identifies this report as its underlying source"
 cargo run --release -- scholar review FINDING_ID accept "Verified against the cited page"
 cargo run --release -- knowledge
 ```
 
-This first source provider covers encyclopedia topics. It does not search the
-whole web, and Lyra does not use web results to establish personal facts about
-the user. The search phrase is sent to Wikipedia; conversation history stays
-local. Internet access and `curl` are required for the scholar worker.
+`scholar blocked` lists robots-denied paths and hosts that Scholar skips for
+30 days. Lyra does not use web results to establish personal facts about the
+user. Research questions are sent to configured search providers; conversation
+history stays local. Internet access and `curl` are required for the worker.
+Scholar can use directly supported findings as tentative evidence before they
+reach the semantic map. Lyra should attribute them and qualify the answer
+naturally, for example, “I'm not completely sure, but these sources say…”.
+Scholar uses SerpAPI after weak Wikipedia evidence when its persisted
+30-minute interval has elapsed, and Tavily after its persisted one-hour
+interval. When Wikipedia yields a direct finding, it searches SerpAPI only
+after an hour and Tavily only after two hours since each provider's last
+search. Set `SCHOLAR_SERP_INTERVAL_SECONDS` or
+`SCHOLAR_TAVILY_INTERVAL_SECONDS` to change the base intervals; the
+strong-Wikipedia interval remains twice the configured value.
+Direct, well-grounded public findings that still need an independent source
+enter a durable corroboration queue. At each maintenance pass, an available
+SerpAPI or Tavily slot takes the next eligible claim. The worker skips hosts
+already cited for that claim and stages only a matching claim from a new
+source. `scholar queue` shows pending, active, completed, and exhausted items.
+Each provider gets at most three attempts per claim; unavailable providers
+leave their work pending. Promotion still uses the existing evidence and
+conflict checks.
+Automatic promotion requires the configured extraction-confidence threshold,
+two directly supporting sources from distinct hosts, and no unresolved source
+provenance warning or active map conflict. The default threshold is 0.90; set
+`SCHOLAR_AUTO_PROMOTION_CONFIDENCE` to a value from 0 to 1 to tune it. A
+Curmudgeon provenance warning must be resolved as possibly distinct reporting
+before the sources count. Personal facts about the user are never established
+from web evidence.
+
+`scholar source-review` and `scholar origin-review` remain available for manual
+review and correction of automatic assessments. `scholar review` can explicitly
+accept or reject a finding that remains staged.
 
 ## Curmudgeon consistency audit
 
@@ -167,11 +212,21 @@ Configuration:
 | `COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` | `8` | Maximum inference jobs admitted per pass, 1–16. |
 | `COMMUNITY_AUTONOMOUS_RESEARCH` | on | Set to `off` or `0` to skip automatic Scout and Scholar work while local curation and audits continue. |
 | `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 0–200. |
+| `COMMUNITY_CONFIG` | `config.toml` | Optional local TOML file for search provider settings. |
+| `TAVILY_API_KEY` | — | Tavily API key; overrides `[search.tavily].api_key`. |
+| `SERP_API_KEY` | — | SerpAPI key. |
+| `SEARXNG_URL` | — | Local SearXNG search URL; overrides `[search.searxng].url`. |
 
-Autonomous research currently contacts only English Wikipedia through the
-MediaWiki API. Scholar uses its source and review rules before a claim enters
-the map; personal facts are excluded. Model checkpoint training and approval
-remain manual. See [Autonomous Knowledge Maintenance](docs/autonomous-knowledge-maintenance.md)
+Copy `config.example.toml` to `config.toml` to configure Tavily or a local
+SearXNG instance. `config.toml` is ignored by Git. SearXNG endpoints must be
+local (`localhost`, loopback IP, or `.local` hostname) and return JSON results.
+If no paid discovery provider can run, Scholar can use configured SearXNG;
+Wikipedia remains available in every configuration. Search snippets remain
+leads until source pages pass policy checks and are fetched.
+
+Scholar uses its source and review rules before a claim enters the map;
+personal facts are excluded. Model checkpoint training and approval remain
+manual. See [Autonomous Knowledge Maintenance](docs/autonomous-knowledge-maintenance.md)
 for the implementation and verification details.
 
 ## Update the model

@@ -1,0 +1,8 @@
+# Copy this file to config.toml for local-only provider configuration.
+
+[search.tavily]
+# api_key = ""
+
+[search.searxng]
+# Local endpoints only. Example: "http://searxng.local:8080/search"
+# url = ""

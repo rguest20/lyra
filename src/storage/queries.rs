@@ -1,5 +1,14 @@
 use super::*;
 
+fn research_relevance_weight(relevance: Option<&str>) -> usize {
+    match relevance {
+        Some("direct") => 100,
+        Some("related") => 75,
+        Some("tangential") => 40,
+        _ => 100,
+    }
+}
+
 impl LearningStore {
     pub fn claim_count(&self) -> io::Result<usize> {
         let count: i64 = self
@@ -29,7 +38,10 @@ impl LearningStore {
                     COALESCE((SELECT source_quality FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
                              CASE WHEN source_observation_id IS NOT NULL THEN 'user_reported' END),
                     COALESCE((SELECT freshness FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             CASE WHEN source_observation_id IS NOT NULL THEN 'not_applicable' END)
+                             CASE WHEN source_observation_id IS NOT NULL THEN 'not_applicable' END),
+                    (SELECT a.research_relevance FROM scholar_findings f
+                     JOIN scholar_source_assessments a ON a.finding_id = f.id
+                     WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1)
              FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id DESC LIMIT 1000",
             )
             .map_err(database_error)?;
@@ -53,6 +65,7 @@ impl LearningStore {
                     extraction_confidence: row.get(14)?,
                     source_quality: row.get(15)?,
                     freshness: row.get(16)?,
+                    research_relevance: row.get(17)?,
                 })
             })
             .map_err(database_error)?;
@@ -63,7 +76,8 @@ impl LearningStore {
                 "{} {} {}",
                 claim.subject, claim.relation, claim.object
             ));
-            let score = lexical_overlap(&words, &query_words);
+            let score = lexical_overlap(&words, &query_words)
+                * research_relevance_weight(claim.research_relevance.as_deref());
             if score > 0 {
                 ranked.push((score, claim));
             }
@@ -77,6 +91,70 @@ impl LearningStore {
             .into_iter()
             .take(limit)
             .map(|(_, claim)| claim)
+            .collect())
+    }
+
+    pub fn relevant_scholar_evidence(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
+        let query_words = relevant_words(query);
+        if query_words.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.source_url, f.subject, f.relation, f.object,
+                    f.evidence_text, f.confidence, a.gate_status, a.reason,
+                    a.research_relevance
+                 FROM scholar_findings f
+                 JOIN scholar_source_assessments a ON a.finding_id = f.id
+                 WHERE f.status = 'needs_review' AND a.direct_support = 1
+                   AND instr(f.source_excerpt, f.evidence_text) > 0
+                   AND lower(trim(f.subject)) NOT IN ('user', 'the user')
+                 ORDER BY f.id DESC LIMIT 500",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ScholarEvidenceForAnswer {
+                    id: row.get(0)?,
+                    source_url: row.get(1)?,
+                    subject: row.get(2)?,
+                    relation: row.get(3)?,
+                    object: row.get(4)?,
+                    evidence_text: row.get(5)?,
+                    confidence: row.get(6)?,
+                    gate_status: row.get(7)?,
+                    reason: row.get(8)?,
+                    research_relevance: row.get(9)?,
+                })
+            })
+            .map_err(database_error)?;
+        let mut ranked = Vec::new();
+        for row in rows {
+            let finding = row.map_err(database_error)?;
+            let words = relevant_words(&format!(
+                "{} {} {} {}",
+                finding.subject, finding.relation, finding.object, finding.evidence_text
+            ));
+            let score = lexical_overlap(&words, &query_words)
+                * research_relevance_weight(Some(&finding.research_relevance));
+            if score > 0 {
+                ranked.push((score, finding));
+            }
+        }
+        ranked.sort_by(|(left_score, left), (right_score, right)| {
+            right_score
+                .cmp(left_score)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, finding)| finding)
             .collect())
     }
 
@@ -306,6 +384,7 @@ impl LearningStore {
                     extraction_confidence: row.get(14)?,
                     source_quality: row.get(15)?,
                     freshness: row.get(16)?,
+                    research_relevance: None,
                 })
             })
             .map_err(database_error)?;

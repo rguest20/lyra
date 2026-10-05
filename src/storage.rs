@@ -9,10 +9,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 38;
 const PROMOTION_CONFIDENCE: f64 = 0.95;
+const DEFAULT_AUTO_PROMOTION_CONFIDENCE: f64 = 0.90;
 const ASSISTANT_BASE_CONFIDENCE: f64 = 0.5;
 const SEVERE_CHALLENGE_MULTIPLIER: f64 = 0.2;
+
+pub(crate) fn automatic_promotion_confidence() -> f64 {
+    parse_automatic_promotion_confidence(
+        std::env::var("SCHOLAR_AUTO_PROMOTION_CONFIDENCE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_automatic_promotion_confidence(value: Option<&str>) -> f64 {
+    value
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .unwrap_or(DEFAULT_AUTO_PROMOTION_CONFIDENCE)
+}
 
 pub struct LearningStore {
     connection: Connection,
@@ -62,6 +78,9 @@ pub struct SemanticClaim {
     pub extraction_confidence: Option<f64>,
     pub source_quality: Option<String>,
     pub freshness: Option<String>,
+    /// Relevance of the Scholar finding to the question that sourced it.
+    /// This affects retrieval priority, not factual confidence.
+    pub research_relevance: Option<String>,
 }
 
 impl Default for SemanticClaim {
@@ -84,6 +103,7 @@ impl Default for SemanticClaim {
             extraction_confidence: None,
             source_quality: None,
             freshness: None,
+            research_relevance: None,
         }
     }
 }
@@ -145,6 +165,30 @@ pub struct ScholarJob {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorroborationTask {
+    pub finding_id: i64,
+    pub provider: String,
+    pub job_id: String,
+    pub question: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorroborationQueueItem {
+    pub finding_id: i64,
+    pub claim: String,
+    pub status: String,
+    pub serp_attempts: i64,
+    pub tavily_attempts: i64,
+    pub claimed_provider: Option<String>,
+    pub last_outcome: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScoutInvestigation {
     pub trigger_kind: String,
     pub topic_key: String,
@@ -152,6 +196,108 @@ pub struct ScoutInvestigation {
     pub question: String,
     pub scholar_job_id: String,
     pub selection_reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScoutModelProbe {
+    pub id: i64,
+    pub status: String,
+    pub seed: String,
+    pub topic: Option<String>,
+    pub question: Option<String>,
+    pub selection_reason: String,
+    pub scholar_job_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarSearchAttempt {
+    pub provider: String,
+    pub trigger_reason: String,
+    pub query: String,
+    pub status: String,
+    pub result_count: Option<usize>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRequestReservation {
+    pub id: i64,
+    pub scheduled_at_ms: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TavilyReservation {
+    pub id: i64,
+    pub credits: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerpApiReservation {
+    pub id: i64,
+    pub scheduled_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SerpApiDomainObservation {
+    pub searched_at_ms: i64,
+    pub query: String,
+    pub domain: String,
+    pub result_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarSearchCandidate {
+    pub id: i64,
+    pub provider: String,
+    pub query: String,
+    pub result_type: String,
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub structured_data_json: String,
+    pub status: String,
+    pub policy_status: String,
+    pub policy_reason: Option<String>,
+    pub fetch_status: String,
+    pub fetched_url: Option<String>,
+    pub fetched_excerpt: Option<String>,
+    pub fetched_at: Option<String>,
+    /// Declared HTML metadata; useful for review, never proof of independence.
+    pub page_provenance_json: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarProvenanceReview {
+    pub id: i64,
+    pub finding_id: i64,
+    pub related_finding_id: i64,
+    pub signal: String,
+    pub source_url: String,
+    pub related_source_url: String,
+    pub source_excerpt: String,
+    pub related_source_excerpt: String,
+    pub source_metadata_json: Option<String>,
+    pub related_metadata_json: Option<String>,
+    pub status: String,
+    pub verdict: Option<String>,
+    pub rationale: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarRobotsBlock {
+    pub host: String,
+    pub display_path: String,
+    pub reason: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarExtractionAttempt {
+    pub attempt_index: usize,
+    pub passage: String,
+    pub status: String,
+    pub reason: String,
+    pub model_output: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -282,6 +428,25 @@ pub struct ScholarFinding {
     pub source_updated_at: Option<String>,
 }
 
+/// Source facts established by an adapter or reviewer, never inferred from a
+/// search snippet or a different hostname alone.
+#[derive(Clone, Debug, Default)]
+pub struct ScholarSourceProfile {
+    pub published_at: Option<String>,
+    pub verified_underlying_source_id: Option<String>,
+    pub topical_expertise_verified: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScholarEvidence {
+    pub source_title: String,
+    pub source_url: String,
+    pub source_excerpt: String,
+    pub finding: Option<ScholarFinding>,
+    pub profile: ScholarSourceProfile,
+    pub research_relevance: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredScholarFinding {
     pub id: i64,
@@ -298,6 +463,60 @@ pub struct StoredScholarFinding {
     pub source_quality: String,
     pub freshness: String,
     pub source_updated_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScholarEvidenceForAnswer {
+    pub id: i64,
+    pub source_url: String,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub evidence_text: String,
+    pub confidence: f64,
+    pub gate_status: String,
+    pub reason: String,
+    pub research_relevance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarSourceAssessment {
+    pub finding_id: i64,
+    pub topic_class: String,
+    pub source_kind: String,
+    pub topical_expertise: String,
+    pub direct_support: Option<bool>,
+    pub independence_key: Option<String>,
+    pub independence_verified: bool,
+    pub currency: String,
+    pub published_at: Option<String>,
+    pub gate_status: String,
+    pub reason: String,
+    pub research_relevance: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarSourceExpertiseReview {
+    pub id: i64,
+    pub finding_id: i64,
+    pub source_kind: String,
+    pub suitable_for_topic: bool,
+    pub published_at: Option<String>,
+    pub evidence_text: String,
+    pub rationale: String,
+    pub review_method: String,
+    pub reviewed_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScholarSourceOriginReview {
+    pub id: i64,
+    pub finding_id: i64,
+    pub underlying_source_id: String,
+    pub evidence_text: String,
+    pub rationale: String,
+    pub review_method: String,
+    pub reviewed_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -342,6 +561,7 @@ pub struct StoredAssistantClaim {
 
 mod assistant_audit;
 mod candidate_review;
+mod evidence_policy;
 mod maintenance;
 mod model_lineage;
 mod observations;
@@ -641,10 +861,19 @@ fn is_time_sensitive(question: &str, relation: &str, object: &str) -> bool {
         "version",
         "weather",
         "election",
-        "stock",
+        "stock market",
+        "stock quote",
+        "stock ticker",
+        "stock symbol",
+        "share price",
         "exchange rate",
         "market cap",
         "operating system",
+        "gpu",
+        "graphics card",
+        "processor",
+        "chipset",
+        "specification",
     ]
     .iter()
     .any(|term| text.contains(term))
@@ -758,10 +987,10 @@ fn read_assistant_claim(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAssis
     })
 }
 
-fn evidence_supports_claim(finding: &ScholarFinding) -> bool {
+pub(crate) fn evidence_supports_claim(finding: &ScholarFinding) -> bool {
     let evidence = canonical(&finding.evidence_text);
     if !evidence.contains(&canonical(&finding.subject))
-        || !evidence.contains(&canonical(&finding.object))
+        || !evidence_supports_object(&evidence, finding)
     {
         return false;
     }
@@ -774,6 +1003,20 @@ fn evidence_supports_claim(finding: &ScholarFinding) -> bool {
         .into_iter()
         .any(|word| evidence.contains(word))
         || relation.split_whitespace().all(|word| word.len() < 4)
+}
+
+fn evidence_supports_object(evidence: &str, finding: &ScholarFinding) -> bool {
+    let object = canonical(&finding.object);
+    if evidence.contains(&object) {
+        return true;
+    }
+    finding.relation.to_ascii_lowercase().starts_with("lists ")
+        && finding
+            .object
+            .split(';')
+            .map(canonical)
+            .filter(|item| !item.is_empty())
+            .all(|item| evidence.contains(&item))
 }
 
 fn get_claim(tx: &Transaction<'_>, id: u64) -> io::Result<Option<Claim>> {
@@ -850,7 +1093,7 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-fn relevant_words(text: &str) -> std::collections::BTreeSet<String> {
+pub(crate) fn relevant_words(text: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "and", "are", "did", "do", "does", "for", "from", "how", "i", "in", "is", "it",
         "me", "my", "of", "on", "or", "please", "tell", "that", "the", "to", "was", "what", "when",
@@ -863,7 +1106,7 @@ fn relevant_words(text: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-fn lexical_overlap(
+pub(crate) fn lexical_overlap(
     left: &std::collections::BTreeSet<String>,
     right: &std::collections::BTreeSet<String>,
 ) -> usize {

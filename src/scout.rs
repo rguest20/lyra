@@ -16,20 +16,52 @@ struct Gap {
     question: String,
 }
 
+enum ScoutRequest<'a> {
+    Map {
+        subject: &'a str,
+        known: &'a [String],
+        previous: &'a [String],
+    },
+    Model {
+        previous_topics: &'a [String],
+    },
+}
+
 pub fn process_once(
     database_path: &Path,
     knowledge_path: &Path,
     model: &mut LocalModel,
 ) -> io::Result<usize> {
-    process_once_with(database_path, knowledge_path, |subject, known, previous| {
-        model.scout_question(subject, known, previous)
+    process_once_with_request(database_path, knowledge_path, |request| match request {
+        ScoutRequest::Map {
+            subject,
+            known,
+            previous,
+        } => model.scout_question(subject, known, previous),
+        ScoutRequest::Model { previous_topics } => model.scout_model_lead(previous_topics),
     })
 }
 
+#[cfg(test)]
 pub(crate) fn process_once_with(
     database_path: &Path,
     knowledge_path: &Path,
     mut ask: impl FnMut(&str, &[String], &[String]) -> io::Result<String>,
+) -> io::Result<usize> {
+    process_once_with_request(database_path, knowledge_path, |request| match request {
+        ScoutRequest::Map {
+            subject,
+            known,
+            previous,
+        } => ask(subject, known, previous),
+        ScoutRequest::Model { .. } => Ok(String::new()),
+    })
+}
+
+fn process_once_with_request(
+    database_path: &Path,
+    knowledge_path: &Path,
+    mut ask: impl FnMut(ScoutRequest<'_>) -> io::Result<String>,
 ) -> io::Result<usize> {
     let mut store = LearningStore::open(database_path)?;
     let map = KnowledgeMap::load(knowledge_path)?;
@@ -82,7 +114,11 @@ pub(crate) fn process_once_with(
             let known = store.scout_known_claims_for_subject(&claim.subject)?;
             let mut rejected = previous.clone();
             for _ in 0..2 {
-                let raw = ask(&claim.subject, &known, &rejected)?;
+                let raw = ask(ScoutRequest::Map {
+                    subject: &claim.subject,
+                    known: &known,
+                    previous: &rejected,
+                })?;
                 if let Some(question) = focused_question(&raw, &claim.subject, &previous) {
                     let key = format!("claim:{}|{}", claim.id, canonical(&question));
                     if !store.scout_topic_exists("expansion", &key)? {
@@ -152,7 +188,112 @@ pub(crate) fn process_once_with(
             },
         )?));
     }
-    Ok(0)
+    let previous_topics = store.recent_model_topics()?;
+    let Some(probe_id) = store.begin_model_probe(
+        "open public knowledge",
+        "Eligible map-derived gaps exhausted; bounded model-derived lead",
+    )?
+    else {
+        return Ok(0);
+    };
+    let raw = match ask(ScoutRequest::Model {
+        previous_topics: &previous_topics,
+    }) {
+        Ok(raw) => raw,
+        Err(error) => {
+            store.complete_model_probe(probe_id, "failed", &error.to_string(), None, None, None)?;
+            return Err(error);
+        }
+    };
+    let Some((topic, question)) = parse_model_lead(&raw) else {
+        store.complete_model_probe(probe_id, "rejected", &raw, None, None, None)?;
+        return Ok(0);
+    };
+    let topic_key = canonical(&topic);
+    let covered = previous_topics
+        .iter()
+        .any(|old| canonical(old) == topic_key)
+        || !store.scout_known_claims_for_subject(&topic)?.is_empty()
+        || map
+            .entries()
+            .iter()
+            .any(|claim| claim.retracted_by.is_none() && canonical(&claim.subject) == topic_key);
+    if covered {
+        store.complete_model_probe(
+            probe_id,
+            "rejected",
+            &raw,
+            Some(&topic),
+            Some(&question),
+            None,
+        )?;
+        return Ok(0);
+    }
+    let key = format!("{topic_key}|{}", canonical(&question));
+    let queued = store.enqueue_scout_research_with_reason(
+        "model_probe",
+        &key,
+        &format!("model_probe:{probe_id}"),
+        &question,
+        "Model suggested a public question after map gaps were exhausted",
+    )?;
+    let job_id = if queued {
+        store.model_probe_job_id(probe_id)?
+    } else {
+        None
+    };
+    store.complete_model_probe(
+        probe_id,
+        if queued { "queued" } else { "rejected" },
+        &raw,
+        Some(&topic),
+        Some(&question),
+        job_id.as_deref(),
+    )?;
+    Ok(usize::from(queued))
+}
+
+fn parse_model_lead(raw: &str) -> Option<(String, String)> {
+    let mut lines = raw.lines();
+    let topic = lines.next()?.trim().strip_prefix("TOPIC:")?.trim();
+    let question = lines.next()?.trim().strip_prefix("QUESTION:")?.trim();
+    if lines.next().is_some()
+        || topic.is_empty()
+        || topic.chars().count() > 80
+        || topic.contains(['<', '>'])
+        || !public_topic(topic, "research topic")
+        || model_lead_question(question, topic).is_none()
+    {
+        return None;
+    }
+    Some((topic.to_owned(), question.to_owned()))
+}
+
+fn model_lead_question(raw: &str, topic: &str) -> Option<String> {
+    let question = raw.trim();
+    let normalized = canonical(question);
+    let words = normalized
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let normalized_topic = canonical(topic);
+    let topic_terms = normalized_topic
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.len() >= 5)
+        .collect::<HashSet<_>>();
+    let shares_topic_term = words.iter().any(|word| topic_terms.contains(word));
+    if question.chars().count() > 160
+        || !question.ends_with('?')
+        || question.contains(['\n', '\r', '<', '>'])
+        || question.matches('?').count() != 1
+        || words.len() < 6
+        || !shares_topic_term
+        || normalized.starts_with("what are the key facts about ")
+        || normalized == format!("what is {normalized_topic}?")
+    {
+        return None;
+    }
+    Some(question.to_owned())
 }
 
 fn focused_question(raw: &str, subject: &str, previous: &[String]) -> Option<String> {
@@ -353,6 +494,100 @@ mod tests {
     use crate::storage::{ScholarFinding, SemanticClaim, SemanticClaimDetail};
 
     #[test]
+    fn model_only_lead_is_queued_after_map_gaps_and_never_becomes_a_claim() {
+        let directory = std::env::temp_dir().join(format!(
+            "community-model-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("learning.db");
+        let knowledge = directory.join("knowledge.json");
+        let mut calls = 0;
+        assert_eq!(
+            process_once_with_request(&database, &knowledge, |request| {
+                calls += 1;
+                match request {
+                    ScoutRequest::Model { previous_topics } => {
+                        assert!(previous_topics.is_empty());
+                        Ok("TOPIC: Byzantine Empire\nQUESTION: What was the administrative role of the Byzantine Empire's themes?".into())
+                    }
+                    ScoutRequest::Map { .. } => panic!("empty map has no map-derived gap"),
+                }
+            }).unwrap(),
+            1
+        );
+        assert_eq!(calls, 1);
+        let mut store = LearningStore::open(&database).unwrap();
+        let probe = store.model_probes().unwrap().remove(0);
+        assert_eq!(probe.status, "queued");
+        assert_eq!(probe.topic.as_deref(), Some("Byzantine Empire"));
+        assert!(probe.scholar_job_id.is_some());
+        let investigation = store.scout_investigations().unwrap().remove(0);
+        assert_eq!(investigation.trigger_kind, "model_probe");
+        assert_eq!(
+            investigation.trigger_ref,
+            format!("model_probe:{}", probe.id)
+        );
+        assert!(store.active_semantic_claims().unwrap().is_empty());
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        store
+            .finish_scholar_job(
+                &job.id,
+                "Byzantine Empire",
+                "https://en.wikipedia.org/wiki/Byzantine_Empire",
+                "The Byzantine Empire used themes as military-administrative districts.",
+                Some(ScholarFinding {
+                    subject: "Byzantine Empire".into(),
+                    relation: "used".into(),
+                    object: "themes as military-administrative districts".into(),
+                    evidence_text:
+                        "The Byzantine Empire used themes as military-administrative districts."
+                            .into(),
+                    confidence: 0.99,
+                    valid_from: None,
+                    valid_until: None,
+                    source_quality: "reference".into(),
+                    source_updated_at: None,
+                }),
+                None,
+            )
+            .unwrap();
+        assert!(store.active_semantic_claims().unwrap().is_empty());
+        assert_eq!(
+            store.scholar_findings(&job.id).unwrap()[0].status,
+            "needs_review"
+        );
+        assert!(
+            store.scholar_findings(&job.id).unwrap()[0]
+                .decision_reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("one secondary source")
+        );
+        drop(store);
+        assert_eq!(
+            process_once_with_request(&database, &knowledge, |_| panic!("probe is cooling down"))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn model_lead_parser_rejects_unspecific_or_extra_output() {
+        assert!(parse_model_lead("TOPIC: User\nQUESTION: Where does User live?").is_none());
+        assert!(parse_model_lead("TOPIC: Mars\nQUESTION: What is Mars?").is_none());
+        assert!(
+            parse_model_lead("TOPIC: Mars\nQUESTION: What are Mars's moons?\nANSWER: two")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn summary_gap_asks_a_focused_question_and_scholar_can_add_a_new_relation() {
         let directory = std::env::temp_dir().join(format!(
             "community-scout-expansion-{}-{}",
@@ -422,6 +657,14 @@ mod tests {
                 }),
                 None,
             )
+            .unwrap();
+        let finding_id = store.scholar_findings(&job.id).unwrap()[0].id;
+        assert_eq!(
+            store.scholar_findings(&job.id).unwrap()[0].status,
+            "needs_review"
+        );
+        store
+            .review_scholar_finding(finding_id, true, "Reviewed the cited passage")
             .unwrap();
         assert_eq!(store.active_semantic_claims().unwrap().len(), 2);
         assert_eq!(

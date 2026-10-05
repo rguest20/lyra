@@ -24,7 +24,7 @@ enum Command {
 }
 
 pub struct CuratorHandle {
-    sender: mpsc::Sender<Command>,
+    sender: mpsc::SyncSender<Command>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -71,7 +71,7 @@ impl CuratorHandle {
         knowledge_path: String,
         model: Arc<Mutex<LocalModel>>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = wake_queue();
         let thread = thread::Builder::new()
             .name("semantic-curator".into())
             .spawn(move || run(database_path, knowledge_path, model, receiver));
@@ -86,7 +86,7 @@ impl CuratorHandle {
     }
 
     pub fn wake(&self) {
-        let _ = self.sender.send(Command::Wake);
+        send_wake(&self.sender);
     }
 
     pub fn stop(mut self) {
@@ -145,6 +145,14 @@ fn wait_for_next_pass(receiver: &mpsc::Receiver<Command>, interval: std::time::D
         receiver.recv_timeout(interval),
         Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout)
     )
+}
+
+fn wake_queue() -> (mpsc::SyncSender<Command>, mpsc::Receiver<Command>) {
+    mpsc::sync_channel(1)
+}
+
+fn send_wake(sender: &mpsc::SyncSender<Command>) {
+    let _ = sender.try_send(Command::Wake);
 }
 
 fn drain_commands(receiver: &mpsc::Receiver<Command>) -> bool {
@@ -496,7 +504,8 @@ fn invalid_json(error: serde_json::Error) -> io::Error {
 mod tests {
     use super::{
         Command, ExtractedClaim, contains_reference_pronoun, is_confirmation_response,
-        load_context, parse_response, validate_candidate, wait_for_next_pass,
+        load_context, parse_response, send_wake, validate_candidate, wait_for_next_pass,
+        wake_queue,
     };
     use crate::storage::Observation;
 
@@ -512,6 +521,15 @@ mod tests {
             &receiver,
             std::time::Duration::from_secs(1)
         ));
+    }
+
+    #[test]
+    fn duplicate_wake_requests_coalesce_in_a_bounded_queue() {
+        let (sender, receiver) = wake_queue();
+        send_wake(&sender);
+        send_wake(&sender);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Wake)));
+        assert!(receiver.try_recv().is_err());
     }
 
     fn observation() -> Observation {

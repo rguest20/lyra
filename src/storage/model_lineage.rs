@@ -44,6 +44,7 @@ impl LearningStore {
                         valid_until: row.get(9)?, observed_at: row.get(10)?, checked_at: row.get(11)?,
                         last_reviewed_at: row.get(12)?, next_review_at: row.get(13)?,
                         extraction_confidence: None, source_quality: None, freshness: None,
+                        research_relevance: None,
                     })
                 },
             )

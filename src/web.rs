@@ -17,6 +17,7 @@ use crate::maintenance;
 use crate::storage::LearningStore;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_IMMEDIATE_MAINTENANCE_PASSES: usize = 3;
 const PAGE: &str = include_str!("../web/index.html");
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SIGNAL_HANDLER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
@@ -57,7 +58,9 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
     let mut curator: Option<Child> = None;
-    let mut pending_maintenance = false;
+    let mut productive_passes = 0;
+    // Scan durable queues once at startup, then recover on the periodic tick.
+    let mut pending_maintenance = true;
     let interval = maintenance::interval();
     let mut next_tick = Instant::now() + interval;
 
@@ -65,18 +68,27 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         if let Some(child) = curator.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    let mut output = Vec::new();
+                    if let Some(mut stdout) = child.stdout.take() {
+                        stdout.read_to_end(&mut output)?;
+                    }
                     if !status.success() {
                         eprintln!("background maintenance process exited with {status}");
                         let store = LearningStore::open(Path::new(database_path))?;
                         store.mark_maintenance_worker_interrupted(child.id())?;
+                        productive_passes = 0;
+                    } else if maintenance_summary_did_work(&output)
+                        && productive_passes < MAX_IMMEDIATE_MAINTENANCE_PASSES
+                    {
+                        productive_passes += 1;
+                        wake_maintenance(&mut pending_maintenance);
+                    } else {
+                        productive_passes = 0;
                     }
                     curator = None;
                     next_tick = Instant::now() + interval;
                 }
-                Ok(None) => {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
-                }
+                Ok(None) => {}
                 Err(error) => {
                     eprintln!("could not poll background maintenance process: {error}");
                     let _ = child.kill();
@@ -90,7 +102,7 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         }
 
         if tick_due(Instant::now(), &mut next_tick, interval) {
-            pending_maintenance = true;
+            wake_maintenance(&mut pending_maintenance);
         }
         if pending_maintenance && curator.is_none() {
             match spawn_maintenance(&executable, database_path) {
@@ -120,7 +132,7 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
             Path::new(database_path),
         ) {
             Ok(should_curate) if should_curate => {
-                pending_maintenance = true;
+                wake_maintenance(&mut pending_maintenance);
                 next_tick = Instant::now() + interval;
             }
             Ok(_) => {}
@@ -145,15 +157,27 @@ fn tick_due(now: Instant, next_tick: &mut Instant, interval: Duration) -> bool {
     true
 }
 
+fn wake_maintenance(pending: &mut bool) {
+    *pending = true;
+}
+
 fn spawn_maintenance(executable: &Path, database_path: &str) -> io::Result<Child> {
     Command::new(executable)
         .arg("curate-once")
         .env("COMMUNITY_DB", database_path)
         .env("COMMUNITY_MAINTENANCE_MODE", "serve")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
+}
+
+fn maintenance_summary_did_work(output: &[u8]) -> bool {
+    output
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find_map(|line| serde_json::from_slice::<maintenance::PassSummary>(line).ok())
+        .is_some_and(|summary| summary.did_work())
 }
 
 /// Returns true after a chat request, which triggers one curation pass.
@@ -426,7 +450,10 @@ fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_request, read_request, serve, tick_due, valid_session_id};
+    use super::{
+        handle_request, maintenance_summary_did_work, read_request, serve, tick_due,
+        valid_session_id, wake_maintenance,
+    };
     use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -439,6 +466,29 @@ mod tests {
         assert!(!tick_due(now, &mut next, interval));
         assert!(tick_due(now + interval, &mut next, interval));
         assert!(!tick_due(now + interval, &mut next, interval));
+    }
+
+    #[test]
+    fn repeated_chat_events_coalesce_until_maintenance_starts() {
+        let mut pending = false;
+        wake_maintenance(&mut pending);
+        wake_maintenance(&mut pending);
+        assert!(pending);
+        pending = false;
+        assert!(!pending);
+    }
+
+    #[test]
+    fn productive_maintenance_pass_requests_one_bounded_follow_up() {
+        assert!(maintenance_summary_did_work(
+            br#"{"curated":1,"audited":0,"scouted":0,"researched":0,"errors":0}"#
+        ));
+        assert!(!maintenance_summary_did_work(
+            br#"{"curated":0,"audited":0,"scouted":0,"researched":0,"errors":0}"#
+        ));
+        assert!(!maintenance_summary_did_work(
+            b"worker failed before writing a summary"
+        ));
     }
 
     #[test]

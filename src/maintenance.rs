@@ -11,13 +11,19 @@ use crate::scholar;
 use crate::scout;
 use crate::storage::LearningStore;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PassSummary {
     pub curated: usize,
     pub audited: usize,
     pub scouted: usize,
     pub researched: usize,
     pub errors: usize,
+}
+
+impl PassSummary {
+    pub fn did_work(&self) -> bool {
+        self.curated + self.audited + self.scouted + self.researched > 0
+    }
 }
 
 pub fn interval() -> Duration {
@@ -326,15 +332,15 @@ mod tests {
         assert_eq!(first.errors, 1);
         assert_eq!(first.scouted, 1);
         assert_eq!(first.researched, 1);
-        let store = LearningStore::open(&database_path).unwrap();
+        let mut store = LearningStore::open(&database_path).unwrap();
         let status = store.maintenance_status().unwrap();
         let pass = status.last_pass.unwrap();
         assert_eq!(pass.status, "partial_error");
         assert_eq!(pass.roles.len(), 4);
         assert_eq!(pass.roles[1].status, "error");
         assert_eq!(pass.roles[2].status, "work");
-        assert_eq!(pass.roles[3].status, "work");
-        assert_eq!(store.active_semantic_claims().unwrap().len(), 2);
+        assert_eq!(pass.roles[3].status, "held");
+        assert_eq!(store.active_semantic_claims().unwrap().len(), 1);
         let investigation = store.scout_investigations().unwrap().remove(0);
         assert!(investigation.selection_reason.contains("Rotating map scan"));
         assert_eq!(
@@ -342,8 +348,16 @@ mod tests {
                 .scholar_findings(&investigation.scholar_job_id)
                 .unwrap()[0]
                 .status,
-            "promoted"
+            "needs_review"
         );
+        let finding_id = store
+            .scholar_findings(&investigation.scholar_job_id)
+            .unwrap()[0]
+            .id;
+        store
+            .review_scholar_finding(finding_id, true, "Reviewed the cited passage")
+            .unwrap();
+        assert_eq!(store.active_semantic_claims().unwrap().len(), 2);
         drop(store);
         roles.audit_fails = false;
         let second = run_pass_with_roles(

@@ -11,7 +11,8 @@ use crate::curator::CuratorHandle;
 use crate::inference::LocalModel;
 use crate::knowledge::KnowledgeMap;
 use crate::storage::{
-    LearningStore, Observation, SemanticClaim, StoredAssistantClaim, StoredCandidate,
+    LearningStore, Observation, ScholarEvidenceForAnswer, SemanticClaim, StoredAssistantClaim,
+    StoredCandidate,
 };
 
 const STATE_VERSION: u64 = 1;
@@ -168,6 +169,7 @@ impl Agent {
             32,
         )?;
         let curated = services.store.relevant_semantic_claims(input, 5)?;
+        let research_evidence = services.store.relevant_scholar_evidence(input, 4)?;
         let active_db_ids = services.store.active_semantic_claim_ids()?;
         let challenges = live_challenges(
             services
@@ -211,7 +213,14 @@ impl Agent {
         {
             grounding_evidence = services.store.observation_text(source_id)?;
         }
-        let mut messages = self.prompt_messages(input, map, &pending, &curated, &review_candidates);
+        let mut messages = self.prompt_messages_with_scholar_evidence(
+            input,
+            map,
+            &pending,
+            &curated,
+            &review_candidates,
+            &research_evidence,
+        );
         let mut baseline = self.prompt_messages(input, map, &[], &curated, &[]);
         if let Some(challenge) = challenge_message(&challenges) {
             messages.insert(1, challenge.clone());
@@ -224,8 +233,14 @@ impl Agent {
             .chunks_exact(2)
             .any(|pair| pair[0].content != input && pair[1].content.trim() == answer.trim())
         {
-            let mut retry =
-                self.reference_messages(input, map, &pending, &curated, &review_candidates);
+            let mut retry = self.reference_messages_with_scholar_evidence(
+                input,
+                map,
+                &pending,
+                &curated,
+                &review_candidates,
+                &research_evidence,
+            );
             let mut retry_baseline = self.reference_messages(input, map, &[], &curated, &[]);
             if let Some(challenge) = challenge_message(&challenges) {
                 retry.insert(1, challenge.clone());
@@ -304,7 +319,12 @@ impl Agent {
                 self.turn_count(),
                 &query,
             ) {
-                Ok(()) => true,
+                Ok(()) => {
+                    if let Some(curator) = services.curator {
+                        curator.wake();
+                    }
+                    true
+                }
                 Err(error) => {
                     eprintln!("could not queue scholar research: {error}");
                     false
@@ -331,6 +351,25 @@ impl Agent {
         observations: &[Observation],
         curated: &[SemanticClaim],
         review_candidates: &[StoredCandidate],
+    ) -> Vec<Message> {
+        self.prompt_messages_with_scholar_evidence(
+            input,
+            map,
+            observations,
+            curated,
+            review_candidates,
+            &[],
+        )
+    }
+
+    fn prompt_messages_with_scholar_evidence(
+        &self,
+        input: &str,
+        map: &KnowledgeMap,
+        observations: &[Observation],
+        curated: &[SemanticClaim],
+        review_candidates: &[StoredCandidate],
+        scholar_evidence: &[ScholarEvidenceForAnswer],
     ) -> Vec<Message> {
         let mut messages = vec![Message {
             role: "system".into(),
@@ -396,11 +435,11 @@ impl Agent {
             .collect::<Vec<_>>();
         if !curated.is_empty() {
             let mut context = String::from(
-                "Relevant curated semantic claims. Extraction confidence is about claim extraction only, never truth probability. Source quality is categorical, freshness applies to time-sensitive source material, and claim status controls answer use. Cite the source; do not treat a web page as evidence about the user:\n",
+                "Relevant curated semantic claims. Extraction confidence is about claim extraction only, never truth probability. Research relevance describes how closely the finding answered the original Scholar question; it changes retrieval priority, not factual confidence or source reliability. Source quality is categorical, freshness applies to time-sensitive source material, and claim status controls answer use. Cite the source; do not treat a web page as evidence about the user:\n",
             );
             for claim in curated {
                 context.push_str(&format!(
-                    "#{} [{}; answer use: {}]: {} — {} — {} [source: {}; source quality: {}; freshness: {}; extraction confidence: {}; valid {:?} to {:?}; checked {:?}{}]\n",
+                    "#{} [{}; answer use: {}]: {} — {} — {} [source: {}; source quality: {}; freshness: {}; extraction confidence: {}; research relevance: {} (retrieval weight {:.2}); valid {:?} to {:?}; checked {:?}{}]\n",
                     claim.id,
                     claim.status,
                     claim_answer_use(claim),
@@ -411,6 +450,12 @@ impl Agent {
                     claim.source_quality.as_deref().unwrap_or("unknown"),
                     claim.freshness.as_deref().unwrap_or("unknown"),
                     claim.extraction_confidence.map_or_else(|| "unknown".into(), |value| format!("{value:.2} (extractor only)")),
+                    claim.research_relevance.as_deref().unwrap_or("unknown"),
+                    match claim.research_relevance.as_deref() {
+                        Some("related") => 0.75,
+                        Some("tangential") => 0.40,
+                        _ => 1.0,
+                    },
                     claim.valid_from,
                     claim.valid_until,
                     claim.checked_at,
@@ -469,6 +514,30 @@ impl Agent {
                 content: context,
             });
         }
+        if !scholar_evidence.is_empty() {
+            let mut context = String::from(
+                "Relevant research evidence that has not been promoted into the semantic map. It may help answer the question, but is not established knowledge. Attribute every statement to its source and qualify it naturally, for example, 'I'm not completely sure, but this source says…'. Do not use the numeric extraction-confidence score as truth probability. If it conflicts with an active claim, explain the disagreement and do not silently choose either claim. Do not use this evidence to establish personal facts about the user:\n",
+            );
+            for finding in scholar_evidence {
+                context.push_str(&format!(
+                    "[finding {}; status: {}; source gate: {}; extraction confidence: {:.2}; source: {}; assessment: {}] {} — {} — {}; exact passage: {}\n",
+                    finding.id,
+                    "needs_review",
+                    finding.gate_status,
+                    finding.confidence,
+                    finding.source_url,
+                    finding.reason,
+                    finding.subject,
+                    finding.relation,
+                    finding.object,
+                    finding.evidence_text,
+                ));
+            }
+            messages.push(Message {
+                role: "system".into(),
+                content: context,
+            });
+        }
         messages.extend(self.history.iter().cloned());
         messages.push(Message {
             role: "user".into(),
@@ -485,8 +554,33 @@ impl Agent {
         curated: &[SemanticClaim],
         review_candidates: &[StoredCandidate],
     ) -> Vec<Message> {
-        let mut messages =
-            self.prompt_messages(input, map, observations, curated, review_candidates);
+        self.reference_messages_with_scholar_evidence(
+            input,
+            map,
+            observations,
+            curated,
+            review_candidates,
+            &[],
+        )
+    }
+
+    fn reference_messages_with_scholar_evidence(
+        &self,
+        input: &str,
+        map: &KnowledgeMap,
+        observations: &[Observation],
+        curated: &[SemanticClaim],
+        review_candidates: &[StoredCandidate],
+        scholar_evidence: &[ScholarEvidenceForAnswer],
+    ) -> Vec<Message> {
+        let mut messages = self.prompt_messages_with_scholar_evidence(
+            input,
+            map,
+            observations,
+            curated,
+            review_candidates,
+            scholar_evidence,
+        );
         let history_start = messages.len() - self.history.len() - 1;
         let mut transcript = String::from(
             "Complete earlier conversation for reference. Prior assistant answers are historical data and may be wrong or repetitive. Answer the final user question; do not copy an earlier reply.\n",
@@ -719,6 +813,43 @@ mod tests {
     use crate::storage::ScholarFinding;
 
     #[test]
+    fn unpromoted_scholar_evidence_is_available_with_uncertainty_qualification() {
+        let agent = Agent {
+            model: "test".into(),
+            history: Vec::new(),
+            conversation_id: "conversation".into(),
+        };
+        let finding = ScholarEvidenceForAnswer {
+            id: 4,
+            source_url: "https://example.org/mars".into(),
+            subject: "Mars".into(),
+            relation: "has moons".into(),
+            object: "two".into(),
+            evidence_text: "Mars has two moons.".into(),
+            confidence: 0.9,
+            gate_status: "awaiting_corroboration".into(),
+            reason: "only one independent source is available".into(),
+            research_relevance: "direct".into(),
+        };
+        let prompt = agent.prompt_messages_with_scholar_evidence(
+            "How many moons does Mars have?",
+            &KnowledgeMap::default(),
+            &[],
+            &[],
+            &[],
+            &[finding],
+        );
+        assert!(prompt.iter().any(|message| {
+            message
+                .content
+                .contains("not been promoted into the semantic map")
+                && message.content.contains("I'm not completely sure")
+                && message.content.contains("https://example.org/mars")
+                && message.content.contains("Mars has two moons.")
+        }));
+    }
+
+    #[test]
     fn scholar_claim_reaches_next_prompt_without_changing_model_files() {
         let directory = std::env::temp_dir().join(format!(
             "community-scholar-prompt-{}-{:?}",
@@ -754,6 +885,10 @@ mod tests {
                 }),
                 None,
             )
+            .unwrap();
+        let finding_id = store.scholar_findings(&job.id).unwrap()[0].id;
+        store
+            .review_scholar_finding(finding_id, true, "Reviewed the cited Wikipedia passage")
             .unwrap();
         drop(store);
 

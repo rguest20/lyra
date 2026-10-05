@@ -2,3 +2,6 @@
 /state/
 /models/
 .DS_Store
+.env
+config.toml
+*.example
