@@ -609,6 +609,7 @@ fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
             "https://first.example.org/mars",
             "Mars is a planet. This report describes telescope observations.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -704,6 +705,7 @@ fn source_assessment_migration_marks_old_findings_unassessed() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -754,6 +756,7 @@ fn expired_scholar_lease_reclaims_once_and_duplicate_finish_rolls_back() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -775,6 +778,7 @@ fn expired_scholar_lease_reclaims_once_and_duplicate_finish_rolls_back() {
                 "https://en.wikipedia.org/wiki/Mars",
                 "Mars is a planet.",
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -838,6 +842,7 @@ fn only_active_explicitly_approved_claims_can_train_the_model() {
 #[test]
 fn scholar_evidence_must_support_the_relation_and_object() {
     let claim = ScholarFinding {
+        semantic_support: None,
         subject: "Hellenic Police".into(),
         relation: "first editor".into(),
         object: "Dimitrios Mallios".into(),
@@ -855,6 +860,7 @@ fn scholar_evidence_must_support_the_relation_and_object() {
 fn scholar_evidence_supports_each_item_in_a_cited_source_list() {
     let evidence_text = "Usually, the main ingredients of chicken soup are:\n* Chicken broth\n* Chicken\n* Noodles\n* Carrots";
     let claim = ScholarFinding {
+        semantic_support: None,
         subject: "Chicken soup".into(),
         relation: "lists ingredients".into(),
         object: "Chicken broth; Chicken; Noodles; Carrots".into(),
@@ -868,10 +874,66 @@ fn scholar_evidence_supports_each_item_in_a_cited_source_list() {
     assert!(evidence_supports_claim(&claim));
 
     let unsupported_item = ScholarFinding {
+        semantic_support: None,
         object: "Chicken broth; Chicken; Noodles; Peas".into(),
         ..claim
     };
     assert!(!evidence_supports_claim(&unsupported_item));
+}
+
+#[test]
+fn failed_ai_review_retries_after_restart_without_blocking_other_findings() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let mut ids = Vec::new();
+    for turn in 1..=2 {
+        store
+            .enqueue_research("retry-test", turn, "What is Mars?")
+            .unwrap();
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        store
+            .finish_scholar_job(
+                &job.id,
+                "Mars",
+                &format!("https://source{turn}.example/mars"),
+                "Mars is a planet.",
+                Some(ScholarFinding {
+                    semantic_support: None,
+                    subject: "Mars".into(),
+                    relation: "is a".into(),
+                    object: "planet".into(),
+                    evidence_text: "Mars is a planet.".into(),
+                    confidence: 0.99,
+                    valid_from: None,
+                    valid_until: None,
+                    source_quality: "unknown".into(),
+                    source_updated_at: None,
+                }),
+                None,
+            )
+            .unwrap();
+        ids.push(store.scholar_findings(&job.id).unwrap()[0].id);
+    }
+    assert_eq!(store.scholar_ai_review_queue().unwrap().len(), 2);
+    store
+        .defer_scholar_ai_review(ids[0], "source_kind was invalid")
+        .unwrap();
+    drop(store);
+    let reopened = LearningStore::open(&path).unwrap();
+    let ready = reopened.scholar_ai_review_queue().unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].0, ids[1]);
+    assert!(reopened.active_semantic_claims().unwrap().is_empty());
+    reopened
+        .connection
+        .execute(
+            "UPDATE scholar_ai_review_retries SET retry_after = '2000-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(reopened.scholar_ai_review_queue().unwrap().len(), 2);
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -887,6 +949,7 @@ fn review_cannot_promote_a_finding_without_direct_passage_support() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -934,6 +997,7 @@ fn scholar_requires_quality_and_freshness_separate_from_extraction_score() {
             "https://example.invalid/page",
             "Example has a property.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Example".into(),
                 relation: "has".into(),
                 object: "a property".into(),
@@ -966,6 +1030,7 @@ fn scholar_requires_quality_and_freshness_separate_from_extraction_score() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars current population is 100.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "current population is".into(),
                 object: "100".into(),
@@ -994,6 +1059,7 @@ fn scholar_requires_quality_and_freshness_separate_from_extraction_score() {
             "https://en.wikipedia.org/wiki/Insomnia",
             "A treatment is available.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Insomnia".into(),
                 relation: "treatment is".into(),
                 object: "available".into(),
@@ -1042,6 +1108,7 @@ fn two_verified_independent_secondary_sources_can_promote_one_claim() {
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -1119,6 +1186,7 @@ fn copied_secondary_sources_do_not_count_as_independent() {
                 url,
                 "Mars is a planet.",
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -1167,6 +1235,7 @@ fn repeated_article_wording_blocks_corroboration_even_with_different_source_ids(
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Chicken soup".into(),
                     relation: "contains".into(),
                     object: "chicken".into(),
@@ -1235,6 +1304,7 @@ fn shared_short_fact_in_distinct_recipes_is_not_a_copy_signal() {
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Chicken soup".into(),
                     relation: "contains".into(),
                     object: "chicken".into(),
@@ -1333,6 +1403,7 @@ fn shared_declared_citation_holds_until_curmudgeon_resolves_it_as_distinct() {
                 url,
                 &passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Chicken soup".into(),
                     relation: "contains".into(),
                     object: "chicken".into(),
@@ -1394,6 +1465,7 @@ fn reviewed_primary_source_can_clear_expertise_gate_but_claim_needs_its_own_revi
             "https://journal.example/photosynthesis",
             evidence,
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Photosynthesis".into(),
                 relation: "converts".into(),
                 object: "light energy".into(),
@@ -1458,6 +1530,7 @@ fn reviewed_secondary_still_needs_independence_and_recent_claim_needs_confirmed_
             "https://tech.example/gpu",
             evidence,
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "GPU".into(),
                 relation: "has memory".into(),
                 object: "16 GB".into(),
@@ -1533,6 +1606,7 @@ fn two_suitable_secondary_sources_need_distinct_reviewer_verified_origins() {
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -1618,6 +1692,7 @@ fn scholar_research_flow_keeps_two_source_evidence_through_review_and_promotion(
                     source_url: url.to_owned(),
                     source_excerpt: passage.to_owned(),
                     finding: Some(ScholarFinding {
+                        semantic_support: None,
                         subject: "Mars".into(),
                         relation: "is a".into(),
                         object: "planet".into(),
@@ -1748,6 +1823,7 @@ fn scholar_auto_reviews_direct_findings_from_distinct_hosts_at_configured_defaul
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -1862,6 +1938,7 @@ fn scholar_auto_promotion_waits_until_active_map_conflict_is_resolved() {
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "has moons".into(),
                     object: "two".into(),
@@ -1927,6 +2004,7 @@ fn matching_verified_publication_ids_do_not_satisfy_secondary_corroboration() {
                 url,
                 passage,
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),
@@ -1977,6 +2055,7 @@ fn one_job_keeps_wikipedia_and_fetched_source_claims_with_separate_assessments()
         .unwrap();
     let job = store.claim_scholar_job().unwrap().unwrap();
     let make_finding = |quality: &str| ScholarFinding {
+        semantic_support: None,
         subject: "Mars".into(),
         relation: "is a".into(),
         object: "planet".into(),
@@ -2293,7 +2372,7 @@ fn schema_v37_migrates_persisted_http_safety_state() {
         .connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 38);
+    assert_eq!(version, super::SCHEMA_VERSION);
     migrated
         .reserve_host_request_with_interval("migration.example", "external_robots_txt", 10_000)
         .unwrap();
@@ -2381,6 +2460,7 @@ fn source_specific_list_is_directly_supported_but_held_for_review() {
                 source_url: "https://example.org/chicken-soup".into(),
                 source_excerpt: passage.into(),
                 finding: Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Simple Chicken Soup".into(),
                     relation: "lists ingredients".into(),
                     object: "Chicken breasts; Chicken stock; Carrots".into(),
@@ -2496,6 +2576,7 @@ fn recent_primary_requires_verified_expertise_and_publication_date() {
             "https://vendor.example.com/specs",
             "Example GPU has 24 GB memory.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Example GPU".into(),
                 relation: "has".into(),
                 object: "24 GB memory".into(),
@@ -2553,6 +2634,7 @@ fn scholar_conflicts_depend_on_overlapping_claim_periods() {
             "https://en.wikipedia.org/wiki/Alex",
             excerpt,
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Alex".into(),
                 relation: "served as mayor in".into(),
                 object: "Town B".into(),
@@ -2595,6 +2677,7 @@ fn scholar_conflicts_depend_on_overlapping_claim_periods() {
             "https://en.wikipedia.org/wiki/Alex#later",
             excerpt,
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Alex".into(),
                 relation: "served as mayor in".into(),
                 object: "Town C".into(),
@@ -2656,6 +2739,7 @@ fn scholar_queue_promotes_only_source_supported_claims() {
             "https://en.wikipedia.org/wiki/Photosynthesis",
             "Photosynthesis converts light energy into chemical energy.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Photosynthesis".into(),
                 relation: "converts".into(),
                 object: "light energy into chemical energy".into(),
@@ -2701,6 +2785,7 @@ fn scholar_queue_promotes_only_source_supported_claims() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -2738,6 +2823,7 @@ fn scholar_queue_promotes_only_source_supported_claims() {
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
             Some(ScholarFinding {
+                semantic_support: None,
                 subject: "Mars".into(),
                 relation: "is a".into(),
                 object: "planet".into(),
@@ -3691,4 +3777,710 @@ fn inbox_details_and_review_acceptance_preserve_conflict_history() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+fn feedback_fixture(store: &mut LearningStore) -> (String, i64) {
+    store
+        .enqueue_research("feedback-test", 1, "What kind of body is Mars?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let id = feedback_finding(store, &job.id);
+    (job.id, id)
+}
+
+fn feedback_finding(store: &mut LearningStore, job: &str) -> i64 {
+    store
+        .finish_scholar_job(
+            job,
+            "Mars",
+            "https://evidence.example/mars",
+            "Mars is a planet.",
+            Some(ScholarFinding {
+                semantic_support: None,
+                subject: "Mars".into(),
+                relation: "is a".into(),
+                object: "planet".into(),
+                evidence_text: "Mars is a planet.".into(),
+                confidence: 0.99,
+                valid_from: None,
+                valid_until: None,
+                source_quality: "unknown".into(),
+                source_updated_at: None,
+            }),
+            None,
+        )
+        .unwrap();
+    store.scholar_findings(job).unwrap()[0].id
+}
+
+#[test]
+fn feedback_budget_is_three_total_across_routes_and_restarts() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (original_job, root) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_feedback(
+            root,
+            "Needs better extraction",
+            "repair",
+            "Preserve the source's actual wording.",
+        )
+        .unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let repair = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    assert_eq!((repair.root_finding_id, repair.attempt), (root, 2));
+    assert_eq!(repair.question, "What kind of body is Mars?");
+    assert_eq!(repair.source_excerpt, "Mars is a planet.");
+    assert_eq!(repair.guidance, "Preserve the source's actual wording.");
+    let child = feedback_finding(&mut store, &repair.job_id);
+    store
+        .finish_scholar_feedback(&repair, true, "Re-extracted for review")
+        .unwrap();
+    assert_eq!(
+        store.scholar_findings(&repair.job_id).unwrap()[0].status,
+        "needs_review"
+    );
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    store
+        .reject_scholar_finding_with_source_feedback(
+            child,
+            "Unsuitable source",
+            "new_source",
+            "Find an independent astronomy reference.",
+            Some("irrelevant"),
+            None,
+        )
+        .unwrap();
+    let search = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    assert_eq!((search.root_finding_id, search.attempt), (root, 3));
+    assert_eq!(search.question, repair.question);
+    assert_eq!(
+        store
+            .scholar_feedback_excluded_sources(&search.job_id)
+            .unwrap(),
+        vec!["https://evidence.example/mars"]
+    );
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(job.id, search.job_id);
+    let last = feedback_finding(&mut store, &job.id);
+    store
+        .finish_scholar_feedback(&search, true, "Another candidate")
+        .unwrap();
+    store
+        .reject_scholar_finding_with_feedback(
+            last,
+            "Still unsupported",
+            "repair",
+            "Read the exact passage.",
+        )
+        .unwrap();
+    assert!(store.claim_scholar_feedback("repair").unwrap().is_none());
+    assert!(
+        store
+            .claim_scholar_feedback("new_source")
+            .unwrap()
+            .is_none()
+    );
+    let session: (i64, String) = store
+        .connection
+        .query_row(
+            "SELECT attempts, status FROM scholar_feedback_sessions WHERE root_finding_id = ?1",
+            [root],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(session, (3, "exhausted".into()));
+    assert_eq!(
+        store.scholar_findings(&original_job).unwrap()[0].status,
+        "rejected"
+    );
+    assert_eq!(store.scholar_jobs().unwrap().len(), 3);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn feedback_failed_attempt_recovery_is_idempotent_and_bounded() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (_, root) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_feedback(
+            root,
+            "Bad extraction",
+            "repair",
+            "Try the exact passage again.",
+        )
+        .unwrap();
+    let repair = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    // A stale lease resumes the same attempt and job, without spending another go.
+    store.connection.execute("UPDATE scholar_research_feedback SET claimed_at = '2000-01-01T00:00:00Z' WHERE id = ?1", [repair.id]).unwrap();
+    let reclaimed = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    assert_eq!(
+        (reclaimed.id, reclaimed.job_id.as_str(), reclaimed.attempt),
+        (repair.id, repair.job_id.as_str(), 2)
+    );
+    store
+        .finish_scholar_job(&repair.job_id, "", "", "", None, Some("No grounded claim"))
+        .unwrap();
+    // Simulate interruption after the job completes but before feedback completion.
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    store.recover_finished_scholar_feedback().unwrap();
+    store.recover_finished_scholar_feedback().unwrap();
+    store
+        .finish_scholar_feedback(&repair, false, "Repeated completion")
+        .unwrap();
+    let search = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    assert_eq!(search.attempt, 3);
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&search.job_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        search
+            .guidance
+            .contains("Previous attempt produced no grounded finding")
+    );
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    store
+        .finish_scholar_job(&job.id, "", "", "", None, Some("No suitable source"))
+        .unwrap();
+    store
+        .finish_scholar_feedback(&search, false, "No suitable source")
+        .unwrap();
+    store
+        .finish_scholar_feedback(&search, false, "Duplicate completion")
+        .unwrap();
+    assert!(
+        store
+            .claim_scholar_feedback("new_source")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(store.scholar_jobs().unwrap().len(), 3);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT status FROM scholar_feedback_sessions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "exhausted"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn invalid_feedback_rolls_back_rejection_and_acceptance_stops_retrying() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (job, root) = feedback_fixture(&mut store);
+    assert!(
+        store
+            .reject_scholar_finding_with_feedback(root, "Fixable", "repair", "")
+            .is_err()
+    );
+    assert_eq!(
+        store.scholar_findings(&job).unwrap()[0].status,
+        "needs_review"
+    );
+    assert!(store.claim_scholar_feedback("repair").unwrap().is_none());
+    store
+        .reject_scholar_finding_with_feedback(root, "Fixable", "repair", "Re-extract faithfully.")
+        .unwrap();
+    let task = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    let child = feedback_finding(&mut store, &task.job_id);
+    store
+        .finish_scholar_feedback(&task, true, "Extracted")
+        .unwrap();
+    store
+        .review_scholar_finding_ai(child, true, "Exact passage supports it.")
+        .unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT status FROM scholar_feedback_sessions", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+        "accepted"
+    );
+    assert!(store.claim_scholar_feedback("repair").unwrap().is_none());
+    assert_eq!(store.active_semantic_claims().unwrap().len(), 1);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn feedback_migration_preserves_existing_findings() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (job, root) = feedback_fixture(&mut store);
+    store.connection.execute_batch("DROP TABLE scholar_research_feedback; DROP TABLE scholar_feedback_sessions; PRAGMA user_version = 39;").unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    assert_eq!(store.scholar_findings(&job).unwrap()[0].id, root);
+    store
+        .reject_scholar_finding_with_feedback(root, "Fixable", "repair", "Read the passage.")
+        .unwrap();
+    assert_eq!(
+        store
+            .claim_scholar_feedback("repair")
+            .unwrap()
+            .unwrap()
+            .attempt,
+        2
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn source_feedback_preserves_suggested_evidence_and_does_not_exclude_on_failure() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (job, root) = feedback_fixture(&mut store);
+    assert!(
+        store
+            .reject_scholar_finding_with_source_feedback(
+                root,
+                "Wrong wording",
+                "repair",
+                "Extract the classification.",
+                None,
+                Some("Mars is a moon.")
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.scholar_findings(&job).unwrap()[0].status,
+        "needs_review"
+    );
+    assert!(
+        store
+            .reject_scholar_finding_with_source_feedback(
+                root,
+                "Wrong wording",
+                "repair",
+                "Extract the classification.",
+                Some("unreliable"),
+                None
+            )
+            .is_err()
+    );
+    store
+        .reject_scholar_finding_with_source_feedback(
+            root,
+            "Wrong wording",
+            "repair",
+            "Extract the classification.",
+            None,
+            Some("Mars is a planet."),
+        )
+        .unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let task = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    assert_eq!(
+        task.suggested_evidence.as_deref(),
+        Some("Mars is a planet.")
+    );
+    assert!(task.exclusion_reason.is_none());
+    store
+        .finish_scholar_job(&task.job_id, "", "", "", None, Some("Extraction failed"))
+        .unwrap();
+    store
+        .finish_scholar_feedback(&task, false, "Extraction failed")
+        .unwrap();
+    let search = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    assert_eq!(search.attempt, 3);
+    assert!(search.exclusion_reason.is_none());
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&search.job_id)
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn version_40_feedback_migration_retains_budget_without_ambiguous_exclusions() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (_, root) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_feedback(
+            root,
+            "Old ambiguous review",
+            "new_source",
+            "Find something more relevant.",
+        )
+        .unwrap();
+    store.connection.execute_batch("ALTER TABLE scholar_research_feedback DROP COLUMN exclusion_reason; ALTER TABLE scholar_research_feedback DROP COLUMN suggested_evidence; PRAGMA user_version = 40;").unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let task = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    assert_eq!(task.attempt, 2);
+    assert_eq!(task.root_finding_id, root);
+    assert_eq!(task.guidance, "Find something more relevant.");
+    assert!(task.exclusion_reason.is_none());
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&task.job_id)
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn source_exclusion_is_confined_to_one_finding_retry_chain_after_restart() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (original_job, root) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_source_feedback(
+            root,
+            "Irrelevant to this claim",
+            "new_source",
+            "Find evidence for the original question.",
+            Some("irrelevant"),
+            None,
+        )
+        .unwrap();
+    let retry = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    let excluded = "https://evidence.example/mars";
+    assert_eq!(
+        store
+            .scholar_feedback_excluded_sources(&retry.job_id)
+            .unwrap(),
+        vec![excluded]
+    );
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&original_job)
+            .unwrap()
+            .is_empty()
+    );
+    // Finish the retry job, then research the identical question independently.
+    assert_eq!(store.claim_scholar_job().unwrap().unwrap().id, retry.job_id);
+    store
+        .finish_scholar_job(&retry.job_id, "", "", "", None, Some("No result"))
+        .unwrap();
+    store
+        .finish_scholar_feedback(&retry, true, "Completed test retry")
+        .unwrap();
+    store
+        .enqueue_research("independent-claim", 1, "What kind of body is Mars?")
+        .unwrap();
+    let independent = store.claim_scholar_job().unwrap().unwrap();
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&independent.id)
+            .unwrap()
+            .is_empty()
+    );
+    let independent_finding = feedback_finding(&mut store, &independent.id);
+    store
+        .reject_scholar_finding_with_feedback(
+            independent_finding,
+            "Improve wording",
+            "repair",
+            "Keep the supported detail.",
+        )
+        .unwrap();
+    let independent_retry = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    assert_ne!(independent_retry.root_finding_id, root);
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&independent_retry.job_id)
+            .unwrap()
+            .is_empty()
+    );
+    // The page is also available to an entirely different research question.
+    store
+        .enqueue_research(
+            "different-claim",
+            1,
+            "What is the history of Mars observation?",
+        )
+        .unwrap();
+    let different = store.claim_scholar_job().unwrap().unwrap();
+    assert!(
+        store
+            .scholar_feedback_excluded_sources(&different.id)
+            .unwrap()
+            .is_empty()
+    );
+    drop(store);
+    let store = LearningStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .scholar_feedback_excluded_sources(&retry.job_id)
+            .unwrap(),
+        vec![excluded]
+    );
+    for job in [
+        &original_job,
+        &independent.id,
+        &independent_retry.job_id,
+        &different.id,
+    ] {
+        assert!(
+            store
+                .scholar_feedback_excluded_sources(job)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+fn semantic_round_finding() -> ScholarFinding {
+    let mut finding = crate::semantic::candidate_from_context(&serde_json::json!({"subject":"The world","relation":"is","object":"round","evidence_text":"The world is round."})).unwrap();
+    let passage = "The world is spherical.";
+    let support = crate::semantic::assess_with("What shape is the world?","World",passage,&finding, |_|Ok(serde_json::json!({"verdict":"entailed","reason":"Spherical entails round.","evidence_text":passage}).to_string())).unwrap();
+    finding.evidence_text = passage.into();
+    finding.semantic_support = Some(support);
+    finding
+}
+
+#[test]
+fn semantic_paraphrase_survives_storage_restart_and_ai_promotion() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("semantic-round", 1, "What shape is the world?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    store
+        .finish_scholar_job(
+            &job.id,
+            "World",
+            "https://evidence.example/world",
+            "The world is spherical.",
+            Some(semantic_round_finding()),
+            None,
+        )
+        .unwrap();
+    let id = store.scholar_findings(&job.id).unwrap()[0].id;
+    assert_eq!(
+        store
+            .scholar_source_assessment(id)
+            .unwrap()
+            .unwrap()
+            .direct_support,
+        Some(true)
+    );
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let context = store.scholar_review_context(id).unwrap().unwrap();
+    assert_eq!(context["object"], "round");
+    assert_eq!(context["evidence_text"], "The world is spherical.");
+    assert_eq!(context["support_method"], "ai_semantic_entailment");
+    assert_eq!(context["semantic_support"]["verdict"], "entailed");
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    store
+        .review_scholar_source_expertise_ai(id, "primary", true, None, "Verified for this topic.")
+        .unwrap();
+    store
+        .review_scholar_finding_ai(id, true, "The source supports this paraphrase.")
+        .unwrap();
+    assert_eq!(
+        store.active_semantic_claims().unwrap()[0].claim.object,
+        "round"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn semantic_assessment_cannot_approve_a_changed_finding() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("semantic-mutation", 1, "What shape is the world?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let mut finding = semantic_round_finding();
+    finding.object = "flat".into();
+    assert!(
+        store
+            .finish_scholar_job(
+                &job.id,
+                "World",
+                "https://evidence.example/world",
+                "The world is spherical.",
+                Some(finding),
+                None
+            )
+            .is_err()
+    );
+    assert!(store.scholar_findings(&job.id).unwrap().is_empty());
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn pending_lexical_failure_can_gain_semantic_support_without_replacing_claim() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("semantic-legacy", 1, "What shape is the world?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let mut finding = semantic_round_finding();
+    let support = finding.semantic_support.take().unwrap();
+    finding.evidence_text = "The world is round.".into();
+    store
+        .finish_scholar_job(
+            &job.id,
+            "World",
+            "https://evidence.example/world",
+            "The world is spherical.",
+            Some(finding),
+            None,
+        )
+        .unwrap();
+    let id = store.scholar_findings(&job.id).unwrap()[0].id;
+    assert_eq!(
+        store
+            .scholar_source_assessment(id)
+            .unwrap()
+            .unwrap()
+            .direct_support,
+        Some(false)
+    );
+    store.record_scholar_semantic_support(id, &support).unwrap();
+    assert_eq!(
+        store
+            .scholar_source_assessment(id)
+            .unwrap()
+            .unwrap()
+            .direct_support,
+        Some(true)
+    );
+    assert_eq!(store.scholar_findings(&job.id).unwrap()[0].object, "round");
+    assert_eq!(
+        store.scholar_findings(&job.id).unwrap()[0].evidence_text,
+        "The world is spherical."
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn semantic_schema_upgrade_preserves_findings_and_does_not_invent_assessments() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (job, id) = feedback_fixture(&mut store);
+    store
+        .connection
+        .execute_batch("DROP TABLE scholar_semantic_support; PRAGMA user_version = 41;")
+        .unwrap();
+    drop(store);
+    let store = LearningStore::open(&path).unwrap();
+    assert_eq!(store.scholar_findings(&job).unwrap()[0].id, id);
+    assert_eq!(
+        store
+            .connection
+            .query_row("SELECT COUNT(*) FROM scholar_semantic_support", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn ai_promotion_rechecks_saved_semantic_assessment_binding() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("semantic-stored-mutation", 1, "What shape is the world?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    store
+        .finish_scholar_job(
+            &job.id,
+            "World",
+            "https://evidence.example/world",
+            "The world is spherical.",
+            Some(semantic_round_finding()),
+            None,
+        )
+        .unwrap();
+    let id = store.scholar_findings(&job.id).unwrap()[0].id;
+    store
+        .connection
+        .execute(
+            "UPDATE scholar_findings SET object = 'flat' WHERE id = ?1",
+            [id],
+        )
+        .unwrap();
+    let error = store
+        .review_scholar_finding_ai(id, true, "Accept revised wording.")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("saved semantic assessment no longer supports")
+    );
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn semantic_disproof_blocks_promotion_despite_matching_candidate_words() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("semantic-disproof", 1, "Is Earth flat?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let passage = "Flat Earth is a scientifically disproven conception of the Earth's shape as a plane or disk.";
+    let finding = crate::semantic::candidate_from_context(&serde_json::json!({"subject":"Flat Earth","relation":"is","object":"a true conception of the Earth as a plane or disk","evidence_text":passage})).unwrap();
+    let support = crate::semantic::assess_with("Is Earth flat?","Flat Earth",passage,&finding, |_|Ok(serde_json::json!({"verdict":"entailed","reason":"It mentions the conception.","evidence_text":passage}).to_string())).unwrap();
+    assert_eq!(support.verdict(), "contradicted");
+    store
+        .finish_scholar_job(
+            &job.id,
+            "Flat Earth",
+            "https://evidence.example/flat-earth",
+            passage,
+            Some(finding),
+            None,
+        )
+        .unwrap();
+    let id = store.scholar_findings(&job.id).unwrap()[0].id;
+    store.record_scholar_semantic_support(id, &support).unwrap();
+    assert_eq!(
+        store
+            .scholar_source_assessment(id)
+            .unwrap()
+            .unwrap()
+            .direct_support,
+        Some(false)
+    );
+    assert!(
+        store
+            .review_scholar_finding_ai(id, true, "Accept the mentioned notion.")
+            .is_err()
+    );
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }

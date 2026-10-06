@@ -5,3 +5,5 @@
 .env
 config.toml
 *.example
+
+/.venv-qwen35/

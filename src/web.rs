@@ -346,6 +346,10 @@ fn handle_request(
             return Ok(false);
         }
     };
+    // Child diagnostics belong in the server log on successful replies too.
+    if !output.stderr.is_empty() {
+        io::stderr().lock().write_all(&output.stderr)?;
+    }
     if output.status.success() {
         let result: serde_json::Value =
             match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
@@ -374,7 +378,18 @@ fn handle_request(
             .into_bytes(),
         )?;
     } else {
-        let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let reason = reply_error(&output.stderr);
+        #[cfg(unix)]
+        let signal = {
+            use std::os::unix::process::ExitStatusExt;
+            output.status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        crate::diagnostics::event(
+            "web.reply_process_failed",
+            json!({"exit_code":output.status.code(),"signal":signal,"reason":reason}),
+        );
         respond(
             stream,
             "500 Internal Server Error",
@@ -385,6 +400,19 @@ fn handle_request(
         )?;
     }
     Ok(true)
+}
+
+fn reply_error(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find(|line| {
+            !line.trim().is_empty()
+                && !serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|value| value.get("event").is_some())
+        })
+        .map(|line| line.trim().chars().take(1000).collect())
+        .unwrap_or_else(|| "reply process failed; see the server log for details".into())
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -522,6 +550,19 @@ mod tests {
             serde_json::from_slice(br#"{"message":"hello","session_id":"0123456789abcdef0123456789abcdef","show_thinking":true}"#).unwrap();
         assert!(parsed.show_thinking);
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn reply_errors_show_the_failure_and_keep_startup_diagnostics_out_of_the_bubble() {
+        let stderr = b"{\"event\":\"model.loaded\",\"details\":{\"adapter_loaded\":false}}\nmodel returned no visible answer\n";
+        assert_eq!(
+            super::reply_error(stderr),
+            "model returned no visible answer"
+        );
+        assert_eq!(
+            super::reply_error(b"{\"event\":\"model.loaded\"}\n"),
+            "reply process failed; see the server log for details"
+        );
     }
 
     #[test]

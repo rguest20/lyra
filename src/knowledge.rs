@@ -207,11 +207,7 @@ impl KnowledgeMap {
 }
 
 fn words(text: &str) -> BTreeSet<String> {
-    text.to_lowercase()
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 2)
-        .map(str::to_owned)
-        .collect()
+    crate::storage::relevant_words(text)
 }
 
 fn lexical_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> usize {
@@ -280,6 +276,27 @@ mod tests {
         loaded.retract(replacement, "field note D").unwrap();
         assert!(loaded.relevant("What grows near willow?", 5).is_empty());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn common_words_do_not_retrieve_the_hagia_sophia_claim_for_element_questions() {
+        let mut map = KnowledgeMap::default();
+        map.add(
+            "the Hagia Sophia",
+            "is taller than",
+            "the Great Pyramid of Giza",
+            "user observation",
+        )
+        .unwrap();
+        for query in [
+            "Do you want to tell me who the most recent discoverer of an element was again?",
+            "Much better. Thank you for being honest about being unsure :)",
+            "the",
+            "What is the atomic number of Oganesson?",
+        ] {
+            assert!(map.relevant(query, 5).is_empty(), "{query}");
+        }
+        assert_eq!(map.relevant("How tall is Hagia Sophia?", 5).len(), 1);
     }
 
     #[test]

@@ -25,7 +25,8 @@ pub(super) fn coherent_passages(question: &str, page: &str) -> Vec<String> {
             let body_hits = crate::storage::lexical_overlap(&query_words, &body_words);
             let score =
                 heading_hits * 4 + body_hits + usize::from(passage.text.starts_with('#')) * 3;
-            (score > 0).then_some((score, passage))
+            // An inherited article title must not make unrelated navigation relevant.
+            (body_hits > 0).then_some((score, passage))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|(left_score, left), (right_score, right)| {
@@ -162,6 +163,18 @@ fn push_chunk(passages: &mut Vec<Passage>, chunk: &str, heading_context: &str, s
 #[cfg(test)]
 mod tests {
     use super::coherent_passages;
+
+    #[test]
+    fn inherited_article_title_does_not_select_related_navigation() {
+        let page = "# Antidisestablishmentarianism\nAntidisestablishmentarianism is a political position.\n\n### Related\n* News\n* The USD Vista\n";
+        let passages = coherent_passages(
+            "What is the political ideology of antidisestablishmentarianism?",
+            page,
+        );
+        assert_eq!(passages.len(), 1);
+        assert!(passages[0].contains("political position"));
+        assert!(!passages[0].contains("Related"));
+    }
 
     #[test]
     fn keeps_a_list_and_a_prose_section_as_separate_contiguous_passages() {

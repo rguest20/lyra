@@ -113,6 +113,7 @@ pub(super) fn structured_list_finding(question: &str, passage: &str) -> Option<S
         }
         let evidence_text = lines[heading_index..=last_item?].join("\n");
         let finding = ScholarFinding {
+            semantic_support: None,
             subject,
             relation: format!("lists {}", category.to_ascii_lowercase()),
             object: items.join("; "),
@@ -215,6 +216,7 @@ pub(super) fn explicit_list_finding(
             continue;
         }
         return Some(ScholarFinding {
+            semantic_support: None,
             subject: section_subject.to_owned(),
             relation,
             object,
@@ -236,6 +238,16 @@ pub(super) fn claim_is_grounded(
     evidence: &str,
     excerpt: &str,
 ) -> bool {
+    claim_grounding_failure(subject, relation, object, evidence, excerpt).is_none()
+}
+
+pub(super) fn claim_grounding_failure(
+    subject: &str,
+    relation: &str,
+    object: &str,
+    evidence: &str,
+    excerpt: &str,
+) -> Option<&'static str> {
     if evidence.trim().is_empty()
         || evidence.chars().count() > 4_500
         || !excerpt.contains(evidence)
@@ -243,7 +255,9 @@ pub(super) fn claim_is_grounded(
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
     {
-        return false;
+        return Some(
+            "evidence span is empty, oversized, absent from the passage, or contains control characters",
+        );
     }
 
     let content = evidence
@@ -258,7 +272,7 @@ pub(super) fn claim_is_grounded(
     let subject_words = crate::storage::relevant_words(subject);
     let object_words = crate::storage::relevant_words(object);
     if content.trim().is_empty() || subject_words.is_empty() || object_words.is_empty() {
-        return false;
+        return Some("evidence or claim fields contain no usable factual terms");
     }
 
     let covered = |terms: &std::collections::BTreeSet<String>| {
@@ -267,11 +281,20 @@ pub(super) fn claim_is_grounded(
     let new_object_detail = object_words
         .difference(&subject_words)
         .collect::<std::collections::BTreeSet<_>>();
-    covered(&subject_words) >= 75
-        && covered(&object_words) >= 75
-        && !new_object_detail.is_empty()
-        && !matches!(
-            relation.trim().to_ascii_lowercase().as_str(),
-            "has encyclopedia summary" | "has encyclopedia detail"
-        )
+    if covered(&subject_words) < 75 {
+        return Some("subject terms are not sufficiently present in the evidence span");
+    }
+    if covered(&object_words) < 75 {
+        return Some("object terms are not sufficiently present in the evidence span");
+    }
+    if new_object_detail.is_empty() {
+        return Some("object adds no factual detail beyond the subject");
+    }
+    if matches!(
+        relation.trim().to_ascii_lowercase().as_str(),
+        "has encyclopedia summary" | "has encyclopedia detail"
+    ) {
+        return Some("relation is a generic encyclopedia summary/detail, not a supported fact");
+    }
+    None
 }

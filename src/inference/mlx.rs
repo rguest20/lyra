@@ -1,0 +1,447 @@
+//! Persistent MLX worker for Qwen3.5's hybrid attention architecture.
+use super::*;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Mutex;
+
+struct Worker {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+}
+impl Worker {
+    fn read(&mut self) -> io::Result<serde_json::Value> {
+        let mut line = String::new();
+        if self.output.read_line(&mut line)? == 0 {
+            return Err(other("MLX worker exited before returning a response"));
+        }
+        let response: serde_json::Value = serde_json::from_str(&line).map_err(other)?;
+        if let Some(error) = response["error"].as_str() {
+            crate::diagnostics::event(
+                "model.backend_error",
+                serde_json::json!({"backend":"mlx","error":error,"memory":response["memory"]}),
+            );
+            return Err(other(format!("MLX worker: {error}")));
+        }
+        Ok(response)
+    }
+    fn request(&mut self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
+        serde_json::to_writer(&mut self.input, request).map_err(other)?;
+        self.input.write_all(b"\n")?;
+        self.input.flush()?;
+        self.read()
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+pub struct MlxModel {
+    worker: Mutex<Worker>,
+    tokenizer: Tokenizer,
+    supports_thinking: bool,
+    max_context: usize,
+    adapter: PathBuf,
+    pub(super) consolidated: bool,
+    pub(super) last_thinking: Option<String>,
+    _device_lease: fs::File,
+}
+impl MlxModel {
+    pub(super) fn load(
+        dir: &Path,
+        checkpoint: &Path,
+        adapter: &Path,
+        cpu: bool,
+    ) -> io::Result<Self> {
+        if cpu {
+            return Err(invalid(
+                "the Qwen3.5 MLX backend currently requires Apple Silicon Metal",
+            ));
+        }
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("config.json"))?).map_err(other)?;
+        if config.get("quantization").is_some_and(|v| !v.is_null())
+            || config
+                .get("quantization_config")
+                .is_some_and(|v| !v.is_null())
+        {
+            return Err(invalid(
+                "Qwen3.5 must use the original non-quantized BF16 checkpoint",
+            ));
+        }
+        let native = config["text_config"]["max_position_embeddings"]
+            .as_u64()
+            .ok_or_else(|| invalid("Qwen3.5 text context is missing"))?
+            as usize;
+        let max_context = context_limit(
+            native,
+            std::env::var("COMMUNITY_CONTEXT_TOKENS").ok().as_deref(),
+        )?;
+        let checkpoints = checkpoint_files(checkpoint)?;
+        let lease = std::env::var_os("COMMUNITY_MODEL_LOCK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("state/model-inference.lock"));
+        let device_lease = acquire_model_lease(&lease)?;
+        let python = std::env::var_os("COMMUNITY_MLX_PYTHON")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv-qwen35/bin/python")
+            });
+        let init = serde_json::json!({"model_dir": dir, "checkpoints": checkpoints, "adapter": adapter, "context_tokens": max_context});
+        let mut child = Command::new(python).arg("-u").arg("-c").arg(include_str!("../../scripts/mlx_worker.py")).arg(init.to_string())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
+            .map_err(|error| other(format!("could not start MLX worker; install scripts/requirements-mlx.txt in .venv-qwen35: {error}")))?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| other("MLX worker stdin is unavailable"))?;
+        let output = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| other("MLX worker stdout is unavailable"))?,
+        );
+        let mut worker = Worker {
+            child,
+            input,
+            output,
+        };
+        let ready = worker.read()?;
+        if ready["ready"] != true {
+            return Err(other("MLX worker did not signal readiness"));
+        }
+        let supports_thinking = checkpoint_supports_thinking(dir)?;
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(other)?;
+        for token in ["<|im_end|>", "<|endoftext|>"] {
+            if tokenizer.token_to_id(token).is_none() {
+                return Err(invalid("Qwen3.5 tokenizer is missing a stop token"));
+            }
+        }
+        crate::diagnostics::event(
+            "model.loaded",
+            serde_json::json!({"model_dir":dir,"backend":"mlx","precision":"BF16","shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":"qwen3_5_no_thinking","adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
+        );
+        Ok(Self {
+            worker: Mutex::new(worker),
+            tokenizer,
+            supports_thinking,
+            max_context,
+            adapter: adapter.into(),
+            consolidated: config["text_config"]["tie_word_embeddings"] == false,
+            last_thinking: None,
+            _device_lease: device_lease,
+        })
+    }
+    fn request(&self, value: serde_json::Value) -> io::Result<serde_json::Value> {
+        self.worker
+            .lock()
+            .map_err(|_| other("MLX worker lock is poisoned"))?
+            .request(&value)
+    }
+    fn ids(&self, messages: &[Message], thinking: bool) -> io::Result<Vec<u32>> {
+        self.tokenizer
+            .encode(
+                format_prompt_for_model(messages, thinking, self.supports_thinking),
+                true,
+            )
+            .map_err(other)
+            .map(|value| value.get_ids().to_vec())
+    }
+    pub(super) fn additional_prompt_tokens(
+        &self,
+        baseline: &[Message],
+        expanded: &[Message],
+    ) -> io::Result<usize> {
+        Ok(self
+            .ids(expanded, false)?
+            .len()
+            .saturating_sub(self.ids(baseline, false)?.len()))
+    }
+    pub(super) fn chat(
+        &mut self,
+        messages: &[Message],
+        extra: usize,
+        cap: usize,
+        temperature: f64,
+        thinking: bool,
+    ) -> io::Result<String> {
+        self.last_thinking = None;
+        for attempt in 0..2 {
+            let use_thinking = thinking && attempt == 0 && self.supports_thinking;
+            let ids = self.ids(messages, use_thinking)?;
+            if ids.is_empty() || ids.len() > self.max_context - MIN_REPLY {
+                return Err(invalid(
+                    "full conversation exceeds the configured context limit; no history was discarded",
+                ));
+            }
+            let limit = reply_budget(ids.len(), extra, self.max_context, cap);
+            let stops = [
+                self.tokenizer.token_to_id("<|im_end|>").unwrap(),
+                self.tokenizer.token_to_id("<|endoftext|>").unwrap(),
+            ];
+            let response = self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
+                "thinking":use_thinking,"thinking_budget":thinking_budget(),"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+            let tokens: Vec<u32> =
+                serde_json::from_value(response["tokens"].clone()).map_err(other)?;
+            let decoded = self.tokenizer.decode(&tokens, true).map_err(other)?;
+            crate::diagnostics::event(
+                "model.generation",
+                serde_json::json!({"backend":"mlx","attempt":attempt+1,"prompt_tokens":ids.len(),"reply_limit":limit,"generated_tokens":tokens.len(),"thinking_enabled":use_thinking,"thinking_tokens":response["thinking_tokens"],"finish_reason":response["finish_reason"],"memory":response["memory"]}),
+            );
+            match generation_reply(&decoded, use_thinking) {
+                Ok((thought, answer)) => {
+                    if thought.is_some() {
+                        self.last_thinking = thought;
+                    }
+                    return Ok(answer);
+                }
+                Err(error) => {
+                    crate::diagnostics::event(
+                        "model.reply_recovery",
+                        serde_json::json!({"attempt":attempt+1,"reason":error.to_string(),"finish_reason":response["finish_reason"],"generated_output_excerpt":decoded.chars().take(1200).collect::<String>(),"action":if attempt==0 {"retry_without_thinking"} else {"fail_after_retry"}}),
+                    );
+                    if attempt == 1 {
+                        return Err(error);
+                    }
+                    if thinking {
+                        self.last_thinking = Some(format!(
+                            "[Debug trace from a discarded attempt; the final answer was generated with thinking disabled.]\n{}",
+                            decoded
+                                .trim()
+                                .strip_prefix("<think>")
+                                .unwrap_or(decoded.trim())
+                                .trim()
+                        ));
+                    }
+                }
+            }
+        }
+        unreachable!()
+    }
+    pub(super) fn train(
+        &mut self,
+        system: &str,
+        prompt: &str,
+        answer: &str,
+    ) -> io::Result<(usize, f32)> {
+        if prompt.trim().is_empty() || answer.trim().is_empty() {
+            return Err(invalid("training prompt and answer must be nonempty"));
+        }
+        let ids = self.ids(
+            &[
+                Message {
+                    role: "system".into(),
+                    content: system.into(),
+                },
+                Message {
+                    role: "user".into(),
+                    content: prompt.into(),
+                },
+            ],
+            false,
+        )?;
+        let mut targets = self
+            .tokenizer
+            .encode(answer, false)
+            .map_err(other)?
+            .get_ids()
+            .to_vec();
+        if targets.is_empty() || targets.len() > MAX_TRAIN {
+            return Err(invalid("training answer exceeds 128 tokens"));
+        }
+        targets.push(self.tokenizer.token_to_id("<|im_end|>").unwrap());
+        if ids.len() + targets.len() > self.max_context {
+            return Err(invalid("training example exceeds context limit"));
+        }
+        let response = self.request(
+            serde_json::json!({"op":"train","ids":ids,"targets":targets,"adapter":self.adapter}),
+        )?;
+        let count = response["tokens"]
+            .as_u64()
+            .ok_or_else(|| other("MLX returned no training token count"))?
+            as usize;
+        let loss = response["loss"]
+            .as_f64()
+            .filter(|loss| loss.is_finite())
+            .ok_or_else(|| other("MLX returned invalid training loss"))? as f32;
+        Ok((count, loss))
+    }
+    pub(super) fn save_merged_checkpoint(
+        &self,
+        source: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        if destination.exists() {
+            return Err(invalid("destination checkpoint already exists"));
+        }
+        self.request(serde_json::json!({"op":"merge","checkpoints":checkpoint_files(source)?,"destination":destination}))?;
+        Ok(())
+    }
+}
+
+fn thinking_budget() -> usize {
+    std::env::var("COMMUNITY_THINKING_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (1..=2048).contains(value))
+        .unwrap_or(256)
+}
+
+fn generation_reply(decoded: &str, thinking: bool) -> io::Result<(Option<String>, String)> {
+    let (thought, answer) = if thinking {
+        split_thinking(decoded)?
+    } else {
+        (None, visible_reply(decoded)?)
+    };
+    if answer.trim().is_empty() {
+        return Err(invalid("model returned no visible answer"));
+    }
+    Ok((thought.filter(|value| !value.is_empty()), answer.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker(script: &str) -> Worker {
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        Worker {
+            input: child.stdin.take().unwrap(),
+            output: BufReader::new(child.stdout.take().unwrap()),
+            child,
+        }
+    }
+
+    #[test]
+    fn generation_requires_visible_answer_and_recovers_by_disabling_thinking() {
+        assert!(generation_reply("Reasoning without a closing tag", true).is_err());
+        assert!(generation_reply("<think>unfinished reasoning", false).is_err());
+        assert!(generation_reply("Reasoning</think>  ", true).is_err());
+        assert!(generation_reply("", false).is_err());
+        assert_eq!(
+            generation_reply("Reasoning</think>Soup is ready.", true).unwrap(),
+            (Some("Reasoning".into()), "Soup is ready.".into())
+        );
+        assert_eq!(
+            generation_reply("Soup is ready.", false).unwrap(),
+            (None, "Soup is ready.".into())
+        );
+    }
+
+    #[test]
+    fn protocol_preserves_requests_across_multiple_generations() {
+        let mut worker = worker(
+            "import sys,json\nfor line in sys.stdin: print(json.dumps(json.loads(line)),flush=True)",
+        );
+        for cap in [128, 256] {
+            let request = serde_json::json!({"op":"generate", "ids":[1,2,3], "max_tokens":cap,"stop_ids":[4,5],"temperature":0.0});
+            assert_eq!(worker.request(&request).unwrap(), request);
+        }
+        let pid = worker.child.id();
+        drop(worker);
+        let status = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "dropping the model must reap its worker");
+    }
+
+    #[test]
+    fn incomplete_thinking_gets_one_automatic_retry_and_keeps_debug_trace() {
+        let vocabulary = [
+            ("<unk>".into(), 0),
+            ("<|im_end|>".into(), 1),
+            ("<|endoftext|>".into(), 2),
+            ("<think>".into(), 3),
+            ("unfinished".into(), 4),
+            ("Soup.".into(), 5),
+            ("</think>".into(), 6),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocabulary)
+                .unk_token("<unk>".into())
+                .build()
+                .unwrap(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "community-reply-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worker = worker(
+            "import sys,json\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert request['thinking'] == (attempt==0)\n assert attempt<2\n print(json.dumps({'tokens':[3,4] if attempt==0 else [5],'finish_reason':'thinking_budget' if attempt==0 else 'stop_token'}),flush=True)",
+        );
+        let mut model = MlxModel {
+            worker: Mutex::new(worker),
+            tokenizer,
+            supports_thinking: true,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(&path).unwrap(),
+        };
+        let messages = [Message {
+            role: "user".into(),
+            content: "How do I make soup?".into(),
+        }];
+        assert_eq!(model.chat(&messages, 0, 128, 0.1, true).unwrap(), "Soup.");
+        assert!(
+            model
+                .last_thinking
+                .as_ref()
+                .unwrap()
+                .contains("discarded attempt")
+        );
+        assert!(
+            model
+                .last_thinking
+                .as_ref()
+                .unwrap()
+                .ends_with("unfinished")
+        );
+        drop(model);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn protocol_surfaces_backend_errors() {
+        let mut worker = worker("print('{\"error\":\"invalid adapter shape\"}',flush=True)");
+        assert!(
+            worker
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid adapter shape")
+        );
+    }
+
+    #[test]
+    fn protocol_reports_early_exit_and_invalid_json() {
+        let mut exited = worker("pass");
+        assert!(
+            exited
+                .read()
+                .unwrap_err()
+                .to_string()
+                .contains("exited before returning")
+        );
+        let mut malformed = worker("print('not json',flush=True)");
+        assert!(malformed.read().is_err());
+    }
+}

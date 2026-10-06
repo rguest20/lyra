@@ -9,11 +9,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_VERSION: i64 = 42;
+
+#[derive(Debug)]
+pub struct ScholarFeedbackTask {
+    pub id: i64,
+    pub finding_id: i64,
+    pub root_finding_id: i64,
+    pub attempt: i64,
+    pub guidance: String,
+    pub job_id: String,
+    pub question: String,
+    pub source_title: String,
+    pub source_url: String,
+    pub source_excerpt: String,
+    pub source_quality: String,
+    pub source_updated_at: Option<String>,
+    pub rejected_claim: String,
+    pub suggested_evidence: Option<String>,
+    pub exclusion_reason: Option<String>,
+}
 const PROMOTION_CONFIDENCE: f64 = 0.95;
 const DEFAULT_AUTO_PROMOTION_CONFIDENCE: f64 = 0.90;
 const ASSISTANT_BASE_CONFIDENCE: f64 = 0.5;
 const SEVERE_CHALLENGE_MULTIPLIER: f64 = 0.2;
+
+pub(crate) fn scout_min_interval_seconds() -> u64 {
+    std::env::var("COMMUNITY_SCOUT_MIN_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 86_400)
+        .unwrap_or(300)
+}
 
 pub(crate) fn automatic_promotion_confidence() -> f64 {
     parse_automatic_promotion_confidence(
@@ -417,6 +444,7 @@ pub struct ModelCheckpointManifest {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScholarFinding {
+    pub semantic_support: Option<crate::semantic::SemanticSupport>,
     pub subject: String,
     pub relation: String,
     pub object: String,
@@ -994,7 +1022,8 @@ pub(crate) fn evidence_supports_claim(finding: &ScholarFinding) -> bool {
     {
         return false;
     }
-    let relation = canonical(&finding.relation);
+    // Extractors sometimes emit schema-style names for ordinary copulas.
+    let relation = canonical(&finding.relation).replace('_', " ");
     let relation_terms = relation
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|word| word.len() >= 4)
@@ -1097,7 +1126,8 @@ pub(crate) fn relevant_words(text: &str) -> std::collections::BTreeSet<String> {
     const STOP_WORDS: &[&str] = &[
         "a", "an", "and", "are", "did", "do", "does", "for", "from", "how", "i", "in", "is", "it",
         "me", "my", "of", "on", "or", "please", "tell", "that", "the", "to", "was", "what", "when",
-        "where", "who", "why", "with", "you", "your",
+        "where", "who", "why", "with", "you", "your", "than", "then", "be", "been", "being",
+        "about", "this", "these", "those", "thanks", "thank",
     ];
     text.to_lowercase()
         .split(|ch: char| !ch.is_alphanumeric())

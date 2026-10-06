@@ -86,17 +86,28 @@ pub(super) fn wikipedia_json_request(
             .as_millis();
         retry_after_delay_ms(value, i64::try_from(now).ok()?)
     });
-    let request_error = (!output.status.success()).then_some("Wikipedia request failed");
+    let request_error = (!output.status.success())
+        .then(|| wikipedia_request_failure(output.status.code(), response_status, max_bytes));
     store.complete_host_request_with_retry_after(
         reservation.id,
         Some(response_status),
         retry_after,
-        request_error,
+        request_error.as_deref(),
     )?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Wikipedia request failed with HTTP status {response_status}"
-        )));
+    if let Some(error) = request_error {
+        crate::diagnostics::event(
+            "internet.request_failed",
+            serde_json::json!({
+                "provider": "wikipedia",
+                "request_kind": request_kind,
+                "http_status": response_status,
+                "curl_exit_code": output.status.code(),
+                "max_bytes": max_bytes,
+                "received_bytes": body.len(),
+                "error": error,
+            }),
+        );
+        return Err(io::Error::other(error));
     }
     if body.len() > max_bytes {
         return Err(io::Error::new(
@@ -106,6 +117,40 @@ pub(super) fn wikipedia_json_request(
     }
     serde_json::from_slice(body.as_bytes())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn wikipedia_request_failure(exit_code: Option<i32>, http_status: u16, max_bytes: usize) -> String {
+    let reason = match exit_code {
+        Some(6) => "host could not be resolved".to_owned(),
+        Some(7) => "connection failed".to_owned(),
+        Some(18) => "response was incomplete".to_owned(),
+        Some(22) => "server returned an HTTP error".to_owned(),
+        Some(28) => "request timed out".to_owned(),
+        Some(35) | Some(60) => "TLS connection or certificate verification failed".to_owned(),
+        Some(63) => format!("response exceeded the {max_bytes}-byte limit"),
+        _ => "curl transport failed".to_owned(),
+    };
+    let exit = exit_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "terminated".into());
+    format!("Wikipedia request failed: {reason} (curl exit {exit}; HTTP status {http_status})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wikipedia_request_failure;
+
+    #[test]
+    fn successful_http_status_can_still_have_a_transport_or_size_failure() {
+        let timeout = wikipedia_request_failure(Some(28), 200, 1200);
+        assert!(timeout.contains("request timed out"));
+        assert!(timeout.contains("curl exit 28; HTTP status 200"));
+        let oversized = wikipedia_request_failure(Some(63), 200, 1200);
+        assert!(oversized.contains("exceeded the 1200-byte limit"));
+        let server_error = wikipedia_request_failure(Some(22), 503, 1200);
+        assert!(server_error.contains("server returned an HTTP error"));
+        assert!(server_error.contains("HTTP status 503"));
+    }
 }
 
 pub(super) fn text_property(value: &serde_json::Value) -> Option<&str> {

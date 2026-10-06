@@ -1,22 +1,100 @@
 # Community Lab
 
-One local chatbot in Rust. Candle runs the **BF16 Qwen3-0.6B** conversational
-model on Apple Metal, with no Ollama process or API. The model uses its own
-tokenizer from `models/qwen3-0.6b/`. The chatbot also keeps its conversation
-and consults an editable, sourced knowledge map.
+One local chatbot in Rust, using the original **BF16 Qwen3.5-2B** checkpoint
+on Apple Metal. A persistent local MLX worker runs its hybrid attention model;
+Rust handles conversations, research, grounding, AI review, logging, and storage.
+No hosted inference service is required. The legacy Qwen3 backend uses Candle.
 
 ## Set up the model
 
-The three model files are ignored by Git. In a fresh checkout:
+Weights and the Python environment are ignored by Git. On Apple Silicon:
 
 ```sh
-mkdir -p models/qwen3-0.6b
-hf download Qwen/Qwen3-0.6B config.json model.safetensors tokenizer.json --local-dir models/qwen3-0.6b
-cargo run --release -- chat
+python3 -m venv --system-site-packages .venv-qwen35
+.venv-qwen35/bin/pip install -r scripts/requirements-mlx.txt
+hf download Qwen/Qwen3.5-2B config.json tokenizer.json tokenizer_config.json model.safetensors.index.json model.safetensors-00001-of-00001.safetensors --local-dir models/qwen3.5-2b
 ```
 
+Set these in local `.env`:
+
+```dotenv
+COMMUNITY_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_MODEL_DIR=models/qwen3.5-2b
+COMMUNITY_MLX_PYTHON=.venv-qwen35/bin/python
+COMMUNITY_ADAPTER=state/adapter-qwen3.5-2b.safetensors
+COMMUNITY_STATE=state/agent-qwen3.5-2b.json
+COMMUNITY_CONTEXT_TOKENS=8192
+COMMUNITY_MODEL_LOCK=state/model-inference.lock
+```
+
+Then run `cargo run --release -- chat` or `cargo run --release -- serve`.
+Normal replies and extraction disable thinking. Only text inputs are supported.
+The MLX backend requires Apple Silicon Metal; `COMMUNITY_DEVICE=cpu` is available
+for the legacy Candle Qwen3 backend. Quantized Qwen3.5 checkpoints are rejected.
+
+The switch checklist in [docs/qwen35-2b-switch.md](docs/qwen35-2b-switch.md)
+records conversation migration and measured results. The knowledge map and
+SQLite research database remain shared. Context exhaustion returns an error;
+it does not silently discard conversation history.
+
+`model.loaded` logs backend, precision, shard count, context cap, template,
+device, and adapter selection. A process lock at `state/model-inference.lock`
+serializes model use across chat and maintenance; a waiting process emits
+`model.waiting_for_lease`. Override the shared lock path with
+`COMMUNITY_MODEL_LOCK` if needed.
+
+The MLX backend supports a fresh output adapter, teacher-forced adapter training,
+and merging that adapter into an unquantized BF16 output head. Adapter files are
+specific to this model's hidden and vocabulary sizes. Consolidation and rebuild
+preserve original checkpoint tensors and create an untied output head;
+they require additional memory and disk. Lineage hashing covers every source
+shard. Do not reuse an adapter from a different model.
+
+Fresh MLX adapters are saved automatically when the model first loads. They
+start with a zero output delta, so the base model is unchanged. `model.loaded`
+reports `adapter_state` (`initialized_untrained`, `loaded_untrained`, or
+`loaded_trained`), whether the file exists, and its training-step count. Untrained
+adapters skip their unused output computation during generation.
+
+Debug thinking is limited to 256 tokens by default. Set
+`COMMUNITY_THINKING_TOKENS` to an integer from 1 to 2048 to change that limit.
+If thinking ends without a visible answer, generation retries once with thinking
+disabled and keeps the partial debug trace. `model.generation` records token
+counts, stop reason, and MLX active/peak/cache memory; `model.reply_recovery`
+records the retry. The browser forwards reply diagnostics to server stderr on
+both success and failure, while error bubbles show the actual error message.
+
+Scholar checks claim meaning in a separate AI entailment pass. Faithful synonyms
+and paraphrases can pass without matching the source's words. The reviewer
+recovers an original source quotation and returns `entailed`, `contradicted`,
+`qualified`, or `insufficient`. Negation, uncertainty, attribution, and dates
+must be preserved. Credibility and corroboration requirements still apply.
+
+`scholar.semantic_support` logs the verdict, model verdict, any stance override,
+reason, candidate, and original evidence. Saved assessments appear in
+Curmudgeon's context and are checked again before promotion. Pending findings
+without a semantic assessment receive one during AI review. Invalid assessments
+follow automated repair/retry handling. Each candidate adds one model call,
+including another check if extraction repair produces a new candidate.
+
+The implementation and probe results are recorded in
+[docs/semantic-support.md](docs/semantic-support.md).
+
+Isolated probes use the actual Scholar extraction and Curmudgeon review prompts:
+
+```sh
+cargo run --release -- model probe-scholar "What is Mars?" "Mars" "Mars is a planet."
+cargo run --release -- model probe-support '{"question":"What shape is the world?","source_title":"World","source_excerpt":"The world is spherical.","subject":"The world","relation":"is","object":"round"}'
+cargo run --release -- model probe-review '{"question":"What is Mars?","source_excerpt":"Mars is a planet.","subject":"Mars","relation":"is a","object":"planet"}'
+```
+
+Use temporary `COMMUNITY_STATE` and `COMMUNITY_DB` paths for probes when
+experimenting with a different model. Probes do not queue searches or promote
+claims.
+
+
 Type `/quit` to leave. The conversation is saved to
-`state/agent-qwen3-0.6b.json`. You can also use `cargo run --release -- say
+the configured `COMMUNITY_STATE` path. You can also use `cargo run --release -- say
 "Hello"` for one reply, or `cargo run --release -- status` to see the paths.
 Chat loads the model once and is faster over several turns. The full saved
 conversation enters each prompt, including older turns. The latest user
@@ -55,6 +133,12 @@ file is replaced. The diagnostic log records `conversation.history_archived`
 with the archive path and message count. Starting a new browser conversation
 keeps the previous session file in place.
 
+Reply diagnostics include `conversation.context_selected` with the retrieved
+claim and finding IDs. Unsuitable replies receive one automated style rewrite;
+answers relying solely on unpromoted research also receive an AI grounding
+review. See [context and reply quality fixes](docs/context-and-reply-quality.md)
+for the events, retry limits and validation.
+
 ## Scholar research queue
 
 When Lyra's reply leaves a public factual question unanswered, a local model
@@ -73,6 +157,10 @@ same source also trigger a shared-origin review. Short shared facts such as
 chicken being an ingredient in chicken soup do not trigger a copy warning.
 Curmudgeon reviews provenance-linked pairs and records an advisory explanation;
 its assessment never clears the independence gate by itself.
+Invalid source-review responses log the precise invalid field and a bounded
+model-output excerpt. The AI gets one repair attempt; repeated failures are
+scheduled for automatic retry after five minutes, allowing other reviews and
+assistant audits to continue. The retry schedule survives a restart.
 Headings followed by bullets can yield a source-specific list for the Scholar
 AI reviewer when the extractor cannot return a grounded claim. The reviewer
 assesses source suitability and direct support; suitable secondary findings
@@ -212,17 +300,41 @@ The terminal logs role errors to stderr, and `serve` reports background worker
 exits there. Ctrl-C or a termination signal lets `serve` wait for an active
 maintenance subprocess.
 
+Curmudgeon rejection feeds back into research automatically. A fixable extraction
+returns to Scholar with the original question, exact source passage, and review
+guidance. An unsuitable source returns to Scout to queue a search for better
+evidence. Sources are excluded only after an explicit irrelevant or unreliable
+verdict, and only for that page within the question's retry loop. Extraction
+failures never establish source unsuitability; useful passages return to Scholar
+with exact suggested evidence. Missing source verdicts default to repair. A finding gets **three
+attempts total** (the original plus two retries), shared across both routes.
+After the third unsuccessful attempt the loop stops and records its reason.
+Personal or sensitive findings stop without retries. The budget, guidance,
+and rejected findings survive restarts in SQLite. Corrected findings still
+receive AI review before acceptance.
+
+Structured stderr events `scholar.research_feedback`,
+`scholar.guided_repair_started`, `scout.research_feedback`, and
+`scholar.feedback_attempt_finished` include the original finding ID, attempt
+number, and guidance or outcome. `scholar.research_feedback` records
+`status: exhausted` when the retry budget is spent. Existing `internet.*`
+events show the search queries and pages reviewed during retries.
+
 Curator sends flagged extractions to an independent AI reviewer. Curmudgeon
 also resolves any candidate that remains flagged after deterministic conflict
 checks. Scholar findings receive an AI source and passage assessment; suitable
 secondary findings continue through independent-source corroboration. Review
 decisions and rationales are emitted as structured JSON lines to stderr and
-retained in SQLite. Internet searches emit an `internet.search` event with the
-provider, trigger, query, outcome, and result count; API credentials are not
-included. Capture the terminal log with:
+retained in SQLite. Scholar extraction events include the research question,
+the selected passage excerpt shown to the model, the model's candidate, and the
+specific grounding check that rejected it. Internet searches emit `internet.search` events with the
+provider, trigger, query, outcome, and result count, plus `internet.search_result`
+and `internet.page_review` events showing discovered URLs and whether pages were
+allowed, skipped, or fetched. URL credentials, query parameters, and fragments
+are omitted. Capture the terminal log with:
 
 ```sh
-cargo run --release -- serve 2>community-lab.log
+cargo run --release -- serve 2>>community-lab.log
 ```
 
 The database at `state/learning.db` retains structured maintenance history and
@@ -236,7 +348,9 @@ Configuration:
 | `COMMUNITY_MAINTENANCE_MAX_MS` | `120000` | Time budget checked between roles, 1000–600000 ms. It does not interrupt a model call already running. |
 | `COMMUNITY_MAINTENANCE_INFERENCE_BUDGET` | `8` | Maximum inference jobs admitted per pass, 1–16. |
 | `COMMUNITY_AUTONOMOUS_RESEARCH` | on | Set to `off` or `0` to skip automatic Scout and Scholar work while local curation and audits continue. |
-| `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 0–200. |
+| `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 1–200; `0` disables this cap. |
+| `COMMUNITY_SCOUT_MODEL_PROBES_PER_DAY` | `3` | Maximum broad, model-suggested Scout leads per rolling day, 1–200; `0` disables this cap. |
+| `COMMUNITY_SCOUT_MIN_INTERVAL_SECONDS` | `300` | Minimum spacing between Scout investigations and broad model probes, 0–86400 seconds; `0` disables spacing. Per-topic retry limits still apply. |
 | `COMMUNITY_CONFIG` | `config.toml` | Optional local TOML file for search provider settings. |
 | `TAVILY_API_KEY` | — | Tavily API key; overrides `[search.tavily].api_key`. |
 | `SERP_API_KEY` | — | SerpAPI key. |
@@ -375,7 +489,7 @@ linking the accepted claim to the source observation. Back up
 `state/learning.db` and `state/knowledge.json` after a clean shutdown and
 before manual database maintenance.
 
-`COMMUNITY_MODEL_DIR`, `COMMUNITY_ADAPTER`, `COMMUNITY_STATE`,
+`COMMUNITY_MODEL_ID`, `COMMUNITY_MODEL_DIR`, `COMMUNITY_CONTEXT_TOKENS`, `COMMUNITY_ADAPTER`, `COMMUNITY_STATE`,
 `COMMUNITY_KNOWLEDGE`, `COMMUNITY_DB`, and `COMMUNITY_DEVICE=cpu` override
 the defaults.
 A different base model needs a compatible config/checkpoint/tokenizer and a

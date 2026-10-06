@@ -499,7 +499,7 @@ impl Cli {
 
     pub(super) fn status(&mut self, args: Vec<String>) -> Result<(), String> {
         let mut args = args.into_iter();
-        let model = self.model;
+        let model = &self.model;
         let model_dir = &self.model_dir;
         let adapter_path = &self.adapter_path;
         let state_path = &self.state_path;

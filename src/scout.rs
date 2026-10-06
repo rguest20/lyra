@@ -65,6 +65,22 @@ fn process_once_with_request(
 ) -> io::Result<usize> {
     let mut store = LearningStore::open(database_path)?;
     let map = KnowledgeMap::load(knowledge_path)?;
+    if let Some(task) = store.claim_scholar_feedback("new_source")? {
+        crate::diagnostics::event(
+            "scout.research_feedback",
+            serde_json::json!({
+                "feedback_id": task.id, "root_finding_id": task.root_finding_id,
+                "rejected_finding_id": task.finding_id, "scholar_job_id": task.job_id,
+                "attempt": task.attempt, "max_attempts": 3, "question": task.question,
+                "guidance": task.guidance,
+                "excluded_source": task.exclusion_reason.as_ref().map(|_| crate::diagnostics::safe_public_url(&task.source_url)),
+                "exclusion_reason": task.exclusion_reason,
+                "exclusion_scope": "root_finding_retry_chain",
+                "excluded_sources": store.scholar_feedback_excluded_sources(&task.job_id)?.iter().map(|url| crate::diagnostics::safe_public_url(url)).collect::<Vec<_>>(),
+            }),
+        );
+        return Ok(1);
+    }
     // Advance background coverage on every pass, including passes where an
     // urgent challenged or due claim is handled first.
     let review_batch = store.next_claims_for_maintenance(8)?;
@@ -207,6 +223,15 @@ fn process_once_with_request(
     };
     let Some((topic, question)) = parse_model_lead(&raw) else {
         store.complete_model_probe(probe_id, "rejected", &raw, None, None, None)?;
+        crate::diagnostics::event(
+            "scout.model_probe_decision",
+            serde_json::json!({
+                "probe_id": probe_id,
+                "decision": "rejected",
+                "reason": "model lead did not match the required topic and question format",
+                "model_output_excerpt": raw.chars().take(300).collect::<String>(),
+            }),
+        );
         return Ok(0);
     };
     let topic_key = canonical(&topic);
@@ -227,6 +252,16 @@ fn process_once_with_request(
             Some(&question),
             None,
         )?;
+        crate::diagnostics::event(
+            "scout.model_probe_decision",
+            serde_json::json!({
+                "probe_id": probe_id,
+                "decision": "rejected",
+                "reason": "suggested topic was already covered or recently explored",
+                "topic": topic,
+                "question": question,
+            }),
+        );
         return Ok(0);
     }
     let key = format!("{topic_key}|{}", canonical(&question));
@@ -250,6 +285,17 @@ fn process_once_with_request(
         Some(&question),
         job_id.as_deref(),
     )?;
+    crate::diagnostics::event(
+        "scout.model_probe_decision",
+        serde_json::json!({
+            "probe_id": probe_id,
+            "decision": if queued { "queued" } else { "rejected" },
+            "reason": if queued { "fresh public research lead" } else { "research queue declined the lead" },
+            "topic": topic,
+            "question": question,
+            "scholar_job_id": job_id,
+        }),
+    );
     Ok(usize::from(queued))
 }
 
@@ -277,17 +323,11 @@ fn model_lead_question(raw: &str, topic: &str) -> Option<String> {
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
     let normalized_topic = canonical(topic);
-    let topic_terms = normalized_topic
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|word| word.len() >= 5)
-        .collect::<HashSet<_>>();
-    let shares_topic_term = words.iter().any(|word| topic_terms.contains(word));
     if question.chars().count() > 160
         || !question.ends_with('?')
         || question.contains(['\n', '\r', '<', '>'])
         || question.matches('?').count() != 1
         || words.len() < 6
-        || !shares_topic_term
         || normalized.starts_with("what are the key facts about ")
         || normalized == format!("what is {normalized_topic}?")
     {
@@ -392,9 +432,10 @@ fn select_gaps(
                 key,
                 reference: format!("assistant_claim:{}", claim.id),
                 question: format!(
-                    "What is the {} of {}?",
-                    claim.relation.trim(),
-                    claim.subject.trim()
+                    "Find reliable evidence that supports, contradicts, or qualifies this assertion: {} {} {}.",
+                    claim.subject.trim(),
+                    claim.relation.trim().replace('_', " "),
+                    claim.object.trim(),
                 ),
             });
         }
@@ -481,6 +522,13 @@ fn public_topic(subject: &str, relation: &str) -> bool {
             subject.as_str(),
             "user" | "the user" | "i" | "me" | "you" | "lyra" | "the assistant"
         )
+        && !(matches!(
+            subject.as_str(),
+            "yes" | "no" | "okay" | "ok" | "thanks" | "hello"
+        ) && matches!(
+            relation.as_str(),
+            "statement" | "response" | "fact" | "acknowledgement"
+        ))
         && ![
             "lives in", "is named", "name", "prefers", "owns", "address", "email", "phone",
         ]
@@ -541,6 +589,7 @@ mod tests {
                 "https://en.wikipedia.org/wiki/Byzantine_Empire",
                 "The Byzantine Empire used themes as military-administrative districts.",
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Byzantine Empire".into(),
                     relation: "used".into(),
                     object: "themes as military-administrative districts".into(),
@@ -575,6 +624,13 @@ mod tests {
             0
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn logged_biodiversity_question_is_valid_without_exact_topic_word_overlap() {
+        assert!(parse_model_lead("TOPIC: The impact of climate change on biodiversity  \nQUESTION: How does rising global temperatures affect species distribution and ecosystem resilience?").is_some());
+        assert!(!public_topic("Yes", "statement"));
+        assert!(public_topic("Yes", "formed in"));
     }
 
     #[test]
@@ -645,6 +701,7 @@ mod tests {
                 "https://en.wikipedia.org/wiki/Chicken_soup",
                 "Chicken soup includes noodles.",
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Chicken soup".into(),
                     relation: "includes".into(),
                     object: "noodles".into(),

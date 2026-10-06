@@ -2,6 +2,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 mod corroboration;
+mod feedback;
 mod intake;
 mod promotion;
 use promotion::{automatically_review_source_pair, self_promote_verified_findings};
@@ -259,7 +260,8 @@ impl LearningStore {
         {
             return Err(invalid("candidate structured data must be valid JSON"));
         }
-        self.connection
+        let inserted = self
+            .connection
             .execute(
                 "INSERT OR IGNORE INTO scholar_search_candidates
                 (job_id, provider, query, result_type, title, url, snippet,
@@ -277,6 +279,19 @@ impl LearningStore {
                 ],
             )
             .map_err(database_error)?;
+        if inserted > 0 {
+            crate::diagnostics::event(
+                "internet.search_result",
+                serde_json::json!({
+                    "job_id": job_id,
+                    "provider": provider,
+                    "query": query.chars().take(500).collect::<String>(),
+                    "title": title.chars().take(300).collect::<String>(),
+                    "result_type": result_type,
+                    "url": crate::diagnostics::safe_public_url(url),
+                }),
+            );
+        }
         Ok(())
     }
 
@@ -1066,22 +1081,29 @@ impl LearningStore {
                 |row| row.get(0),
             )
             .map_err(database_error)?;
-        if recent >= 3 {
+        let daily_limit = std::env::var("COMMUNITY_SCOUT_MODEL_PROBES_PER_DAY")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value <= 200)
+            .unwrap_or(3);
+        if daily_limit > 0 && recent >= i64::try_from(daily_limit).unwrap_or(3) {
             return Ok(None);
         }
-        let cooling_down: bool = tx
-            .query_row(
-                "SELECT EXISTS(
-                 SELECT 1 FROM scout_model_probes
-                 WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')
-                 UNION ALL
-                 SELECT 1 FROM scout_investigations
-                 WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')
-             )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let min_interval = scout_min_interval_seconds();
+        let cooling_down = min_interval > 0
+            && tx
+                .query_row(
+                    "SELECT EXISTS(
+                     SELECT 1 FROM scout_model_probes
+                     WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+                     UNION ALL
+                     SELECT 1 FROM scout_investigations
+                     WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+                 )",
+                    [format!("-{min_interval} seconds")],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
         if cooling_down {
             return Ok(None);
         }
@@ -1356,16 +1378,19 @@ impl LearningStore {
         if scout_topic_blocked(&tx, trigger_kind, topic_key)? {
             return Ok(false);
         }
-        let recent: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM scout_investigations
-             WHERE created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-5 minutes')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
-        if recent > 0 {
-            return Ok(false);
+        let min_interval = scout_min_interval_seconds();
+        if min_interval > 0 {
+            let recent: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM scout_investigations
+                 WHERE created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+                    [format!("-{min_interval} seconds")],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if recent > 0 {
+                return Ok(false);
+            }
         }
         let daily: i64 = tx
             .query_row(
@@ -1380,7 +1405,7 @@ impl LearningStore {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value <= 200)
             .unwrap_or(20);
-        if daily >= i64::try_from(daily_limit).unwrap_or(20) {
+        if daily_limit > 0 && daily >= i64::try_from(daily_limit).unwrap_or(20) {
             return Ok(false);
         }
         let job_id: String = tx
@@ -1628,6 +1653,25 @@ impl LearningStore {
             .optional()
             .map_err(database_error)?;
         if let Some(context) = context.as_mut() {
+            let support: Option<String> = self
+                .connection
+                .query_row(
+                    "SELECT assessment_json FROM scholar_semantic_support WHERE finding_id = ?1",
+                    [finding_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            context["support_method"] = if support.is_some() {
+                "ai_semantic_entailment"
+            } else {
+                "lexical"
+            }
+            .into();
+            context["semantic_support"] = support
+                .map(|raw| serde_json::from_str::<serde_json::Value>(&raw).map_err(invalid_json))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null);
             let subject = context["subject"].as_str().unwrap_or_default().to_owned();
             let relation = context["relation"].as_str().unwrap_or_default().to_owned();
             let object = context["object"].as_str().unwrap_or_default().to_owned();
@@ -1709,6 +1753,11 @@ impl LearningStore {
             .prepare(
                 "SELECT f.id, f.job_id FROM scholar_findings f
                  WHERE f.status = 'needs_review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scholar_ai_review_retries r
+                       WHERE r.finding_id = f.id
+                         AND r.retry_after > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                   )
                    AND EXISTS (SELECT 1 FROM scholar_source_assessments a
                                WHERE a.finding_id = f.id)
                    AND (NOT EXISTS (
@@ -1729,6 +1778,19 @@ impl LearningStore {
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
+    }
+
+    pub fn defer_scholar_ai_review(&self, finding_id: i64, reason: &str) -> io::Result<()> {
+        self.connection.execute(
+            "INSERT INTO scholar_ai_review_retries (finding_id, attempts, retry_after, last_error)
+             VALUES (?1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 minutes'), ?2)
+             ON CONFLICT(finding_id) DO UPDATE SET
+                attempts = attempts + 1,
+                retry_after = excluded.retry_after,
+                last_error = excluded.last_error",
+            params![finding_id, reason.chars().take(500).collect::<String>()],
+        ).map_err(database_error)?;
+        Ok(())
     }
 
     pub fn review_scholar_source_expertise(
@@ -2223,7 +2285,7 @@ impl LearningStore {
         accept: bool,
         reason: &str,
     ) -> io::Result<()> {
-        self.review_scholar_finding_with_method(finding_id, accept, reason, "human")
+        self.review_scholar_finding_with_method(finding_id, accept, reason, "human", None)
     }
 
     pub fn review_scholar_finding_ai(
@@ -2232,7 +2294,42 @@ impl LearningStore {
         accept: bool,
         reason: &str,
     ) -> io::Result<()> {
-        self.review_scholar_finding_with_method(finding_id, accept, reason, "ai")
+        self.review_scholar_finding_with_method(finding_id, accept, reason, "ai", None)
+    }
+
+    #[cfg(test)]
+    pub fn reject_scholar_finding_with_feedback(
+        &mut self,
+        finding_id: i64,
+        reason: &str,
+        route: &str,
+        guidance: &str,
+    ) -> io::Result<()> {
+        self.review_scholar_finding_with_method(
+            finding_id,
+            false,
+            reason,
+            "ai",
+            Some((route, guidance, None, None)),
+        )
+    }
+
+    pub fn reject_scholar_finding_with_source_feedback(
+        &mut self,
+        finding_id: i64,
+        reason: &str,
+        route: &str,
+        guidance: &str,
+        exclusion_reason: Option<&str>,
+        suggested_evidence: Option<&str>,
+    ) -> io::Result<()> {
+        self.review_scholar_finding_with_method(
+            finding_id,
+            false,
+            reason,
+            "ai",
+            Some((route, guidance, exclusion_reason, suggested_evidence)),
+        )
     }
 
     fn review_scholar_finding_with_method(
@@ -2241,6 +2338,7 @@ impl LearningStore {
         accept: bool,
         reason: &str,
         method: &str,
+        feedback: Option<(&str, &str, Option<&str>, Option<&str>)>,
     ) -> io::Result<()> {
         if reason.trim().is_empty()
             || reason.chars().count() > 500
@@ -2297,6 +2395,42 @@ impl LearningStore {
                     "web evidence cannot establish a personal fact about the user",
                 ));
             }
+            let saved_support: Option<String> = tx
+                .query_row(
+                    "SELECT assessment_json FROM scholar_semantic_support WHERE finding_id = ?1",
+                    [finding_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            if let Some(saved) = saved_support {
+                let support: crate::semantic::SemanticSupport =
+                    serde_json::from_str(&saved).map_err(invalid_json)?;
+                let evidence: String = tx
+                    .query_row(
+                        "SELECT evidence_text FROM scholar_findings WHERE id = ?1",
+                        [finding_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                let bound = ScholarFinding {
+                    semantic_support: None,
+                    subject: subject.clone(),
+                    relation: relation.clone(),
+                    object: object.clone(),
+                    evidence_text: evidence,
+                    confidence: 0.0,
+                    valid_from: valid_from.clone(),
+                    valid_until: valid_until.clone(),
+                    source_quality: "unknown".into(),
+                    source_updated_at: None,
+                };
+                if !support.supports(&bound, &source_excerpt) {
+                    return Err(invalid(
+                        "saved semantic assessment no longer supports this finding",
+                    ));
+                }
+            }
             let direct_support: Option<i64> = tx
                 .query_row(
                     "SELECT direct_support FROM scholar_source_assessments WHERE finding_id = ?1",
@@ -2322,6 +2456,7 @@ impl LearningStore {
                     )
                     .map_err(database_error)?;
                 let legacy = ScholarFinding {
+                    semantic_support: None,
                     subject: subject.clone(),
                     relation: relation.clone(),
                     object: object.clone(),
@@ -2485,7 +2620,24 @@ impl LearningStore {
                 [claim_id],
             ).map_err(database_error)?;
         }
-        tx.commit().map_err(database_error)
+        if let Some((route, guidance, exclusion_reason, suggested_evidence)) = feedback {
+            feedback::queue_feedback(
+                &tx,
+                finding_id,
+                route,
+                guidance,
+                &format!("review:{finding_id}"),
+                exclusion_reason,
+                suggested_evidence,
+            )?;
+        } else {
+            tx.execute("UPDATE scholar_feedback_sessions SET status = ?2, last_reason = ?3 WHERE root_finding_id = (SELECT root_finding_id FROM scholar_research_feedback WHERE scholar_job_id = ?1)", params![job_id, if accept { "accepted" } else { "exhausted" }, reason]).map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)?;
+        if feedback.is_some() {
+            self.log_scholar_feedback(finding_id)?;
+        }
+        Ok(())
     }
 }
 

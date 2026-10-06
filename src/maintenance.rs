@@ -103,6 +103,31 @@ impl Roles for ModelRoles<'_> {
     }
 }
 
+struct RoleOutcome {
+    status: &'static str,
+    processed: usize,
+    detail: Option<String>,
+    error: Option<String>,
+}
+
+fn role_outcome(result: io::Result<usize>, review_delta: bool) -> RoleOutcome {
+    match result {
+        Ok(processed) => RoleOutcome {
+            status: if processed == 0 { "idle" } else { "work" },
+            processed,
+            detail: (processed > 0 && review_delta)
+                .then(|| "items queued for AI review or corroboration".to_owned()),
+            error: None,
+        },
+        Err(error) => RoleOutcome {
+            status: "error",
+            processed: 0,
+            detail: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 fn run_role(
     store: &LearningStore,
     pass_id: i64,
@@ -118,15 +143,12 @@ fn run_role(
         "scholar" => after.1 > before.1,
         _ => false,
     };
-    let (status, processed, detail) = match result {
-        Ok(0) => ("idle", 0, None),
-        Ok(count) => (
-            "work",
-            count,
-            review_delta.then(|| "items queued for AI review or corroboration".to_owned()),
-        ),
-        Err(error) => ("error", 0, Some(error.to_string())),
-    };
+    let RoleOutcome {
+        status,
+        processed,
+        detail,
+        error,
+    } = role_outcome(result, review_delta);
     crate::diagnostics::event(
         "maintenance.role_finished",
         serde_json::json!({
@@ -137,7 +159,8 @@ fn run_role(
             "elapsed_ms": started.elapsed().as_millis(),
             "review_counts_before": {"curator": before.0, "scholar": before.1},
             "review_counts_after": {"curator": after.0, "scholar": after.1},
-            "error": detail,
+            "detail": detail,
+            "error": error,
         }),
     );
     store.record_maintenance_role(
@@ -145,11 +168,11 @@ fn run_role(
         role,
         status,
         processed,
-        detail.as_deref(),
+        error.as_deref().or(detail.as_deref()),
         started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
     )?;
-    if let Some(detail) = &detail {
-        eprintln!("{role} maintenance failed: {detail}");
+    if let Some(error) = &error {
+        eprintln!("{role} maintenance failed: {error}");
     }
     Ok(RoleResult {
         processed,
@@ -260,6 +283,22 @@ mod tests {
     use crate::knowledge::KnowledgeMap;
     use crate::storage::ScholarFinding;
 
+    #[test]
+    fn successful_review_queue_work_has_detail_but_no_error() {
+        let result = role_outcome(Ok(1), true);
+        assert_eq!(result.status, "work");
+        assert_eq!(result.processed, 1);
+        assert_eq!(
+            result.detail.as_deref(),
+            Some("items queued for AI review or corroboration")
+        );
+        assert!(result.error.is_none());
+        let failure = role_outcome(Err(io::Error::other("model unavailable")), true);
+        assert_eq!(failure.status, "error");
+        assert_eq!(failure.error.as_deref(), Some("model unavailable"));
+        assert!(failure.detail.is_none());
+    }
+
     struct FixtureRoles<'a> {
         database_path: &'a Path,
         knowledge_path: &'a Path,
@@ -297,6 +336,7 @@ mod tests {
                 "https://en.wikipedia.org/wiki/Mars",
                 "Mars is a planet.",
                 Some(ScholarFinding {
+                    semantic_support: None,
                     subject: "Mars".into(),
                     relation: "is a".into(),
                     object: "planet".into(),

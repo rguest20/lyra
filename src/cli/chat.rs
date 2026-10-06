@@ -74,7 +74,7 @@ impl Cli {
                         curator: Some(&curator),
                         state_path,
                     },
-                    env::var_os("COMMUNITY_DEBUG_THINKING").is_some(),
+                    env::var_os("COMMUNITY_DEBUG_THINKING").is_some_and(|value| value == "1"),
                 )
                 .map_err(|e| e.to_string())?;
             if reply.new_conversation {

@@ -8,6 +8,7 @@ mod knowledge;
 mod maintenance;
 mod scholar;
 mod scout;
+mod semantic;
 mod storage;
 mod web;
 

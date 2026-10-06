@@ -58,6 +58,36 @@ impl Cli {
                     }
                 }
             }
+            [action, question, title, passage] if action == "probe-scholar" => {
+                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    crate::scholar::probe_extraction(question, title, passage, &mut backend)
+                );
+            }
+            [action, context] if action == "probe-support" => {
+                let context: serde_json::Value =
+                    serde_json::from_str(context).map_err(|error| error.to_string())?;
+                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    crate::semantic::probe(&context, &mut backend)
+                        .map_err(|error| error.to_string())?
+                );
+            }
+            [action, context] if action == "probe-review" => {
+                let context: serde_json::Value =
+                    serde_json::from_str(context).map_err(|error| error.to_string())?;
+                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    crate::curmudgeon::probe_source_review(&context, &mut backend)
+                        .map_err(|error| error.to_string())?
+                );
+            }
             [action, prompt @ ..] if action == "probe-chat" && !prompt.is_empty() => {
                 let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
                     .map_err(|e| format!("could not load local model: {e}"))?;
@@ -88,7 +118,8 @@ impl Cli {
             [action, id] if action == "consolidate" => {
                 let id: i64 = id.parse().map_err(|_| "claim ID must be an integer")?;
                 let claim = store.approved_model_claim(id).map_err(|e| e.to_string())?;
-                let source = model_dir.join("model.safetensors");
+                let source =
+                    crate::inference::checkpoint_path(model_dir).map_err(|e| e.to_string())?;
                 let source_text = source.to_string_lossy().into_owned();
                 let parent_manifest = store
                     .model_manifest_for_checkpoint(&source_text)
@@ -217,6 +248,9 @@ impl Cli {
                 let mut config: serde_json::Value =
                     serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
                 config["tie_word_embeddings"] = serde_json::Value::Bool(false);
+                if config["text_config"].is_object() {
+                    config["text_config"]["tie_word_embeddings"] = serde_json::Value::Bool(false);
+                }
                 fs::write(
                     output_dir.join("config.json"),
                     serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
@@ -227,6 +261,7 @@ impl Cli {
                     output_dir.join("tokenizer.json"),
                 )
                 .map_err(|e| e.to_string())?;
+                copy_tokenizer_metadata(model_dir, &output_dir)?;
                 let mut check =
                     LocalModel::load(&output_dir, &output_dir.join("adapter.safetensors"), cpu)
                         .map_err(|e| format!("new checkpoint failed validation: {e}"))?;
@@ -274,7 +309,7 @@ impl Cli {
             }
             _ => {
                 return Err(
-                        "usage: model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT".into(),
+                        "usage: model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | model probe-scholar QUESTION TITLE PASSAGE | model probe-review CONTEXT_JSON | model probe-support CONTEXT_JSON".into(),
                     );
             }
         }
@@ -283,9 +318,53 @@ impl Cli {
 }
 
 fn sha256_file(path: &std::path::Path) -> Result<String, String> {
-    let bytes = fs::read(path)
-        .map_err(|error| format!("could not read {} for hashing: {error}", path.display()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    use std::io::Read;
+    let hash = |path: &std::path::Path| -> Result<Vec<u8>, String> {
+        let mut file = fs::File::open(path)
+            .map_err(|error| format!("could not open {} for hashing: {error}", path.display()))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 65536];
+        loop {
+            let count = file.read(&mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        Ok(digest.finalize().to_vec())
+    };
+    if path
+        .file_name()
+        .is_some_and(|name| name == "model.safetensors.index.json")
+    {
+        let mut digest = Sha256::new();
+        digest.update(b"community-lab-sharded-checkpoint-v1");
+        digest.update(hash(path)?);
+        for shard in crate::inference::checkpoint_files(path).map_err(|error| error.to_string())? {
+            let name = shard.file_name().unwrap().to_string_lossy();
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update(hash(&shard)?);
+        }
+        Ok(format!("{:x}", digest.finalize()))
+    } else {
+        Ok(hash(path)?
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+}
+
+fn copy_tokenizer_metadata(
+    source_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> Result<(), String> {
+    let metadata = source_dir.join("tokenizer_config.json");
+    if metadata.is_file() {
+        fs::copy(metadata, output_dir.join("tokenizer_config.json"))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 fn rebuild_model_checkpoint(
@@ -396,6 +475,9 @@ fn rebuild_model_checkpoint(
     let mut config: serde_json::Value =
         serde_json::from_slice(&config_bytes).map_err(|e| e.to_string())?;
     config["tie_word_embeddings"] = serde_json::Value::Bool(false);
+    if config["text_config"].is_object() {
+        config["text_config"]["tie_word_embeddings"] = serde_json::Value::Bool(false);
+    }
     fs::write(
         output_dir.join("config.json"),
         serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
@@ -406,6 +488,7 @@ fn rebuild_model_checkpoint(
         output_dir.join("tokenizer.json"),
     )
     .map_err(|e| e.to_string())?;
+    copy_tokenizer_metadata(std::path::Path::new(&manifest.base_model_dir), &output_dir)?;
     let mut check = LocalModel::load(&output_dir, &output_dir.join("adapter.safetensors"), cpu)
         .map_err(|e| format!("rebuilt checkpoint failed to load: {e}"))?;
     for revision in &manifest.included_claims {
@@ -449,4 +532,29 @@ fn rebuild_model_checkpoint(
     println!("New model: {}", output_dir.display());
     println!("Manifest: {}", manifest_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn checkpoint_hash_detects_shard_changes_without_index_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "community-shard-hash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let shard = dir.join("weights.safetensors");
+        let index = dir.join("model.safetensors.index.json");
+        std::fs::write(&shard, b"original").unwrap();
+        std::fs::write(&index, r#"{"weight_map":{"x":"weights.safetensors"}}"#).unwrap();
+        let original = super::sha256_file(&index).unwrap();
+        assert_eq!(original, super::sha256_file(&index).unwrap());
+        std::fs::write(&shard, b"changed").unwrap();
+        assert_ne!(original, super::sha256_file(&index).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -612,6 +612,7 @@ mod tests {
     #[test]
     fn wikipedia_source_is_staged_by_topic_class() {
         let finding = ScholarFinding {
+            semantic_support: None,
             subject: "Photosynthesis".into(),
             relation: "converts".into(),
             object: "light energy".into(),
@@ -708,6 +709,7 @@ mod tests {
     #[test]
     fn chicken_stock_does_not_make_an_ingredient_claim_time_sensitive() {
         let finding = ScholarFinding {
+            semantic_support: None,
             subject: "Simple Chicken Soup".into(),
             relation: "lists ingredients".into(),
             object: "Chicken breasts; Chicken stock; Carrots".into(),

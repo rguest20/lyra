@@ -548,6 +548,82 @@ impl LearningStore {
             .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 39 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scholar_ai_review_retries (
+                    finding_id INTEGER PRIMARY KEY REFERENCES scholar_findings(id),
+                    attempts INTEGER NOT NULL,
+                    retry_after TEXT NOT NULL,
+                    last_error TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 39;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 40 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scholar_feedback_sessions (
+                    root_finding_id INTEGER PRIMARY KEY REFERENCES scholar_findings(id),
+                    attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 3),
+                    status TEXT NOT NULL CHECK(status IN ('active', 'exhausted', 'accepted')),
+                    last_reason TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS scholar_research_feedback (
+                    id INTEGER PRIMARY KEY,
+                    trigger_key TEXT NOT NULL UNIQUE,
+                    finding_id INTEGER NOT NULL REFERENCES scholar_findings(id),
+                    root_finding_id INTEGER NOT NULL REFERENCES scholar_feedback_sessions(root_finding_id),
+                    attempt INTEGER NOT NULL CHECK(attempt BETWEEN 2 AND 3),
+                    route TEXT NOT NULL CHECK(route IN ('repair', 'new_source')),
+                    guidance TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending','processing','queued','completed')),
+                    scholar_job_id TEXT UNIQUE REFERENCES scholar_jobs(id),
+                    claimed_at TEXT,
+                    created_at TEXT NOT NULL,
+                    result_note TEXT,
+                    UNIQUE(root_finding_id, attempt)
+                 );
+                 PRAGMA user_version = 40;",
+            ).map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 41 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('scholar_research_feedback') WHERE name = 'exclusion_reason')", [], |row| row.get::<_, bool>(0)).map_err(database_error)? {
+                tx.execute_batch("ALTER TABLE scholar_research_feedback ADD COLUMN exclusion_reason TEXT CHECK(exclusion_reason IN ('irrelevant','unreliable'));
+                                  ALTER TABLE scholar_research_feedback ADD COLUMN suggested_evidence TEXT;").map_err(database_error)?;
+            }
+            tx.execute_batch("PRAGMA user_version = 41;")
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 42 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scholar_semantic_support (
+                finding_id INTEGER PRIMARY KEY REFERENCES scholar_findings(id),
+                assessment_json TEXT NOT NULL,
+                assessed_at TEXT NOT NULL
+            ); PRAGMA user_version = 42;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

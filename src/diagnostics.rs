@@ -21,3 +21,17 @@ pub(crate) fn event(name: &str, fields: serde_json::Value) {
     let _ = serde_json::to_writer(&mut output, &record);
     let _ = output.write_all(b"\n");
 }
+
+pub(crate) fn safe_public_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "[invalid URL]".into();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return "[non-web URL]".into();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}

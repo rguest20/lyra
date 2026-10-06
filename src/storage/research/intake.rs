@@ -45,12 +45,21 @@ fn grounded_scholar_finding(
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
         && !finding.evidence_text.contains("<|");
-    safe_evidence
+    let semantic_valid = finding
+        .semantic_support
+        .as_ref()
+        .is_none_or(|support| support.supports(finding, source_excerpt));
+    semantic_valid
+        && safe_evidence
         && source_excerpt.contains(&finding.evidence_text)
         && safe_field(&finding.subject)
         && safe_field(&finding.relation)
         && safe_field(&finding.object)
-        && (evidence_supports_claim(finding)
+        && (finding
+            .semantic_support
+            .as_ref()
+            .is_some_and(|support| support.supports(finding, source_excerpt))
+            || evidence_supports_claim(finding)
             || (matches!(
                 finding.relation.as_str(),
                 "has encyclopedia summary" | "has encyclopedia detail"
@@ -186,7 +195,8 @@ fn ingest_source(
     let model_derived_lead: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM scout_investigations
-                 WHERE scholar_job_id = ?1 AND trigger_kind = 'model_probe')",
+                 WHERE scholar_job_id = ?1 AND trigger_kind = 'model_probe')
+             OR EXISTS(SELECT 1 FROM scholar_research_feedback WHERE scholar_job_id = ?1)",
             [job_id],
             |row| row.get(0),
         )
@@ -333,6 +343,14 @@ fn ingest_source(
                     finding.valid_from, finding.valid_until, finding.source_quality, freshness, finding.source_updated_at],
             ).map_err(database_error)?;
     let finding_id = tx.last_insert_rowid();
+    if let Some(support) = finding.semantic_support.as_ref() {
+        if !support.supports(finding, source_excerpt) {
+            return Err(invalid(
+                "semantic support assessment does not match the stored finding",
+            ));
+        }
+        tx.execute("INSERT INTO scholar_semantic_support (finding_id, assessment_json, assessed_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))", params![finding_id, serde_json::to_string(support).map_err(invalid_json)?]).map_err(database_error)?;
+    }
     crate::diagnostics::event(
         "scholar.finding_disposition",
         serde_json::json!({
@@ -341,6 +359,8 @@ fn ingest_source(
             "status": finding_status,
             "gate_status": gate_status,
             "confidence": finding.confidence,
+            "support_method": if finding.semantic_support.is_some() { "ai_semantic_entailment" } else { "lexical" },
+            "semantic_support": finding.semantic_support,
             "reason": reason,
             "source_url": source_url,
         }),
@@ -623,5 +643,55 @@ impl LearningStore {
             return Err(invalid("scholar job is not processing"));
         }
         tx.commit().map_err(database_error)
+    }
+}
+
+impl LearningStore {
+    /// Upgrade a pending lexical assessment using an independently judged source span.
+    pub(crate) fn record_scholar_semantic_support(
+        &mut self,
+        finding_id: i64,
+        support: &crate::semantic::SemanticSupport,
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let (mut finding, passage, title): (ScholarFinding, String, String) = tx.query_row(
+            "SELECT subject, relation, object, evidence_text, confidence, valid_from, valid_until, source_quality, source_updated_at, source_excerpt, source_title FROM scholar_findings WHERE id = ?1 AND status = 'needs_review'", [finding_id],
+            |row| Ok((ScholarFinding {semantic_support:None,subject:row.get(0)?,relation:row.get(1)?,object:row.get(2)?,evidence_text:row.get(3)?,confidence:row.get(4)?,valid_from:row.get(5)?,valid_until:row.get(6)?,source_quality:row.get(7)?,source_updated_at:row.get(8)?},row.get(9)?,row.get(10)?)),
+        ).map_err(database_error)?;
+        if !support.matches_claim(&finding) {
+            return Err(invalid("semantic assessment belongs to a different claim"));
+        }
+        let supported = if support.verdict() == "entailed" {
+            finding.evidence_text = support.evidence().to_owned();
+            finding.semantic_support = Some(support.clone());
+            if !grounded_scholar_finding(&title, &passage, &finding) {
+                return Err(invalid(
+                    "semantic assessment lacks valid original source support",
+                ));
+            }
+            true
+        } else {
+            false
+        };
+        tx.execute("INSERT INTO scholar_semantic_support (finding_id, assessment_json, assessed_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) ON CONFLICT(finding_id) DO UPDATE SET assessment_json = excluded.assessment_json, assessed_at = excluded.assessed_at", params![finding_id,serde_json::to_string(support).map_err(invalid_json)?]).map_err(database_error)?;
+        if supported {
+            tx.execute(
+                "UPDATE scholar_findings SET evidence_text = ?2 WHERE id = ?1",
+                params![finding_id, finding.evidence_text],
+            )
+            .map_err(database_error)?;
+        }
+        tx.execute("UPDATE scholar_source_assessments SET direct_support = ?2,
+            gate_status = CASE WHEN ?2 = 0 THEN 'unsupported' WHEN gate_status = 'unsupported' THEN 'pending_review' ELSE gate_status END,
+            reason = CASE WHEN gate_status = 'conflict' THEN reason || '. ' || ?3 ELSE ?3 END WHERE finding_id = ?1", params![finding_id,supported,format!("AI semantic {}: {}",support.verdict(),support.reason())]).map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        crate::diagnostics::event(
+            "scholar.semantic_support_recorded",
+            serde_json::json!({"finding_id":finding_id,"direct_support":supported,"assessment":support}),
+        );
+        Ok(())
     }
 }
