@@ -23,7 +23,7 @@ enum ScoutRequest<'a> {
         previous: &'a [String],
     },
     Model {
-        previous_topics: &'a [String],
+        seed: &'a str,
     },
 }
 
@@ -38,7 +38,7 @@ pub fn process_once(
             known,
             previous,
         } => model.scout_question(subject, known, previous),
-        ScoutRequest::Model { previous_topics } => model.scout_model_lead(previous_topics),
+        ScoutRequest::Model { seed } => model.scout_model_lead(seed),
     })
 }
 
@@ -115,6 +115,9 @@ fn process_once_with_request(
             &question,
             "Claim has passed its scheduled review date",
         )?));
+    }
+    if store.queue_retained_question()? {
+        return Ok(1);
     }
     for claim in &review_batch {
         if matches!(
@@ -204,6 +207,9 @@ fn process_once_with_request(
             },
         )?));
     }
+    if let Some((id, seed, topic, question, raw)) = store.deferred_model_probe()? {
+        return queue_model_lead(&mut store, id, &seed, &topic, &question, &raw);
+    }
     let previous_topics = store.recent_model_topics()?;
     let Some(probe_id) = store.begin_model_probe(
         "open public knowledge",
@@ -212,37 +218,38 @@ fn process_once_with_request(
     else {
         return Ok(0);
     };
-    let raw = match ask(ScoutRequest::Model {
-        previous_topics: &previous_topics,
-    }) {
+    let seed = model_probe_seed(probe_id);
+    store.set_model_probe_seed(probe_id, &seed)?;
+    let raw = match ask(ScoutRequest::Model { seed: &seed }) {
         Ok(raw) => raw,
         Err(error) => {
             store.complete_model_probe(probe_id, "failed", &error.to_string(), None, None, None)?;
             return Err(error);
         }
     };
-    let Some((topic, question)) = parse_model_lead(&raw) else {
+    let Some((topic, question)) = parse_seeded_model_lead(&raw, &seed) else {
         store.complete_model_probe(probe_id, "rejected", &raw, None, None, None)?;
         crate::diagnostics::event(
             "scout.model_probe_decision",
             serde_json::json!({
-                "probe_id": probe_id,
+                "probe_id": probe_id, "seed":seed,
                 "decision": "rejected",
-                "reason": "model lead did not match the required topic and question format",
+                "reason": "model lead must provide one focused question about the named starting subject",
                 "model_output_excerpt": raw.chars().take(300).collect::<String>(),
             }),
         );
         return Ok(0);
     };
-    let topic_key = canonical(&topic);
     let covered = previous_topics
         .iter()
-        .any(|old| canonical(old) == topic_key)
-        || !store.scout_known_claims_for_subject(&topic)?.is_empty()
+        .any(|old| same_topic_family(old, &topic))
+        || db_claims
+            .iter()
+            .any(|detail| same_topic_family(&detail.claim.subject, &topic))
         || map
             .entries()
             .iter()
-            .any(|claim| claim.retracted_by.is_none() && canonical(&claim.subject) == topic_key);
+            .any(|claim| claim.retracted_by.is_none() && same_topic_family(&claim.subject, &topic));
     if covered {
         store.complete_model_probe(
             probe_id,
@@ -255,7 +262,7 @@ fn process_once_with_request(
         crate::diagnostics::event(
             "scout.model_probe_decision",
             serde_json::json!({
-                "probe_id": probe_id,
+                "probe_id": probe_id, "seed":seed,
                 "decision": "rejected",
                 "reason": "suggested topic was already covered or recently explored",
                 "topic": topic,
@@ -264,39 +271,141 @@ fn process_once_with_request(
         );
         return Ok(0);
     }
-    let key = format!("{topic_key}|{}", canonical(&question));
-    let queued = store.enqueue_scout_research_with_reason(
+    queue_model_lead(&mut store, probe_id, &seed, &topic, &question, &raw)
+}
+
+fn queue_model_lead(
+    store: &mut LearningStore,
+    probe_id: i64,
+    seed: &str,
+    topic: &str,
+    question: &str,
+    raw: &str,
+) -> io::Result<usize> {
+    let key = format!("{}|{}", canonical(topic), canonical(question));
+    let admission = store.try_enqueue_scout_research(
         "model_probe",
         &key,
         &format!("model_probe:{probe_id}"),
-        &question,
-        "Model suggested a public question after map gaps were exhausted",
+        question,
+        "Model formulated a public question about a rotating named subject after map gaps were exhausted",
     )?;
-    let job_id = if queued {
-        store.model_probe_job_id(probe_id)?
-    } else {
-        None
+    let (queued, job_id, reason) = match admission {
+        crate::storage::ScoutAdmission::Queued(job) => (
+            true,
+            Some(store.model_probe_job_id(probe_id)?.unwrap_or(job)),
+            "fresh public research lead",
+        ),
+        crate::storage::ScoutAdmission::Deferred(reason) => {
+            if store.defer_model_probe(probe_id, raw, topic, question, reason)? {
+                crate::diagnostics::event(
+                    "scout.model_probe_decision",
+                    serde_json::json!({"probe_id":probe_id,"seed":seed,"decision":"deferred","reason":reason,"topic":topic,"question":question,"policy":store.scout_queue_status()?}),
+                );
+            }
+            return Ok(0);
+        }
+        crate::storage::ScoutAdmission::Blocked(reason) => (false, None, reason),
     };
     store.complete_model_probe(
         probe_id,
         if queued { "queued" } else { "rejected" },
-        &raw,
-        Some(&topic),
-        Some(&question),
+        raw,
+        Some(topic),
+        Some(question),
         job_id.as_deref(),
     )?;
     crate::diagnostics::event(
         "scout.model_probe_decision",
         serde_json::json!({
-            "probe_id": probe_id,
-            "decision": if queued { "queued" } else { "rejected" },
-            "reason": if queued { "fresh public research lead" } else { "research queue declined the lead" },
+            "probe_id": probe_id, "seed":seed,
+            "decision": if queued { "queued" } else { "blocked" },
+            "reason": reason,
             "topic": topic,
             "question": question,
             "scholar_job_id": job_id,
         }),
     );
     Ok(usize::from(queued))
+}
+
+// Advance with the persisted probe ID, even after a rejection or restart.
+fn model_probe_seed(probe_id: i64) -> String {
+    const DOMAINS: [&str; 12] = [
+        "history and archaeology: Byzantine Empire, Antikythera mechanism, Inca roads",
+        "food and cooking: sourdough, koji, kimchi",
+        "biology: axolotl, platypus, photosynthesis",
+        "music and art: clarinet, woodblock printing, stained glass",
+        "mathematics: Pythagorean theorem, Fibonacci sequence, Mobius strip",
+        "language and writing: cuneiform, Hangul, Swahili",
+        "astronomy: Europa, Crab Nebula, James Webb Space Telescope",
+        "computing: Dijkstra algorithm, B-tree, RISC architecture",
+        "geography: Lake Baikal, Andes, Madagascar",
+        "chemistry: gallium, sodium bicarbonate, chromatography",
+        "architecture: Hagia Sophia, flying buttress, Bauhaus",
+        "transport: sextant, steam locomotive, Silk Road",
+    ];
+    let offset = probe_id.saturating_sub(1).max(0) as usize;
+    let (area, examples) = DOMAINS[offset % DOMAINS.len()].split_once(':').unwrap();
+    let subject = examples
+        .split(',')
+        .nth((offset / DOMAINS.len()) % 3)
+        .unwrap()
+        .trim();
+    format!("{area}: {subject}")
+}
+
+/// Diversify background exploration; this does not merge entities or claims.
+fn same_topic_family(left: &str, right: &str) -> bool {
+    fn anchors(text: &str) -> Vec<String> {
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| {
+                word.len() >= 4
+                    && !matches!(
+                        *word,
+                        "role"
+                            | "impact"
+                            | "global"
+                            | "development"
+                            | "effects"
+                            | "effect"
+                            | "influence"
+                            | "contribution"
+                            | "contribute"
+                            | "systems"
+                            | "system"
+                            | "what"
+                            | "which"
+                            | "about"
+                            | "with"
+                            | "from"
+                            | "that"
+                            | "into"
+                            | "their"
+                    )
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+    if canonical(left) == canonical(right) {
+        return true;
+    }
+    let left = anchors(left);
+    let right = anchors(right);
+    left.windows(2)
+        .any(|pair| right.windows(2).any(|other| pair == other))
+}
+
+fn parse_seeded_model_lead(raw: &str, seed: &str) -> Option<(String, String)> {
+    let subject = seed
+        .split_once(':')
+        .map_or(seed, |(_, subject)| subject.trim());
+    parse_model_lead(raw).filter(|(topic, question)| {
+        canonical(topic) != canonical(seed)
+            && canonical(topic) != canonical(seed.split(':').next().unwrap_or(seed))
+            && crate::entities::mentions_name(question, subject)
+    })
 }
 
 fn parse_model_lead(raw: &str) -> Option<(String, String)> {
@@ -404,7 +513,9 @@ fn select_gaps(
             .iter()
             .filter(|claim| claim.verdict == verdict)
         {
-            if !public_topic(&claim.subject, &claim.relation) {
+            if !public_topic(&claim.subject, &claim.relation)
+                || conversational_limitation(&claim.subject)
+            {
                 continue;
             }
             // A compatible map claim already supplies this fact. A retracted
@@ -501,6 +612,20 @@ fn select_gaps(
     gaps
 }
 
+fn conversational_limitation(subject: &str) -> bool {
+    matches!(
+        canonical(subject).as_str(),
+        "sources"
+            | "the sources"
+            | "provided sources"
+            | "the provided sources"
+            | "the source"
+            | "the assistant"
+            | "assistant"
+            | "lyra"
+    )
+}
+
 fn canonical(value: &str) -> String {
     value
         .split_whitespace()
@@ -542,6 +667,119 @@ mod tests {
     use crate::storage::{ScholarFinding, SemanticClaim, SemanticClaimDetail};
 
     #[test]
+    fn seeded_question_must_stay_about_its_named_subject() {
+        let seed = "language and writing: Swahili";
+        assert!(
+            parse_seeded_model_lead(
+                "TOPIC: Swahili\nQUESTION: What other languages are spoken in Africa?",
+                seed
+            )
+            .is_none()
+        );
+        assert!(
+            parse_seeded_model_lead(
+                "TOPIC: Swahili\nQUESTION: Which language family does Swahili belong to?",
+                seed
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn subject_area_prompt_is_not_a_concrete_topic() {
+        let seed = model_probe_seed(4);
+        assert!(
+            parse_seeded_model_lead(
+                &format!(
+                    "TOPIC: {seed}\nQUESTION: What is the most iconic instrument in the world?"
+                ),
+                &seed
+            )
+            .is_none()
+        );
+        assert!(
+            parse_seeded_model_lead(
+                "TOPIC: music and art\nQUESTION: What is the most iconic instrument in the world?",
+                &seed
+            )
+            .is_none()
+        );
+        assert!(
+            parse_seeded_model_lead(
+                "TOPIC: Clarinet\nQUESTION: What type of reed does a clarinet use?",
+                &seed
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn renewed_energy_titles_cannot_escape_background_topic_diversity_guard() {
+        let original = "The role of renewable energy in global infrastructure development";
+        for renamed in [
+            "The role of renewable energy in urban resilience",
+            "The impact of renewable energy on global economic development",
+            "Renewable energy and climate resilience",
+        ] {
+            assert!(same_topic_family(original, renamed));
+        }
+        assert!(!same_topic_family(original, "Byzantine Empire"));
+        assert!(!same_topic_family(
+            "History of the Roman Empire",
+            "History of the Ottoman Empire"
+        ));
+        let seeds = (1..=12).map(model_probe_seed).collect::<HashSet<_>>();
+        assert_eq!(seeds.len(), 12);
+        assert_ne!(model_probe_seed(13), model_probe_seed(1));
+        assert_eq!(model_probe_seed(37), model_probe_seed(1));
+    }
+
+    #[test]
+    fn persisted_history_rejects_explored_subject_and_records_new_positive_seed() {
+        let directory = std::env::temp_dir().join(format!(
+            "scout-diversity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("learning.db");
+        let knowledge = directory.join("knowledge.json");
+        drop(LearningStore::open(&database).unwrap());
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        for topic in ["Axolotl", "Renewable energy and climate resilience"] {
+            connection.execute("INSERT INTO scout_model_probes(seed,status,topic,selection_reason,created_at) VALUES('open public knowledge','rejected',?1,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now','-2 days'))", [topic]).unwrap();
+        }
+        drop(connection);
+        assert_eq!(
+            process_once_with_request(&database, &knowledge, |request| {
+                match request {
+                    ScoutRequest::Model { seed } => {
+                        assert_eq!(seed, model_probe_seed(3));
+                        assert!(!seed.contains("renewable"));
+                        Ok(
+                            "TOPIC: Axolotl\nQUESTION: How does an axolotl regenerate its limbs?"
+                                .into(),
+                        )
+                    }
+                    ScoutRequest::Map { .. } => panic!("no map gaps in fixture"),
+                }
+            })
+            .unwrap(),
+            0
+        );
+        let reopened = LearningStore::open(&database).unwrap();
+        let probe = reopened.model_probes().unwrap().remove(0);
+        assert_eq!(probe.status, "rejected");
+        assert_eq!(probe.seed, model_probe_seed(3));
+        assert!(reopened.scholar_jobs().unwrap().is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn model_only_lead_is_queued_after_map_gaps_and_never_becomes_a_claim() {
         let directory = std::env::temp_dir().join(format!(
             "community-model-probe-{}-{}",
@@ -559,8 +797,8 @@ mod tests {
             process_once_with_request(&database, &knowledge, |request| {
                 calls += 1;
                 match request {
-                    ScoutRequest::Model { previous_topics } => {
-                        assert!(previous_topics.is_empty());
+                    ScoutRequest::Model { seed } => {
+                        assert!(seed.contains("history"));
                         Ok("TOPIC: Byzantine Empire\nQUESTION: What was the administrative role of the Byzantine Empire's themes?".into())
                     }
                     ScoutRequest::Map { .. } => panic!("empty map has no map-derived gap"),
@@ -804,6 +1042,21 @@ mod tests {
             confidence_before: 0.5,
             confidence_after: 0.1,
         }
+    }
+
+    #[test]
+    fn assistant_ignorance_is_not_a_public_research_topic() {
+        let claims = [
+            assistant(1, "The provided sources", "inconclusive", &[]),
+            assistant(2, "Lyra", "inconclusive", &[]),
+            assistant(3, "Walkers", "inconclusive", &[]),
+            assistant(4, "River sources", "inconclusive", &[]),
+        ];
+        let gaps = select_gaps(&claims, &KnowledgeMap::default(), &[], &HashSet::new());
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps.iter().all(
+            |gap| gap.reference == "assistant_claim:3" || gap.reference == "assistant_claim:4"
+        ));
     }
 
     #[test]

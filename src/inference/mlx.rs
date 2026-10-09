@@ -55,6 +55,7 @@ impl MlxModel {
         checkpoint: &Path,
         adapter: &Path,
         cpu: bool,
+        lease: &Path,
     ) -> io::Result<Self> {
         if cpu {
             return Err(invalid(
@@ -81,10 +82,7 @@ impl MlxModel {
             std::env::var("COMMUNITY_CONTEXT_TOKENS").ok().as_deref(),
         )?;
         let checkpoints = checkpoint_files(checkpoint)?;
-        let lease = std::env::var_os("COMMUNITY_MODEL_LOCK")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("state/model-inference.lock"));
-        let device_lease = acquire_model_lease(&lease)?;
+        let device_lease = acquire_model_lease(lease)?;
         let python = std::env::var_os("COMMUNITY_MLX_PYTHON")
             .map(PathBuf::from)
             .unwrap_or_else(|| {

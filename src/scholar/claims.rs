@@ -7,6 +7,14 @@ pub(super) fn calibrate_research_relevance(
     finding: &ScholarFinding,
     model_relevance: &str,
 ) -> String {
+    if matches!(model_relevance, "direct" | "related" | "tangential")
+        && finding
+            .semantic_support
+            .as_ref()
+            .is_some_and(|support| support.supports(finding, &finding.evidence_text))
+    {
+        return model_relevance.to_owned();
+    }
     let question_words = crate::storage::relevant_words(question);
     let finding_words = crate::storage::relevant_words(&format!(
         "{} {} {}",

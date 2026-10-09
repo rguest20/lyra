@@ -511,6 +511,21 @@ impl Cli {
         }
         println!("Model: {model}");
         println!("Model directory: {}", model_dir.display());
+        for role in [
+            crate::inference::assignments::AgentRole::Scout,
+            crate::inference::assignments::AgentRole::Scholar,
+            crate::inference::assignments::AgentRole::Curmudgeon,
+            crate::inference::assignments::AgentRole::Archivist,
+            crate::inference::assignments::AgentRole::Interaction,
+        ] {
+            println!(
+                "Agent {} model: {}",
+                role.name(),
+                self.model_runtime
+                    .model_id(role)
+                    .map_err(|error| error.to_string())?
+            );
+        }
         println!(
             "Adapter: {} ({})",
             adapter_path.display(),

@@ -29,7 +29,7 @@ pub(super) fn check_corroboration(
                      ORDER BY c.id DESC LIMIT 1)
          FROM scholar_findings f
          JOIN scholar_source_assessments a ON a.finding_id = f.id
-         WHERE lower(trim(f.subject)) = lower(trim(?1))
+         WHERE (lower(trim(f.subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(f.subject)) AND e.right_name = lower(trim(?1))))
            AND lower(trim(f.relation)) = lower(trim(?2))
            AND lower(trim(f.object)) = lower(trim(?3))
            AND f.valid_from IS ?4 AND f.valid_until IS ?5

@@ -1,11 +1,62 @@
 use super::*;
 use sha2::{Digest, Sha256};
 
+pub(super) mod baskets;
 mod corroboration;
 mod feedback;
 mod intake;
+pub(crate) mod network;
 mod promotion;
 use promotion::{automatically_review_source_pair, self_promote_verified_findings};
+
+#[derive(Debug)]
+pub(crate) enum ScoutAdmission {
+    Queued(String),
+    Deferred(&'static str),
+    Blocked(&'static str),
+}
+
+fn scout_daily_limit() -> u64 {
+    std::env::var("COMMUNITY_MAX_RESEARCH_PER_DAY")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 200)
+        .unwrap_or(20)
+}
+
+fn scout_queue_block_reason(
+    connection: &Connection,
+    min_interval: u64,
+    daily_limit: u64,
+) -> io::Result<Option<&'static str>> {
+    if min_interval > 0 {
+        let recent: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scout_investigations
+            WHERE created_at > strftime('%Y-%m-%dT%H:%M:%fZ','now',?1))",
+                [format!("-{min_interval} seconds")],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if recent {
+            return Ok(Some("Scout minimum investigation interval has not elapsed"));
+        }
+    }
+    if daily_limit > 0 {
+        let daily: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM scout_investigations
+            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if daily >= i64::try_from(daily_limit).unwrap_or(20) {
+            return Ok(Some("Scout daily investigation budget exhausted"));
+        }
+    }
+    Ok(None)
+}
 
 pub(super) fn robots_block_key(path_query: &str) -> String {
     format!("{:x}", Sha256::digest(path_query.as_bytes()))
@@ -830,26 +881,7 @@ impl LearningStore {
                 "host is in persisted Retry-After backoff",
             ));
         }
-        if matches!(
-            request_kind,
-            "wikipedia_page_content" | "external_page_content"
-        ) {
-            let page_fetches: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM host_request_log
-                     WHERE request_kind IN ('wikipedia_page_content', 'external_page_content')
-                       AND scheduled_at_ms >= ?1",
-                    [now.saturating_sub(86_400_000)],
-                    |row| row.get(0),
-                )
-                .map_err(database_error)?;
-            if page_fetches >= 100 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Scholar reached the daily external page-fetch limit",
-                ));
-            }
-        }
+        network::check_wikipedia_budget(&tx, host, now, network::wikipedia_limits())?;
         let previous: Option<(i64, Option<i64>)> = tx
             .query_row(
                 "SELECT scheduled_at_ms, completed_at_ms FROM host_request_log
@@ -934,6 +966,7 @@ impl LearningStore {
         let completed_at_ms = i64::try_from(completed_at_ms)
             .map_err(|_| invalid("request completion timestamp too large"))?;
         let error = error.map(|value| value.chars().take(500).collect::<String>());
+        let api_throttled = error.as_deref() == Some(network::MEDIAWIKI_TRANSIENT_ERROR);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -968,15 +1001,27 @@ impl LearningStore {
         if changed != 1 {
             return Err(invalid("Scholar request reservation was not pending"));
         }
-        if response_status.is_some_and(|code| matches!(code, 429 | 503)) {
-            let retry_until = completed_at_ms
-                .saturating_add(retry_after_ms.unwrap_or(60_000).clamp(1_000, 86_400_000));
+        if response_status.is_some_and(|code| matches!(code, 429 | 503)) || api_throttled {
+            let previous: i64 = tx
+                .query_row(
+                    "SELECT failures FROM scholar_host_backoff WHERE host=?1",
+                    [&host],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?
+                .unwrap_or(0);
+            let failures = previous.saturating_add(1).min(7);
+            let delay = retry_after_ms
+                .unwrap_or(60_000_i64.saturating_mul(1_i64 << (failures - 1)))
+                .max(1_000);
+            let retry_until = completed_at_ms.saturating_add(delay);
             tx.execute(
-                "INSERT INTO scholar_host_backoff (host, retry_until_ms, response_status, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO scholar_host_backoff (host, retry_until_ms, response_status, updated_at_ms,failures)
+                 VALUES (?1, ?2, ?3, ?4,?5)
                  ON CONFLICT(host) DO UPDATE SET retry_until_ms = excluded.retry_until_ms,
-                    response_status = excluded.response_status, updated_at_ms = excluded.updated_at_ms",
-                params![host, retry_until, response_status, completed_at_ms],
+                    response_status = excluded.response_status, updated_at_ms = excluded.updated_at_ms,failures=excluded.failures",
+                params![host, retry_until, if api_throttled {Some(429)} else {response_status}, completed_at_ms,failures],
             )
             .map_err(database_error)?;
         } else if response_status.is_some_and(|code| code < 400) {
@@ -1073,6 +1118,11 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
+        if scout_queue_block_reason(&tx, scout_min_interval_seconds(), scout_daily_limit())?
+            .is_some()
+        {
+            return Ok(None);
+        }
         let recent: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM scout_model_probes
@@ -1119,6 +1169,20 @@ impl LearningStore {
         Ok(Some(id))
     }
 
+    pub fn set_model_probe_seed(&self, id: i64, seed: &str) -> io::Result<()> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE scout_model_probes SET seed = ?2 WHERE id = ?1 AND status = 'attempting'",
+                params![id, seed],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(invalid("model probe is not attempting"));
+        }
+        Ok(())
+    }
+
     pub fn complete_model_probe(
         &self,
         id: i64,
@@ -1136,7 +1200,9 @@ impl LearningStore {
             .execute(
                 "UPDATE scout_model_probes SET status = ?2, raw_output = ?3,
                 topic = ?4, question = ?5, scholar_job_id = ?6,
-                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                selection_reason = CASE WHEN ?2='queued' AND selection_reason LIKE 'deferred:%'
+                    THEN 'Deferred public lead admitted to research queue' ELSE selection_reason END
              WHERE id = ?1 AND status = 'attempting'",
                 params![
                     id,
@@ -1152,6 +1218,57 @@ impl LearningStore {
             return Err(invalid("model probe is not attempting"));
         }
         Ok(())
+    }
+
+    pub fn defer_model_probe(
+        &self,
+        id: i64,
+        raw: &str,
+        topic: &str,
+        question: &str,
+        reason: &str,
+    ) -> io::Result<bool> {
+        let reason = format!("deferred: {reason}");
+        let changed = self.connection.execute("UPDATE scout_model_probes SET raw_output=?2,topic=?3,question=?4,selection_reason=?5
+            WHERE id=?1 AND status='attempting' AND (selection_reason<>?5 OR topic IS NULL OR question IS NULL)",
+            params![id,raw.chars().take(1000).collect::<String>(),topic,question,reason]).map_err(database_error)?;
+        Ok(changed > 0)
+    }
+
+    pub fn deferred_model_probe(
+        &self,
+    ) -> io::Result<Option<(i64, String, String, String, String)>> {
+        self.connection.query_row("SELECT id,seed,topic,question,COALESCE(raw_output,'') FROM scout_model_probes
+            WHERE status='attempting' AND selection_reason LIKE 'deferred:%' AND topic IS NOT NULL AND question IS NOT NULL
+            ORDER BY id LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))
+            .optional().map_err(database_error)
+    }
+
+    pub fn scout_queue_status(&self) -> io::Result<serde_json::Value> {
+        let interval = scout_min_interval_seconds();
+        let daily_limit = scout_daily_limit();
+        let daily: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scout_investigations
+            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let deferred: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM scout_model_probes
+            WHERE status='attempting' AND selection_reason LIKE 'deferred:%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        Ok(
+            serde_json::json!({"min_interval_seconds":interval,"daily_investigation_limit":daily_limit,
+            "investigations_last_day":daily,"deferred_model_leads":deferred,"block_reason":scout_queue_block_reason(&self.connection,interval,daily_limit)?}),
+        )
     }
 
     pub fn model_probes(&self) -> io::Result<Vec<ScoutModelProbe>> {
@@ -1183,8 +1300,8 @@ impl LearningStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT topic FROM scout_model_probes WHERE topic IS NOT NULL
-             ORDER BY id DESC LIMIT 30",
+                "SELECT topic FROM scout_model_probes WHERE status<>'attempting' AND topic IS NOT NULL
+             GROUP BY lower(trim(topic)) ORDER BY MAX(id) DESC LIMIT 30",
             )
             .map_err(database_error)?;
         statement
@@ -1362,6 +1479,48 @@ impl LearningStore {
         Ok(())
     }
 
+    pub fn enqueue_research_plan(
+        &self,
+        conversation: &str,
+        turn: usize,
+        plan: &crate::research::ResearchPlan,
+    ) -> io::Result<()> {
+        let turn = i64::try_from(turn).map_err(|_| invalid("turn number too large"))?;
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(database_error)?;
+        tx.execute("INSERT INTO scholar_jobs (id, conversation_id, turn_number, question, status, created_at)
+            VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(conversation_id, turn_number) DO NOTHING", params![conversation,turn,plan.question]).map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO scholar_lookup_plans (job_id, queries_json)
+            SELECT id, ?3 FROM scholar_jobs WHERE conversation_id = ?1 AND turn_number = ?2
+            ON CONFLICT(job_id) DO NOTHING",
+            params![
+                conversation,
+                turn,
+                serde_json::to_string(&plan.queries).map_err(invalid_json)?
+            ],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)
+    }
+
+    pub fn scholar_lookup_queries(&self, job: &str) -> io::Result<Option<Vec<String>>> {
+        let raw: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT queries_json FROM scholar_lookup_plans WHERE job_id = ?1",
+                [job],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        raw.map(|raw| serde_json::from_str(&raw).map_err(invalid_json))
+            .transpose()
+    }
+
     /// Atomically record Scout's reason and enqueue the corresponding Scholar job.
     pub fn enqueue_scout_research_with_reason(
         &mut self,
@@ -1371,42 +1530,43 @@ impl LearningStore {
         question: &str,
         selection_reason: &str,
     ) -> io::Result<bool> {
+        match self.try_enqueue_scout_research(
+            trigger_kind,
+            topic_key,
+            trigger_ref,
+            question,
+            selection_reason,
+        )? {
+            ScoutAdmission::Queued(_) => Ok(true),
+            ScoutAdmission::Deferred(reason) | ScoutAdmission::Blocked(reason) => {
+                crate::diagnostics::event(
+                    "scout.queue_deferred",
+                    serde_json::json!({"trigger_kind":trigger_kind,"reason":reason,"policy":self.scout_queue_status()?}),
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    pub fn try_enqueue_scout_research(
+        &mut self,
+        trigger_kind: &str,
+        topic_key: &str,
+        trigger_ref: &str,
+        question: &str,
+        selection_reason: &str,
+    ) -> io::Result<ScoutAdmission> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        if scout_topic_blocked(&tx, trigger_kind, topic_key)? {
-            return Ok(false);
+        if let Some(reason) = scout_topic_block_reason(&tx, trigger_kind, topic_key)? {
+            return Ok(ScoutAdmission::Blocked(reason));
         }
-        let min_interval = scout_min_interval_seconds();
-        if min_interval > 0 {
-            let recent: i64 = tx
-                .query_row(
-                    "SELECT COUNT(*) FROM scout_investigations
-                 WHERE created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
-                    [format!("-{min_interval} seconds")],
-                    |row| row.get(0),
-                )
-                .map_err(database_error)?;
-            if recent > 0 {
-                return Ok(false);
-            }
-        }
-        let daily: i64 = tx
-            .query_row(
-                "SELECT COUNT(*) FROM scout_investigations
-                 WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
-        let daily_limit = std::env::var("COMMUNITY_MAX_RESEARCH_PER_DAY")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|value| *value <= 200)
-            .unwrap_or(20);
-        if daily_limit > 0 && daily >= i64::try_from(daily_limit).unwrap_or(20) {
-            return Ok(false);
+        if let Some(reason) =
+            scout_queue_block_reason(&tx, scout_min_interval_seconds(), scout_daily_limit())?
+        {
+            return Ok(ScoutAdmission::Deferred(reason));
         }
         let job_id: String = tx
             .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
@@ -1459,7 +1619,7 @@ impl LearningStore {
             Some("research_queued"),
         )?;
         tx.commit().map_err(database_error)?;
-        Ok(true)
+        Ok(ScoutAdmission::Queued(job_id))
     }
 
     pub fn scout_investigations(&self) -> io::Result<Vec<ScoutInvestigation>> {
@@ -1491,15 +1651,59 @@ impl LearningStore {
     }
 
     pub fn claim_scholar_job(&mut self) -> io::Result<Option<ScholarJob>> {
+        self.claim_scholar_job_with_priority(false, None)
+    }
+
+    /// Conversation questions take precedence over Scout and feedback work.
+    pub fn claim_user_scholar_job(&mut self) -> io::Result<Option<ScholarJob>> {
+        self.claim_scholar_job_with_priority(true, None)
+    }
+
+    pub fn claim_conversation_research(
+        &mut self,
+        conversation: &str,
+        turn: usize,
+    ) -> io::Result<Option<ScholarJob>> {
+        self.claim_scholar_job_with_priority(true, Some((conversation, turn)))
+    }
+
+    pub fn has_pending_user_research(&self) -> io::Result<bool> {
+        self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scholar_jobs j
+                 WHERE ((j.status = 'pending' AND (j.next_attempt_at_ms <= CAST(strftime('%s','now') AS INTEGER)*1000
+                     OR j.last_error = 'Scholar reached the daily external page-fetch limit')) OR (j.status = 'processing'
+                AND j.claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-600 seconds')))
+             AND NOT EXISTS(SELECT 1 FROM scout_investigations s WHERE s.scholar_job_id = j.id)
+             AND NOT EXISTS(SELECT 1 FROM scholar_research_feedback f WHERE f.scholar_job_id = j.id))",
+            [], |row| row.get(0),
+        ).map_err(database_error)
+    }
+
+    fn claim_scholar_job_with_priority(
+        &mut self,
+        user_only: bool,
+        target: Option<(&str, usize)>,
+    ) -> io::Result<Option<ScholarJob>> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let job = tx.query_row(
-            "SELECT id, question, status FROM scholar_jobs WHERE status = 'pending'
-             OR (status = 'processing' AND claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-600 seconds'))
-             ORDER BY created_at LIMIT 1",
-            [],
+            "WITH queued AS (
+               SELECT j.*, j.rowid AS queue_order,
+                 (NOT EXISTS(SELECT 1 FROM scout_investigations s WHERE s.scholar_job_id = j.id)
+                  AND NOT EXISTS(SELECT 1 FROM scholar_research_feedback f WHERE f.scholar_job_id = j.id)) AS user_requested
+                             FROM scholar_jobs j WHERE (status = 'pending' AND (next_attempt_at_ms <= CAST(strftime('%s','now') AS INTEGER)*1000
+                                 OR last_error = 'Scholar reached the daily external page-fetch limit'))
+               OR (status = 'processing' AND claimed_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-600 seconds'))
+             )
+             SELECT id, question, status FROM queued WHERE (?1 = 0 OR user_requested)
+               AND (?2 IS NULL OR (conversation_id = ?2 AND turn_number = ?3))
+             ORDER BY user_requested DESC,
+               CASE WHEN user_requested THEN created_at END DESC,
+               CASE WHEN user_requested THEN queue_order END DESC,
+               created_at, queue_order LIMIT 1",
+            params![user_only, target.map(|t| t.0), target.map(|t| i64::try_from(t.1)).transpose().map_err(|_| invalid("turn number too large"))?],
             |row| Ok(ScholarJob { id: row.get(0)?, question: row.get(1)?, status: row.get(2)? }),
         ).optional().map_err(database_error)?;
         if let Some(job) = &job {
@@ -1507,6 +1711,40 @@ impl LearningStore {
         }
         tx.commit().map_err(database_error)?;
         Ok(job)
+    }
+
+    pub fn defer_scholar_job(
+        &self,
+        job_id: &str,
+        reason: &str,
+        retry_at_ms: i64,
+    ) -> io::Result<()> {
+        self.connection.execute(
+            "UPDATE scholar_jobs SET status='pending',last_error=?2,claimed_at=NULL,next_attempt_at_ms=?3
+             WHERE id=?1 AND status='processing'",
+            params![job_id,reason.chars().take(500).collect::<String>(),retry_at_ms],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn next_research_retry_ms(&self) -> io::Result<i64> {
+        let now: i64 = self
+            .connection
+            .query_row(
+                "SELECT CAST(strftime('%s','now') AS INTEGER)*1000",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let backoff: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(retry_until_ms),0) FROM scholar_host_backoff",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        Ok(self.wikipedia_budget_retry_ms(now)?.max(backoff))
     }
 
     pub fn fail_scholar_job(&self, job_id: &str, reason: &str) -> io::Result<()> {
@@ -2504,10 +2742,11 @@ impl LearningStore {
             let today: String = tx
                 .query_row("SELECT date('now')", [], |row| row.get(0))
                 .map_err(database_error)?;
+            let aliases = super::entities::EntityAliases::load(&tx)?;
             let equivalent = current
                 .iter()
                 .find(|(_, s, r, o, from, until)| {
-                    canonical(s) == canonical(&subject)
+                    aliases.same(s, &subject)
                         && canonical(r) == canonical(&relation)
                         && canonical(o) == canonical(&object)
                         && from.as_deref() == valid_from.as_deref()
@@ -2520,7 +2759,7 @@ impl LearningStore {
                 let conflicting = current
                     .iter()
                     .find(|(_, s, r, o, from, until)| {
-                        canonical(s) == canonical(&subject)
+                        aliases.same(s, &subject)
                             && canonical(r) == canonical(&relation)
                             && canonical(o) != canonical(&object)
                             && claim_periods_overlap(
@@ -2641,11 +2880,160 @@ impl LearningStore {
     }
 }
 
+#[cfg(test)]
+mod scout_admission_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_lead_explains_the_no_result_cooldown() {
+        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        store
+            .enqueue_research_plan(
+                "topic-cooldown",
+                1,
+                &crate::research::ResearchPlan {
+                    question: "What materials are used in constructing Inca roads?".into(),
+                    queries: vec!["Inca roads materials".into()],
+                },
+            )
+            .unwrap();
+        store
+            .connection
+            .execute("UPDATE scholar_jobs SET status='no_result'", [])
+            .unwrap();
+        store.connection.execute("INSERT INTO scout_investigations(trigger_kind,topic_key,trigger_ref,question,scholar_job_id,selection_reason,created_at)
+            SELECT 'model_probe','inca roads|materials','fixture',question,id,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM scholar_jobs",[]).unwrap();
+        assert_eq!(
+            scout_topic_block_reason(&store.connection, "model_probe", "inca roads|materials")
+                .unwrap(),
+            Some("Previous investigation found no result; this topic has a one-day retry cooldown")
+        );
+        store.connection.execute("UPDATE scout_investigations SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-2 days')",[]).unwrap();
+        assert_eq!(
+            scout_topic_block_reason(&store.connection, "model_probe", "inca roads|materials")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn scheduling_blocks_explain_cooldown_and_daily_limits() {
+        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        store
+            .enqueue_research_plan(
+                "admission",
+                1,
+                &crate::research::ResearchPlan {
+                    question: "What are Inca roads made of?".into(),
+                    queries: vec!["Inca roads materials".into()],
+                },
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO scout_investigations(trigger_kind,topic_key,trigger_ref,question,scholar_job_id,selection_reason,created_at)
+            SELECT 'model_probe','fixture','fixture',question,id,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM scholar_jobs",[]).unwrap();
+        assert_eq!(
+            scout_queue_block_reason(&store.connection, 300, 20).unwrap(),
+            Some("Scout minimum investigation interval has not elapsed")
+        );
+        assert_eq!(
+            scout_queue_block_reason(&store.connection, 0, 1).unwrap(),
+            Some("Scout daily investigation budget exhausted")
+        );
+        assert_eq!(
+            scout_queue_block_reason(&store.connection, 0, 0).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn deferred_model_lead_survives_restart_and_reuses_its_probe() {
+        let directory = std::env::temp_dir().join(format!(
+            "lyra-deferred-scout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("learning.db");
+        let mut store = LearningStore::open(&path).unwrap();
+        let probe = store
+            .begin_model_probe("Inca roads", "fixture")
+            .unwrap()
+            .unwrap();
+        let raw =
+            "TOPIC: Inca roads\nQUESTION: What materials are used in constructing Inca roads?";
+        assert!(
+            store
+                .defer_model_probe(
+                    probe,
+                    raw,
+                    "Inca roads",
+                    "What materials are used in constructing Inca roads?",
+                    "Scout daily investigation budget exhausted"
+                )
+                .unwrap()
+        );
+        assert!(
+            !store
+                .defer_model_probe(
+                    probe,
+                    raw,
+                    "Inca roads",
+                    "What materials are used in constructing Inca roads?",
+                    "Scout daily investigation budget exhausted"
+                )
+                .unwrap()
+        );
+        assert!(store.recent_model_topics().unwrap().is_empty());
+        drop(store);
+        let mut reopened = LearningStore::open(&path).unwrap();
+        let (id, _, topic, question, raw) = reopened.deferred_model_probe().unwrap().unwrap();
+        assert_eq!(id, probe);
+        let ScoutAdmission::Queued(job) = reopened
+            .try_enqueue_scout_research(
+                "model_probe",
+                "inca roads|materials",
+                &format!("model_probe:{id}"),
+                &question,
+                "Deferred lead resumed",
+            )
+            .unwrap()
+        else {
+            panic!("fresh queue must admit the stored lead")
+        };
+        reopened
+            .complete_model_probe(
+                id,
+                "queued",
+                &raw,
+                Some(&topic),
+                Some(&question),
+                Some(&job),
+            )
+            .unwrap();
+        assert!(reopened.deferred_model_probe().unwrap().is_none());
+        assert_eq!(reopened.model_probes().unwrap().len(), 1);
+        assert_eq!(reopened.recent_model_topics().unwrap(), vec!["Inca roads"]);
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 fn scout_topic_blocked(
     connection: &Connection,
     trigger_kind: &str,
     topic_key: &str,
 ) -> io::Result<bool> {
+    Ok(scout_topic_block_reason(connection, trigger_kind, topic_key)?.is_some())
+}
+
+fn scout_topic_block_reason(
+    connection: &Connection,
+    trigger_kind: &str,
+    topic_key: &str,
+) -> io::Result<Option<&'static str>> {
     let latest: Option<(String, Option<f64>, i64)> = connection
         .query_row(
             "SELECT j.status, (julianday('now') - julianday(s.created_at)) * 86400,
@@ -2660,20 +3048,29 @@ fn scout_topic_blocked(
         .optional()
         .map_err(database_error)?;
     Ok(match latest {
-        None => false,
-        Some((_, _, attempts)) if attempts >= 3 => true,
-        Some((status, _, _))
-            if matches!(status.as_str(), "pending" | "processing" | "promoted") =>
-        {
-            true
+        None => None,
+        Some((_, _, attempts)) if attempts >= 3 => {
+            Some("Scout topic has reached its three-investigation attempt limit")
+        }
+        Some((status, _, _)) if matches!(status.as_str(), "pending" | "processing") => {
+            Some("Same Scout investigation is already pending or processing")
+        }
+        Some((status, _, _)) if status == "promoted" => {
+            Some("Scout topic already has promoted research")
         }
         Some((status, age, _)) => {
-            let cooldown_seconds = if status == "no_result" {
-                86_400.0
+            let (seconds, reason) = if status == "no_result" {
+                (
+                    86_400.0,
+                    "Previous investigation found no result; this topic has a one-day retry cooldown",
+                )
             } else {
-                604_800.0
+                (
+                    604_800.0,
+                    "Previous investigation awaits review or corroboration; this topic has a seven-day retry cooldown",
+                )
             };
-            age.is_none_or(|value| value < cooldown_seconds)
+            age.is_none_or(|value| value < seconds).then_some(reason)
         }
     })
 }

@@ -433,6 +433,12 @@ fn fetch_source_page(
             ));
         }
     };
+    store.retain_fetched_candidate_source(
+        candidate.id,
+        &candidate.title,
+        page_url.as_str(),
+        &text,
+    )?;
     let query_words = crate::storage::relevant_words(&candidate.query);
     let page_words = crate::storage::relevant_words(&text);
     if crate::storage::lexical_overlap(&query_words, &page_words) == 0 {
@@ -467,6 +473,21 @@ fn fetch_url(
     interval_ms: i64,
     max_bytes: usize,
 ) -> io::Result<HttpResponse> {
+    if request_kind == "external_page_content" {
+        if let Some((content_type, body)) = store.cached_source_page(url.as_str())? {
+            if body.len() <= max_bytes {
+                crate::diagnostics::event(
+                    "internet.cache_hit",
+                    serde_json::json!({"provider":"web","request_kind":request_kind}),
+                );
+                return Ok(HttpResponse {
+                    status: 200,
+                    content_type,
+                    body,
+                });
+            }
+        }
+    }
     let reservation = store.reserve_host_request_wait(
         &target.host,
         request_kind,
@@ -567,6 +588,9 @@ fn fetch_url(
             io::ErrorKind::InvalidData,
             "source response exceeded the size limit",
         ));
+    }
+    if status == 200 && output.status.success() && request_kind == "external_page_content" {
+        store.cache_source_page(url.as_str(), content_type, body)?;
     }
     Ok(HttpResponse {
         status,

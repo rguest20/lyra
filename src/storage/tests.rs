@@ -1,3 +1,61 @@
+#[test]
+fn deferred_research_survives_reopen_and_waits_until_due() {
+    let directory = std::env::temp_dir().join(format!(
+        "lyra-research-deferral-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("learning.db");
+    let mut store = LearningStore::open(&path).unwrap();
+    let plan = crate::research::ResearchPlan {
+        question: "Where is the Amazon rainforest?".into(),
+        queries: vec!["Amazon rainforest location".into()],
+    };
+    store.enqueue_research_plan("retry-test", 1, &plan).unwrap();
+    let job = store
+        .claim_conversation_research("retry-test", 1)
+        .unwrap()
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    store
+        .defer_scholar_job(&job.id, "daily budget exhausted", now + 60000)
+        .unwrap();
+    drop(store);
+    let mut reopened = LearningStore::open(&path).unwrap();
+    assert!(
+        reopened
+            .claim_conversation_research("retry-test", 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!reopened.has_pending_user_research().unwrap());
+    reopened
+        .connection
+        .execute(
+            "UPDATE scholar_jobs SET next_attempt_at_ms=0 WHERE id=?1",
+            [&job.id],
+        )
+        .unwrap();
+    assert!(reopened.has_pending_user_research().unwrap());
+    assert_eq!(
+        reopened
+            .claim_conversation_research("retry-test", 1)
+            .unwrap()
+            .unwrap()
+            .id,
+        job.id
+    );
+    drop(reopened);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 use super::{
     AssistantClaim, CandidateClaim, ClaimJudgment, ConsolidatedClaimRevision, ImportSummary,
     LearningStore, ModelCheckpointManifest, ScholarEvidence, ScholarFinding, ScholarSourceProfile,
@@ -7,6 +65,125 @@ use crate::knowledge::KnowledgeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT_DB: AtomicUsize = AtomicUsize::new(0);
+
+#[test]
+fn semantic_lookup_plan_survives_restart_and_foreground_claims_only_its_own_turn() {
+    let path = temp_path();
+    let store = LearningStore::open(&path).unwrap();
+    let plan = crate::research::ResearchPlan {
+        question: "Which flavours does Walkers sell?".into(),
+        queries: vec!["Walkers crisps".into(), "Walkers (snack foods)".into()],
+    };
+    store.enqueue_research_plan("frontend", 1, &plan).unwrap();
+    store.enqueue_research_plan("frontend", 1, &plan).unwrap();
+    store
+        .enqueue_research("other-frontend", 2, "What moons does Mars have?")
+        .unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let job = store
+        .claim_conversation_research("frontend", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.question, plan.question);
+    assert_eq!(
+        store.scholar_lookup_queries(&job.id).unwrap().unwrap(),
+        plan.queries
+    );
+    assert!(
+        store
+            .claim_conversation_research("frontend", 1)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store.claim_user_scholar_job().unwrap().unwrap().question,
+        "What moons does Mars have?"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn lookup_plan_schema_upgrade_preserves_existing_jobs() {
+    let path = temp_path();
+    let store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("existing", 1, "What flavours of crisps exist?")
+        .unwrap();
+    store
+        .connection
+        .execute_batch("DROP TABLE scholar_lookup_plans; PRAGMA user_version = 42;")
+        .unwrap();
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(job.question, "What flavours of crisps exist?");
+    assert!(store.scholar_lookup_queries(&job.id).unwrap().is_none());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn newest_user_research_precedes_background_work_without_losing_older_jobs() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_scout_research_with_reason(
+            "model_probe",
+            "renewable energy",
+            "model_probe:1",
+            "How does renewable energy affect food production?",
+            "Background exploration",
+        )
+        .unwrap();
+    let (_, finding) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_feedback(
+            finding,
+            "Need a different source",
+            "new_source",
+            "Seek independent evidence.",
+        )
+        .unwrap();
+    let retry = store.claim_scholar_feedback("new_source").unwrap().unwrap();
+    assert!(!store.has_pending_user_research().unwrap());
+    assert!(store.claim_user_scholar_job().unwrap().is_none());
+    store
+        .enqueue_research("frontend", 1, "What flavours of crisps exist?")
+        .unwrap();
+    store
+        .enqueue_research("frontend", 2, "Who invented potato crisps?")
+        .unwrap();
+    assert!(store.has_pending_user_research().unwrap());
+    let latest = store.claim_user_scholar_job().unwrap().unwrap();
+    assert_eq!(latest.question, "Who invented potato crisps?");
+    // A second worker cannot claim the same live job.
+    let older = store.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(older.question, "What flavours of crisps exist?");
+    assert!(!store.has_pending_user_research().unwrap());
+    let background = store.claim_scholar_job().unwrap().unwrap();
+    assert_eq!(
+        background.question,
+        "How does renewable energy affect food production?"
+    );
+    assert_eq!(store.claim_scholar_job().unwrap().unwrap().id, retry.job_id);
+    assert!(store.claim_scholar_job().unwrap().is_none());
+    store
+        .connection
+        .execute(
+            "UPDATE scholar_jobs SET claimed_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            [&latest.id],
+        )
+        .unwrap();
+    assert!(store.has_pending_user_research().unwrap());
+    assert_eq!(
+        store.claim_user_scholar_job().unwrap().unwrap().id,
+        latest.id
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
 
 fn temp_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -324,6 +501,25 @@ fn version_17_migration_keeps_scout_jobs_and_adds_operational_history() {
             .status,
         "completed"
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn recent_model_topics_keep_distinct_history_when_rejections_repeat() {
+    let path = temp_path();
+    let store = LearningStore::open(&path).unwrap();
+    for topic in std::iter::once("Earlier distinct topic")
+        .chain(std::iter::repeat_n("Repeated rejected topic", 40))
+    {
+        store.connection.execute("INSERT INTO scout_model_probes(seed,status,topic,selection_reason,created_at) VALUES('open public knowledge','rejected',?1,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now'))", [topic]).unwrap();
+    }
+    drop(store);
+    let reopened = LearningStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.recent_model_topics().unwrap(),
+        vec!["Repeated rejected topic", "Earlier distinct topic"]
+    );
+    drop(reopened);
     let _ = std::fs::remove_file(path);
 }
 
@@ -4483,4 +4679,155 @@ fn semantic_disproof_blocks_promotion_despite_matching_candidate_words() {
     assert!(store.active_semantic_claims().unwrap().is_empty());
     drop(store);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reviewed_entity_aliases_share_claim_sources_and_detect_conflicts_after_restart() {
+    let path = temp_path();
+    let store = LearningStore::open(&path).unwrap();
+    let passage = "Walkers Snack Foods Limited, known as Walkers, is a British company.";
+    let mut calls = 0;
+    let aliases=crate::entities::resolve_with("Walkers","Walkers",passage,|_| {
+        calls+=1;
+        Ok(if calls==1 {serde_json::json!({"aliases":[{"name":"Walkers","alias":"Walkers Snack Foods Limited","evidence_text":passage}]}).to_string()}
+            else {serde_json::json!({"verdict":"entailed","reason":"Both names explicitly identify the same company.","evidence_text":passage}).to_string()})
+    }).unwrap();
+    store
+        .record_entity_alias(None, "https://example.org/walkers", passage, &aliases[0])
+        .unwrap();
+    assert!(
+        store
+            .record_entity_alias(
+                None,
+                "https://example.org/walkers",
+                "An unrelated passage.",
+                &aliases[0]
+            )
+            .is_err()
+    );
+    drop(store);
+    let mut store = LearningStore::open(&path).unwrap();
+    let names = store.entity_aliases().unwrap();
+    assert!(names.same("Walkers", "Walkers Snack Foods Limited"));
+    assert!(names.same("Walkers Snack Foods Limited", "Walkers"));
+    assert!(!names.same("Walkers", "Walkers Shortbread"));
+    assert!(!names.same("Walkers", "PepsiCo"));
+    assert!(!crate::entities::matches_claim(
+        &["Walkers".into()],
+        "Ruffles",
+        "crisps in various flavours",
+        &names
+    ));
+    assert!(crate::entities::matches_claim(
+        &["Walkers".into()],
+        "Walkers Snack Foods Limited",
+        "crisps",
+        &names
+    ));
+    assert!(crate::entities::matches_claim(
+        &["Walkers".into()],
+        "A crisp brand",
+        "Walkers Snack Foods Limited",
+        &names
+    ));
+    for (turn, subject, object) in [
+        (1, "Walkers", "Leicester"),
+        (2, "Walkers Snack Foods Limited", "Leicester"),
+        (3, "Walkers Snack Foods Limited", "London"),
+    ] {
+        let text = format!("{subject} is based in {object}.");
+        let id = store.stage_observation("aliases", turn, &text).unwrap();
+        store.claim_next_observation(600).unwrap().unwrap();
+        store
+            .finish_extraction(
+                &id,
+                &[CandidateClaim {
+                    subject: subject.into(),
+                    relation: "is based in".into(),
+                    object: object.into(),
+                    evidence_text: text,
+                    context_message_ids: Vec::new(),
+                    resolution: None,
+                    confidence: 0.98,
+                    status: "proposed".into(),
+                    decision_reason: None,
+                    valid_from: None,
+                    valid_until: None,
+                }],
+                None,
+            )
+            .unwrap();
+    }
+    assert_eq!(store.claim_count().unwrap(), 1);
+    let sources: i64 = store
+        .connection
+        .query_row("SELECT COUNT(*) FROM semantic_claim_sources", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(sources, 2);
+    let conflicts: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM candidate_claims WHERE status='needs_review'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(conflicts, 1);
+}
+
+#[test]
+fn alias_ambiguity_and_rejected_identity_sources_do_not_merge_entities() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    for (turn, long_name) in [
+        (1, "Walkers Snack Foods Limited"),
+        (2, "Walkers Shortbread"),
+    ] {
+        let passage = format!("{long_name}, also known as Walkers, is a company.");
+        let mut calls = 0;
+        let aliases=crate::entities::resolve_with("Walkers","Identity",&passage,|_| {
+            calls+=1;
+            Ok(if calls==1 {serde_json::json!({"aliases":[{"name":"Walkers","alias":long_name,"evidence_text":passage}]}).to_string()}
+                else {serde_json::json!({"verdict":"entailed","reason":"The source explicitly states an alternative name.","evidence_text":passage}).to_string()})
+        }).unwrap();
+        let url = format!("https://example.org/entity-{turn}");
+        store
+            .enqueue_research("identities", turn, "What is Walkers?")
+            .unwrap();
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        store
+            .finish_scholar_job(
+                &job.id,
+                "Identity",
+                &url,
+                &passage,
+                Some(aliases[0].finding.clone()),
+                None,
+            )
+            .unwrap();
+        let finding = store.scholar_findings(&job.id).unwrap()[0].id;
+        store
+            .record_entity_alias(Some(finding), &url, &passage, &aliases[0])
+            .unwrap();
+        let aliases = store.entity_aliases().unwrap();
+        if turn == 1 {
+            assert!(aliases.same("Walkers", long_name));
+        } else {
+            assert!(!aliases.same("Walkers", "Walkers Snack Foods Limited"));
+            assert!(!aliases.same("Walkers", "Walkers Shortbread"));
+            assert!(!aliases.same("Walkers Snack Foods Limited", "Walkers Shortbread"));
+            store
+                .connection
+                .execute(
+                    "UPDATE scholar_findings SET status='rejected' WHERE id=?1",
+                    [finding],
+                )
+                .unwrap();
+            let aliases = store.entity_aliases().unwrap();
+            assert!(aliases.same("Walkers", "Walkers Snack Foods Limited"));
+            assert!(!aliases.same("Walkers", "Walkers Shortbread"));
+        }
+    }
 }

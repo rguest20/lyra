@@ -1,4 +1,5 @@
 use super::Cli;
+use crate::inference::assignments::AgentRole;
 use crate::{agent, inference::LocalModel, storage};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -59,8 +60,7 @@ impl Cli {
                 }
             }
             [action, question, title, passage] if action == "probe-scholar" => {
-                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-                    .map_err(|error| error.to_string())?;
+                let mut backend = self.model_runtime.model(AgentRole::Scholar);
                 println!(
                     "{}",
                     crate::scholar::probe_extraction(question, title, passage, &mut backend)
@@ -69,19 +69,39 @@ impl Cli {
             [action, context] if action == "probe-support" => {
                 let context: serde_json::Value =
                     serde_json::from_str(context).map_err(|error| error.to_string())?;
-                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-                    .map_err(|error| error.to_string())?;
+                let mut backend = self.model_runtime.model(AgentRole::Scholar);
                 println!(
                     "{}",
                     crate::semantic::probe(&context, &mut backend)
                         .map_err(|error| error.to_string())?
                 );
             }
+            [action, subject, title, passage] if action == "probe-aliases" => {
+                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+                let aliases = crate::entities::resolve_with(subject, title, passage, |messages| {
+                    backend.chat_for_extraction(messages)
+                })
+                .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::json!({"aliases":aliases.iter().map(|a|serde_json::json!({"name":a.finding.subject,"alias":a.finding.object,"evidence":a.finding.evidence_text})).collect::<Vec<_>>()})
+                );
+            }
+            [action, question, evidence] if action == "probe-lookup" => {
+                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+                let plan = crate::research::plan_with(question, evidence, |messages| {
+                    backend.chat_for_extraction(messages)
+                })
+                .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&plan).map_err(|error| error.to_string())?
+                );
+            }
             [action, context] if action == "probe-review" => {
                 let context: serde_json::Value =
                     serde_json::from_str(context).map_err(|error| error.to_string())?;
-                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-                    .map_err(|error| error.to_string())?;
+                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
                 println!(
                     "{}",
                     crate::curmudgeon::probe_source_review(&context, &mut backend)
@@ -89,8 +109,7 @@ impl Cli {
                 );
             }
             [action, prompt @ ..] if action == "probe-chat" && !prompt.is_empty() => {
-                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-                    .map_err(|e| format!("could not load local model: {e}"))?;
+                let mut backend = self.model_runtime.model(AgentRole::Interaction);
                 println!(
                     "{}",
                     backend
@@ -99,7 +118,7 @@ impl Cli {
                 );
             }
             [action, prompt @ ..] if action == "probe" && !prompt.is_empty() => {
-                let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
+                let mut backend = LocalModel::load_for_chat(model_dir, adapter_path, cpu)
                     .map_err(|e| format!("could not load local model: {e}"))?;
                 println!(
                     "{}",
@@ -309,7 +328,7 @@ impl Cli {
             }
             _ => {
                 return Err(
-                        "usage: model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | model probe-scholar QUESTION TITLE PASSAGE | model probe-review CONTEXT_JSON | model probe-support CONTEXT_JSON".into(),
+                        "usage: model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | model probe-scholar QUESTION TITLE PASSAGE | model probe-review CONTEXT_JSON | model probe-support CONTEXT_JSON | model probe-lookup QUESTION SOURCE_EVIDENCE | model probe-aliases SUBJECT TITLE PASSAGE".into(),
                     );
             }
         }

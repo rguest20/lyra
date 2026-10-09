@@ -3,7 +3,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
 use serde::Deserialize;
@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::agent::Message;
 use crate::inference::LocalModel;
+use crate::inference::assignments::ModelRuntime;
 use crate::maintenance;
 use crate::storage::{CandidateClaim, LearningStore, Observation, valid_claim_period};
 
@@ -300,15 +301,11 @@ fn is_explicit_assertion(observation: &str) -> bool {
 }
 
 impl CuratorHandle {
-    pub fn spawn(
-        database_path: String,
-        knowledge_path: String,
-        model: Arc<Mutex<LocalModel>>,
-    ) -> Self {
+    pub fn spawn(database_path: String, knowledge_path: String, models: ModelRuntime) -> Self {
         let (sender, receiver) = wake_queue();
         let thread = thread::Builder::new()
             .name("semantic-curator".into())
-            .spawn(move || run(database_path, knowledge_path, model, receiver));
+            .spawn(move || run(database_path, knowledge_path, models, receiver));
         let thread = match thread {
             Ok(thread) => Some(thread),
             Err(error) => {
@@ -347,25 +344,20 @@ impl Drop for CuratorHandle {
 fn run(
     database_path: String,
     knowledge_path: String,
-    model: Arc<Mutex<LocalModel>>,
+    models: ModelRuntime,
     receiver: mpsc::Receiver<Command>,
 ) {
     loop {
         if drain_commands(&receiver) {
             break;
         }
-        match model.lock() {
-            Ok(mut guard) => {
-                if let Err(error) = maintenance::run_pass(
-                    Path::new(&database_path),
-                    Path::new(&knowledge_path),
-                    &mut guard,
-                    "chat",
-                ) {
-                    eprintln!("semantic maintenance pass failed: {error}");
-                }
-            }
-            Err(_) => eprintln!("semantic maintenance model lock was poisoned"),
+        if let Err(error) = maintenance::run_pass(
+            Path::new(&database_path),
+            Path::new(&knowledge_path),
+            &models,
+            "chat",
+        ) {
+            eprintln!("semantic maintenance pass failed: {error}");
         }
 
         if !wait_for_next_pass(&receiver, maintenance::interval()) {

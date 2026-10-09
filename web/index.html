@@ -139,7 +139,7 @@
         }
         addMessage(result.reply, 'agent');
         addThinking(result.thinking);
-        if (result.research_queued) addMessage('Scholar is looking this up for a future reply.', 'system-note');
+        if (result.research_queued) addMessage('Scholar research was requested for this question.', 'system-note');
         status.textContent = 'Updating knowledge and checking the reply…';
         prompt.focus();
         const ready = await fetch(`/api/ready?session_id=${sessionId}`);

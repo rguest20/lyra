@@ -1,7 +1,7 @@
 # Community Lab
 
-One local chatbot in Rust, using the original **BF16 Qwen3.5-2B** checkpoint
-on Apple Metal. A persistent local MLX worker runs its hybrid attention model;
+One local multi-agent chatbot in Rust, supporting original **BF16 Qwen3 and
+Qwen3.5** checkpoints on Apple Metal. A persistent local MLX worker runs Qwen3.5's hybrid attention model;
 Rust handles conversations, research, grounding, AI review, logging, and storage.
 No hosted inference service is required. The legacy Qwen3 backend uses Candle.
 
@@ -38,10 +38,18 @@ SQLite research database remain shared. Context exhaustion returns an error;
 it does not silently discard conversation history.
 
 `model.loaded` logs backend, precision, shard count, context cap, template,
-device, and adapter selection. A process lock at `state/model-inference.lock`
-serializes model use across chat and maintenance; a waiting process emits
-`model.waiting_for_lease`. Override the shared lock path with
-`COMMUNITY_MODEL_LOCK` if needed.
+device, and adapter selection. Agents now use lazy per-agent model handles and
+share matching model/adapter instances within a process. Inference is serialized
+with a shared request lock derived from `COMMUNITY_MODEL_LOCK` (default
+`state/model-inference.lock`) with `.requests` appended; background network work
+does not hold this lock. A waiting process emits `model.waiting_for_lease`.
+`agent.inference` records agent/model identity, duration, and visible token usage
+where available, without prompt contents. Models remain cached up to
+`COMMUNITY_MODEL_CACHE_SIZE` (default 1). Browser subprocesses still reload
+models between turns. Restart running processes to pick up adapter changes.
+
+For per-agent configuration, the 0.6B/2B MacBook profile, measured memory
+constraints, and cache limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
 
 The MLX backend supports a fresh output adapter, teacher-forced adapter training,
 and merging that adapter into an unquantized BF16 output head. Adapter files are
@@ -113,7 +121,8 @@ cargo run --release -- serve
 The server accepts connections only on a loopback address. Each prompt launches
 the existing `say` command as a short-lived process, so its model is unloaded
 after the reply. A bounded maintenance subprocess runs after chat activity and
-on an idle timer; the next browser prompt waits for an active pass to finish.
+on an idle timer; browser replies share the inference request lock, not the
+entire maintenance pass.
 This lets the roles update SQLite between turns without keeping the reply agent
 loaded. Each browser tab gets a separate conversation
 history under `state/web-sessions/`. Reloading a tab keeps its session; a new
@@ -121,9 +130,11 @@ tab or **Start a new conversation** begins a fresh history. Learned knowledge
 is shared across sessions. The agent also starts a fresh history when you
 explicitly ask it to ignore the conversation, or when the local model judges
 that a new message starts a distinct conversational thread. This semantic
-continuity check starts after the first two exchanges and uses recent dialogue;
-clear follow-up references stay in the current conversation, and unclear
-judgments keep it. The check adds a short local model pass to prompts that need
+continuity check starts after the first two exchanges and uses recent dialogue
+with Curmudgeon's model assignment. It first checks whether the message could
+reasonably continue that dialogue, including corrections and acknowledgments.
+A plausible continuation or an unclear judgment keeps the current conversation;
+only an independent request or explicit reset starts a new one. The check adds a short local model pass to prompts that need
 it. Set `COMMUNITY_WEB_ADDR` to another loopback address if port 8080 is in
 use; non-loopback addresses are rejected.
 
@@ -140,6 +151,20 @@ review. See [context and reply quality fixes](docs/context-and-reply-quality.md)
 for the events, retry limits and validation.
 
 ## Scholar research queue
+
+Fetched passages now also enter separate **unverified claims** and **follow-up
+questions** baskets, independently of answer extraction. Source text survives
+failed reviews; background harvesting, Scout scheduling, and Curmudgeon evidence
+relationships turn it into reusable research. Wikipedia budgets and persisted
+retry times prevent temporary quotas from becoming permanent `no_result` jobs.
+Inspect `scholar usage` and `scholar baskets`.
+`scholar usage` also explains Scout queue cooldowns and budgets. Valid model
+leads wait for admission instead of being rejected by scheduling limits. Empty
+source baskets are bootstrapped from saved excerpts on a background Scholar pass;
+claim/question extraction then proceeds under the normal maintenance budgets.
+See
+[Research Baskets And Quotas](docs/research-baskets-and-quotas.md) for controls,
+confidence limitations, migration notes, and all inspection commands.
 
 When Lyra's reply leaves a public factual question unanswered, a local model
 check can queue a short search phrase for the scholar. The scholar has its own
@@ -166,9 +191,52 @@ AI reviewer when the extractor cannot return a grounded claim. The reviewer
 assesses source suitability and direct support; suitable secondary findings
 continue through automatic independent-source corroboration. Unsupported,
 unsuitable, personal, conflicting, or below-threshold findings are rejected or
-kept out of promotion with the rationale recorded. A web reply shows when research was
-queued; the lookup runs after the reply and may inform later prompts. In the
-CLI, the background worker checks the queue between turns and on idle ticks.
+kept out of promotion with the rationale recorded.
+
+Before replying, Lyra uses semantic assessment to identify missing public facts.
+A subjective question can need a factual prerequisite: “best Walkers flavour”
+becomes a lookup for available flavours, rather than a search for an objective
+winner. Planning uses user questions and selected source passages, excluding
+unsourced assistant drafts. The model supplies a neutral question and alternate query phrases,
+which persist with the job. Lyra processes its own conversation lookup before
+finishing the answer, then selects relevant evidence and checks the enriched
+answer against source passages. Selection requires exact useful passage spans
+and a relevance rationale; website controls and footer bundles are excluded,
+including from previously saved findings. Partial context does not satisfy
+missing facts about the requested use or comparison. If a generated answer
+cannot be validated, Lyra reports the limitation instead of dumping passages.
+Final review checks factual support and whether the reply addresses the actual
+request separately; supported facts about a different use are insufficient.
+This increases first-answer latency; retrieval and network work remain bounded
+by existing request and candidate limits.
+Named entities extracted from the request constrain source selection and
+retrieval; another brand cannot satisfy a named-brand request. Reviewed aliases
+can satisfy that constraint. Existing evidence is shortlisted with model-generated aliases and synonyms,
+then selected semantically. Invalid query expansion falls back to the original
+question; invalid semantic selection is retried once and does not establish
+support. Unrelated recent findings are excluded from the shortlist. If a lookup
+finds no relevant evidence, Lyra reports that gap instead of publishing its
+unverified draft. Short acknowledgments use recent dialogue without retrieving
+new world facts. The shortlist currently examines at most 500 recent eligible findings.
+
+Curmudgeon can learn explicit alternative entity names from suitable reviewed
+sources. A second entailment assessment checks each identity against an exact
+source quotation. Reviewed names participate in claim deduplication, source
+attachment, conflict checks, corroboration and assistant claim review. Original
+names and source evidence remain intact. Similar spelling, common ownership,
+and parent/subsidiary relationships do not establish identity. Links require explicit naming statements such as “trading as” or “also known
+as”. They are direct, without transitive merging. Multiple known identities
+for the same name and context-dependent identities remain unresolved.
+Source-linked aliases stop applying when their finding is rejected or its
+promoted claim is retracted. SQLite schema 44 retains lookup plans and alias
+provenance; existing claims are not rewritten or bulk-merged.
+
+Unanswered public questions such as "What crisp flavours do you know?" trigger
+research even when phrased conversationally. The newest queued conversation
+question is selected before older user questions, Scout investigations, repair
+retries, and corroboration. Maintenance gives that lookup the first slot in its
+pass, including when autonomous research is disabled. Work already in progress
+finishes its current task; background queues remain available afterwards.
 
 ```sh
 cargo run --release -- scholar
@@ -262,6 +330,17 @@ for one question, and Scout asks at most five expansion questions per subject.
 Personal facts such as the user's name or address are excluded from autonomous web
 research.
 
+After those gaps are exhausted, broad model-derived exploration rotates through
+12 subject areas with three named starting subjects per area. The persisted
+probe ID advances the rotation after rejected suggestions and restarts too,
+rotating the starting subject on each circuit. Scout chooses that concrete
+subject and asks the model for a focused factual question instead of asking the
+small model to invent both a topic and question from a long rejection list. Recent-topic
+history keeps distinct titles, so repeated rejections cannot crowd out older
+ones. Shared substantive topic phrases also block close rewordings from being
+queued as fresh background leads. This diversity guard does not merge claims or
+entities. Diagnostics and probe records include the selected subject-area seed.
+
 ```sh
 cargo run --release -- scout
 cargo run --release -- scout-once
@@ -306,7 +385,9 @@ guidance. An unsuitable source returns to Scout to queue a search for better
 evidence. Sources are excluded only after an explicit irrelevant or unreliable
 verdict, and only for that page within the question's retry loop. Extraction
 failures never establish source unsuitability; useful passages return to Scholar
-with exact suggested evidence. Missing source verdicts default to repair. A finding gets **three
+with exact suggested evidence. A request for a new source is honored even when
+the source verdict is missing or unknown, without excluding the old page. Other
+missing source verdicts default to repair. A finding gets **three
 attempts total** (the original plus two retries), shared across both routes.
 After the third unsuccessful attempt the loop stops and records its reason.
 Personal or sensitive findings stop without retries. The budget, guidance,
@@ -354,7 +435,33 @@ Configuration:
 | `COMMUNITY_CONFIG` | `config.toml` | Optional local TOML file for search provider settings. |
 | `TAVILY_API_KEY` | — | Tavily API key; overrides `[search.tavily].api_key`. |
 | `SERP_API_KEY` | — | SerpAPI key. |
+| `SCHOLAR_WIKIPEDIA_INTERVAL_SECONDS` | `10` | Minimum Wikipedia request spacing, never below ten seconds. |
+| `SCHOLAR_WIKIPEDIA_REQUESTS_PER_HOUR` | `60` | Rolling all-call Wikipedia API budget. |
+| `SCHOLAR_WIKIPEDIA_REQUESTS_PER_DAY` | `200` | Rolling all-call Wikipedia API budget; external pages have no shared daily fetch cap. |
 | `SEARXNG_URL` | — | Local SearXNG search URL; overrides `[search.searxng].url`. |
+| `OPENAI_API_KEY` | unset | When non-empty and OpenAI reviews are explicitly enabled, Curmudgeon uses OpenAI for claim, source, semantic-support, provenance, and assistant-audit reviews instead of the local model. |
+| `COMMUNITY_CURMUDGEON_OPENAI` | `off` | Only `on`, `true`, or `1` enables OpenAI reviews. Otherwise the local model is used even with an API key configured. |
+| `COMMUNITY_CURMUDGEON_OPENAI_MODEL` | `gpt-4.1-mini` | OpenAI chat-completions model for Curmudgeon; must support JSON-object responses. |
+
+OpenAI reviews are disabled by default. To enable them, set
+`COMMUNITY_CURMUDGEON_OPENAI=on` and OpenAI credentials directly in the
+Git-ignored `.env`, then restart Lyra.
+Chat and the other agents still use the local model. Curmudgeon sends review
+evidence to OpenAI, including source excerpts, user observations, assistant
+replies, and relevant claim metadata. Requests incur API costs, use a 45-second
+timeout and a 1,536-token response cap, and request `store=false`; this is not a
+promise of zero provider retention. API errors, refusals, and incomplete
+responses leave reviews pending rather than rejecting the evidence or silently
+falling back to the smaller model. Set `COMMUNITY_CURMUDGEON_OPENAI=off` or
+leave it unset to keep all Curmudgeon inference local without removing your key.
+Remove or blank `OPENAI_API_KEY` for the same effect. Restart running processes
+after changes.
+
+The review rubric accepts supported paraphrases and does not demand perfect
+wording. Materially flawed candidates still receive specific repair guidance;
+confidence, exact quoted evidence, privacy, freshness, conflict resolution,
+and independent-corroboration gates are unchanged. A stronger reviewer cannot
+override those storage policies or automatically reopen old rejected findings.
 
 Copy `config.example.toml` to `config.toml` to configure Tavily or a local
 SearXNG instance. `config.toml` is ignored by Git. SearXNG endpoints must be
@@ -463,7 +570,7 @@ Chat and `say` save every user input as a pending observation in
 from the same conversation are included as user-reported context; the latest
 input remains the final prompt message. Repeating an input for the same
 conversation turn after a failure reuses its observation. The `chat` command
-starts one asynchronous curator thread that shares the local model and extracts
+starts one asynchronous curator thread that shares the model cache and extracts
 claims with source evidence. A second AI reviewer assesses flagged extractions;
 acceptance still requires the 0.95 confidence threshold, exact evidence, valid
 dates, and conflict checks. Curmudgeon resolves any remaining candidate

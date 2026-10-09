@@ -103,39 +103,10 @@ impl LearningStore {
         if query_words.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT f.id, f.source_url, f.subject, f.relation, f.object,
-                    f.evidence_text, f.confidence, a.gate_status, a.reason,
-                    a.research_relevance
-                 FROM scholar_findings f
-                 JOIN scholar_source_assessments a ON a.finding_id = f.id
-                 WHERE f.status = 'needs_review' AND a.direct_support = 1
-                   AND instr(f.source_excerpt, f.evidence_text) > 0
-                   AND lower(trim(f.subject)) NOT IN ('user', 'the user')
-                 ORDER BY f.id DESC LIMIT 500",
-            )
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok(ScholarEvidenceForAnswer {
-                    id: row.get(0)?,
-                    source_url: row.get(1)?,
-                    subject: row.get(2)?,
-                    relation: row.get(3)?,
-                    object: row.get(4)?,
-                    evidence_text: row.get(5)?,
-                    confidence: row.get(6)?,
-                    gate_status: row.get(7)?,
-                    reason: row.get(8)?,
-                    research_relevance: row.get(9)?,
-                })
-            })
-            .map_err(database_error)?;
+        let rows = self.scholar_evidence_candidates(false)?;
         let mut ranked = Vec::new();
         for row in rows {
-            let finding = row.map_err(database_error)?;
+            let finding = row;
             let words = relevant_words(&format!(
                 "{} {} {} {}",
                 finding.subject, finding.relation, finding.object, finding.evidence_text
@@ -156,6 +127,46 @@ impl LearningStore {
             .take(limit)
             .map(|(_, finding)| finding)
             .collect())
+    }
+
+    pub fn scholar_evidence_candidates(
+        &self,
+        include_promoted: bool,
+    ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.source_url, f.subject, f.relation, f.object,
+                    f.evidence_text, f.confidence, a.gate_status, a.reason,
+                    a.research_relevance
+                 FROM scholar_findings f
+                 JOIN scholar_source_assessments a ON a.finding_id = f.id
+                 WHERE (f.status = 'needs_review' OR (?1 AND f.status = 'promoted' AND EXISTS(
+                       SELECT 1 FROM semantic_claims c WHERE c.id = f.semantic_claim_id
+                         AND c.retracted_by IS NULL AND c.status IN ('active','uncertain'))))
+                   AND a.direct_support = 1
+                   AND instr(f.source_excerpt, f.evidence_text) > 0
+                   AND lower(trim(f.subject)) NOT IN ('user', 'the user')
+                 ORDER BY f.id DESC LIMIT 500",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([include_promoted], |row| {
+                Ok(ScholarEvidenceForAnswer {
+                    id: row.get(0)?,
+                    source_url: row.get(1)?,
+                    subject: row.get(2)?,
+                    relation: row.get(3)?,
+                    object: row.get(4)?,
+                    evidence_text: row.get(5)?,
+                    confidence: row.get(6)?,
+                    gate_status: row.get(7)?,
+                    reason: row.get(8)?,
+                    research_relevance: row.get(9)?,
+                })
+            })
+            .map_err(database_error)?;
+        rows.map(|row| row.map_err(database_error)).collect()
     }
 
     pub fn inbox_summary(&self) -> io::Result<InboxSummary> {

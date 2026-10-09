@@ -128,11 +128,12 @@ impl LearningStore {
                     let today: String = tx
                         .query_row("SELECT date('now')", [], |row| row.get(0))
                         .map_err(database_error)?;
+                    let aliases = entities::EntityAliases::load(&tx)?;
                     let mut conflicting = None;
                     for row in rows {
                         let (id, subject, relation, object, from, until) =
                             row.map_err(database_error)?;
-                        if canonical(&subject) == canonical(&claim.subject)
+                        if aliases.same(&subject, &claim.subject)
                             && canonical(&relation) == canonical(&claim.relation)
                             && canonical(&object) != canonical(&claim.object)
                             && claim_periods_overlap(

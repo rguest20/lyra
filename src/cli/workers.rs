@@ -1,12 +1,9 @@
 use super::Cli;
-use crate::{curmudgeon, inference::LocalModel, maintenance, scholar, scout, storage};
+use crate::{curmudgeon, inference::assignments::AgentRole, maintenance, scholar, scout, storage};
 
 impl Cli {
     pub(super) fn curate_once(&mut self, args: Vec<String>) -> Result<(), String> {
         let mut args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
         if args.next().is_some() {
@@ -17,17 +14,9 @@ impl Cli {
         } else {
             "once"
         };
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu).map_err(|error| {
-            let reason = format!("could not load local model for maintenance: {error}");
-            if let Err(record_error) =
-                maintenance::record_startup_failure(database_path, mode, &reason)
-            {
-                return format!("{reason}; could not record failed pass: {record_error}");
-            }
-            reason
-        })?;
-        let summary = maintenance::run_pass(database_path, knowledge_path, &mut backend, mode)
-            .map_err(|e| format!("maintenance failed: {e}"))?;
+        let summary =
+            maintenance::run_pass(database_path, knowledge_path, &self.model_runtime, mode)
+                .map_err(|e| format!("maintenance failed: {e}"))?;
         if mode == "serve" {
             println!(
                 "{}",
@@ -53,8 +42,7 @@ impl Cli {
         if args.next().is_some() {
             return Err("scout-once takes no arguments".into());
         }
-        let mut backend = LocalModel::load(&self.model_dir, &self.adapter_path, self.cpu)
-            .map_err(|e| format!("could not load local model for Scout: {e}"))?;
+        let mut backend = self.model_runtime.model(AgentRole::Scout);
         let queued = scout::process_once(database_path, knowledge_path, &mut backend)
             .map_err(|e| format!("Scout failed: {e}"))?;
         println!("Queued {queued} Scout investigation(s)");
@@ -99,15 +87,11 @@ impl Cli {
 
     pub(super) fn scholar_once(&mut self, args: Vec<String>) -> Result<(), String> {
         let mut args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
         let database_path = &self.database_path;
         if args.next().is_some() {
             return Err("scholar-once takes no arguments".into());
         }
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-            .map_err(|e| format!("could not load local model for scholar: {e}"))?;
+        let mut backend = self.model_runtime.model(AgentRole::Scholar);
         let processed = scholar::process_once(database_path, &mut backend)
             .map_err(|e| format!("scholar failed: {e}"))?;
         println!("Processed {processed} scholar job(s)");
@@ -116,16 +100,12 @@ impl Cli {
 
     pub(super) fn curmudgeon_once(&mut self, args: Vec<String>) -> Result<(), String> {
         let mut args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
         if args.next().is_some() {
             return Err("curmudgeon-once takes no arguments".into());
         }
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-            .map_err(|e| format!("could not load local model for Curmudgeon: {e}"))?;
+        let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
         let processed = curmudgeon::process_once(database_path, knowledge_path, &mut backend)
             .map_err(|e| format!("Curmudgeon failed: {e}"))?;
         println!("Audited {processed} assistant reply/replies");
@@ -193,6 +173,66 @@ impl Cli {
         let values = args.collect::<Vec<_>>();
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         match values.as_slice() {
+            [subcommand] if subcommand == "usage" => {
+                println!(
+                    "{}",
+                    store
+                        .research_network_usage()
+                        .map_err(|error| error.to_string())?
+                );
+            }
+            [subcommand] if subcommand == "baskets" => {
+                println!(
+                    "{}",
+                    store
+                        .research_basket_summary()
+                        .map_err(|error| error.to_string())?
+                );
+            }
+            [subcommand, kind] if subcommand == "baskets" && kind == "import" => {
+                println!(
+                    "Retained {} source excerpt(s); old findings are unchanged",
+                    store
+                        .import_retained_research_sources()
+                        .map_err(|error| error.to_string())?
+                );
+            }
+            [subcommand, kind] if subcommand == "baskets" => {
+                println!(
+                    "{}",
+                    serde_json::to_string(
+                        &store
+                            .research_basket_items(kind)
+                            .map_err(|error| error.to_string())?
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            }
+            [subcommand, kind, id]
+                if subcommand == "baskets"
+                    && matches!(kind.as_str(), "claim" | "source" | "retry") =>
+            {
+                let id = id
+                    .parse::<i64>()
+                    .map_err(|_| "basket ID must be an integer")?;
+                if kind == "retry" {
+                    store
+                        .retry_retained_source(id)
+                        .map_err(|error| error.to_string())?;
+                    println!("Queued source #{id} for re-harvesting");
+                } else {
+                    let detail = if kind == "claim" {
+                        store.retained_claim_evidence(id)
+                    } else {
+                        store.retained_source_detail(id)
+                    }
+                    .map_err(|error| error.to_string())?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&detail).map_err(|error| error.to_string())?
+                    );
+                }
+            }
             [subcommand, query @ ..] if subcommand == "ask" && !query.is_empty() => {
                 let question = query.join(" ");
                 let nonce = std::time::SystemTime::now()

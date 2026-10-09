@@ -1,6 +1,7 @@
 //! Wikipedia API access and page-to-passage processing.
 
 use super::*;
+use sha2::{Digest, Sha256};
 use std::process::Command;
 
 pub(super) fn wikipedia_json_request(
@@ -9,10 +10,25 @@ pub(super) fn wikipedia_json_request(
     max_bytes: usize,
     parameters: &[(&str, String)],
 ) -> io::Result<serde_json::Value> {
+    let mut key_parameters = parameters.to_vec();
+    key_parameters.sort();
+    let key = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(request_kind, &key_parameters)).map_err(io::Error::other)?
+        )
+    );
+    if let Some(response) = store.cached_wikipedia_response(&key)? {
+        crate::diagnostics::event(
+            "internet.cache_hit",
+            serde_json::json!({"provider":"wikipedia","request_kind":request_kind}),
+        );
+        return Ok(response);
+    }
     let reservation = store.reserve_host_request_wait(
         "en.wikipedia.org",
         request_kind,
-        10_000,
+        crate::storage::wikipedia_interval_ms(),
         std::time::Duration::from_secs(30),
     )?;
     let now_ms = std::time::SystemTime::now()
@@ -41,6 +57,7 @@ pub(super) fn wikipedia_json_request(
             .arg("--data-urlencode")
             .arg(format!("{name}={value}"));
     }
+    command.args(["--data-urlencode", "maxlag=5"]);
     let output = command
         .arg("--write-out")
         .arg(format!(
@@ -86,6 +103,37 @@ pub(super) fn wikipedia_json_request(
             .as_millis();
         retry_after_delay_ms(value, i64::try_from(now).ok()?)
     });
+    let parsed = serde_json::from_slice::<serde_json::Value>(body.as_bytes());
+    if let Ok(json) = &parsed {
+        if let Some(code) = json["error"]["code"].as_str() {
+            let transient = mediawiki_transient_error(code);
+            store.complete_host_request_with_retry_after(
+                reservation.id,
+                Some(response_status),
+                retry_after,
+                Some(if transient {
+                    crate::storage::MEDIAWIKI_TRANSIENT_ERROR
+                } else {
+                    "MediaWiki API returned an error"
+                }),
+            )?;
+            crate::diagnostics::event(
+                "internet.request_failed",
+                serde_json::json!({"provider":"wikipedia","request_kind":request_kind,"http_status":response_status,"api_error_code":code.chars().take(100).collect::<String>(),"retryable":transient}),
+            );
+            return Err(io::Error::new(
+                if transient {
+                    io::ErrorKind::WouldBlock
+                } else {
+                    io::ErrorKind::Other
+                },
+                format!(
+                    "Wikipedia API error: {}",
+                    code.chars().take(100).collect::<String>()
+                ),
+            ));
+        }
+    }
     let request_error = (!output.status.success())
         .then(|| wikipedia_request_failure(output.status.code(), response_status, max_bytes));
     store.complete_host_request_with_retry_after(
@@ -107,7 +155,14 @@ pub(super) fn wikipedia_json_request(
                 "error": error,
             }),
         );
-        return Err(io::Error::other(error));
+        return Err(io::Error::new(
+            if matches!(response_status, 429 | 503) {
+                io::ErrorKind::WouldBlock
+            } else {
+                io::ErrorKind::Other
+            },
+            error,
+        ));
     }
     if body.len() > max_bytes {
         return Err(io::Error::new(
@@ -115,8 +170,16 @@ pub(super) fn wikipedia_json_request(
             "Wikipedia response exceeded the configured size limit",
         ));
     }
-    serde_json::from_slice(body.as_bytes())
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let parsed = parsed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    store.cache_wikipedia_response(&key, request_kind, &parsed)?;
+    Ok(parsed)
+}
+
+fn mediawiki_transient_error(code: &str) -> bool {
+    matches!(
+        code,
+        "ratelimited" | "maxlag" | "readonly" | "internal_api_error_DBConnectionError"
+    )
 }
 
 fn wikipedia_request_failure(exit_code: Option<i32>, http_status: u16, max_bytes: usize) -> String {
@@ -139,6 +202,13 @@ fn wikipedia_request_failure(exit_code: Option<i32>, http_status: u16, max_bytes
 #[cfg(test)]
 mod tests {
     use super::wikipedia_request_failure;
+
+    #[test]
+    fn mediawiki_json_rate_limits_are_retryable_even_with_http_200() {
+        assert!(super::mediawiki_transient_error("ratelimited"));
+        assert!(super::mediawiki_transient_error("maxlag"));
+        assert!(!super::mediawiki_transient_error("badvalue"));
+    }
 
     #[test]
     fn successful_http_status_can_still_have_a_transport_or_size_failure() {

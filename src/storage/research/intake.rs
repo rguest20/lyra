@@ -95,7 +95,7 @@ fn existing_semantic_match(
         .prepare(
             "SELECT id, object, valid_from, valid_until FROM semantic_claims
              WHERE retracted_by IS NULL
-               AND lower(trim(subject)) = lower(trim(?1))
+               AND (lower(trim(subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(subject)) AND e.right_name = lower(trim(?1))))
                AND lower(trim(relation)) = lower(trim(?2))
              ORDER BY id DESC",
         )

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::curator;
 use crate::curmudgeon;
-use crate::inference::LocalModel;
+use crate::inference::assignments::{AgentRole, ModelRuntime};
 use crate::scholar;
 use crate::scout;
 use crate::storage::LearningStore;
@@ -82,24 +82,39 @@ trait Roles {
 struct ModelRoles<'a> {
     database_path: &'a Path,
     knowledge_path: &'a Path,
-    model: &'a mut LocalModel,
+    models: &'a ModelRuntime,
 }
 
 impl Roles for ModelRoles<'_> {
     fn curate(&mut self, limit: usize) -> io::Result<usize> {
-        curator::process_once_limited(&self.database_path.to_string_lossy(), self.model, limit)
+        curator::process_once_limited(
+            &self.database_path.to_string_lossy(),
+            &mut self.models.model(AgentRole::Archivist),
+            limit,
+        )
     }
 
     fn audit(&mut self) -> io::Result<usize> {
-        curmudgeon::process_once(self.database_path, self.knowledge_path, self.model)
+        curmudgeon::process_once(
+            self.database_path,
+            self.knowledge_path,
+            &mut self.models.model(AgentRole::Curmudgeon),
+        )
     }
 
     fn scout(&mut self) -> io::Result<usize> {
-        scout::process_once(self.database_path, self.knowledge_path, self.model)
+        scout::process_once(
+            self.database_path,
+            self.knowledge_path,
+            &mut self.models.model(AgentRole::Scout),
+        )
     }
 
     fn research(&mut self) -> io::Result<usize> {
-        scholar::process_once(self.database_path, self.model)
+        scholar::process_once(
+            self.database_path,
+            &mut self.models.model(AgentRole::Scholar),
+        )
     }
 }
 
@@ -187,13 +202,13 @@ fn skip_role(store: &LearningStore, pass_id: i64, role: &str, reason: &str) -> i
 pub fn run_pass(
     database_path: &Path,
     knowledge_path: &Path,
-    model: &mut LocalModel,
+    models: &ModelRuntime,
     mode: &str,
 ) -> io::Result<PassSummary> {
     let mut roles = ModelRoles {
         database_path,
         knowledge_path,
-        model,
+        models,
     };
     run_pass_with_roles(
         database_path,
@@ -229,6 +244,16 @@ fn run_pass_with_roles(
     let mut budget = config.inference_budget;
     let mut summary = PassSummary::default();
 
+    // Run a waiting conversation lookup before background roles can consume
+    // the pass budget. Explicit user research also works with autonomy off.
+    let user_research_first = store.has_pending_user_research()?;
+    if user_research_first {
+        let result = run_role(&store, pass_id, "scholar", || roles.research())?;
+        budget = budget.saturating_sub(result.processed.max(usize::from(result.error)));
+        summary.researched = result.processed;
+        summary.errors += usize::from(result.error);
+    }
+
     let curator_limit = budget.min(4);
     if curator_limit == 0 || started.elapsed() >= config.max_duration {
         skip_role(&store, pass_id, "curator", "pass budget exhausted")?;
@@ -263,14 +288,16 @@ fn run_pass_with_roles(
         summary.errors += usize::from(result.error);
     }
 
-    if !config.research_enabled {
-        skip_role(&store, pass_id, "scholar", "autonomous research disabled")?;
-    } else if budget == 0 || started.elapsed() >= config.max_duration {
-        skip_role(&store, pass_id, "scholar", "pass budget exhausted")?;
-    } else {
-        let result = run_role(&store, pass_id, "scholar", || roles.research())?;
-        summary.researched = result.processed;
-        summary.errors += usize::from(result.error);
+    if !user_research_first {
+        if !config.research_enabled {
+            skip_role(&store, pass_id, "scholar", "autonomous research disabled")?;
+        } else if budget == 0 || started.elapsed() >= config.max_duration {
+            skip_role(&store, pass_id, "scholar", "pass budget exhausted")?;
+        } else {
+            let result = run_role(&store, pass_id, "scholar", || roles.research())?;
+            summary.researched = result.processed;
+            summary.errors += usize::from(result.error);
+        }
     }
 
     store.finish_maintenance_pass(pass_id)?;
@@ -282,6 +309,67 @@ mod tests {
     use super::*;
     use crate::knowledge::KnowledgeMap;
     use crate::storage::ScholarFinding;
+
+    #[test]
+    fn frontend_lookup_gets_the_first_pass_slot_even_with_autonomy_disabled() {
+        struct UserRoles(std::path::PathBuf);
+        impl Roles for UserRoles {
+            fn curate(&mut self, _: usize) -> io::Result<usize> {
+                panic!("user lookup must consume the first slot")
+            }
+            fn audit(&mut self) -> io::Result<usize> {
+                panic!("user lookup must precede auditing")
+            }
+            fn scout(&mut self) -> io::Result<usize> {
+                panic!("autonomy is disabled")
+            }
+            fn research(&mut self) -> io::Result<usize> {
+                let mut store = LearningStore::open(&self.0)?;
+                assert_eq!(
+                    store.claim_scholar_job()?.unwrap().question,
+                    "What crisp flavours exist?"
+                );
+                Ok(1)
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "lyra-user-priority-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = LearningStore::open(&path).unwrap();
+        store
+            .enqueue_research("frontend", 1, "What crisp flavours exist?")
+            .unwrap();
+        let mut roles = UserRoles(path.clone());
+        let summary = run_pass_with_roles(
+            &path,
+            "serve",
+            &mut roles,
+            PassConfig {
+                max_duration: Duration::from_secs(10),
+                inference_budget: 1,
+                research_enabled: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.researched, 1);
+        assert_eq!(summary.curated + summary.audited + summary.scouted, 0);
+        let pass = store.maintenance_status().unwrap().last_pass.unwrap();
+        assert_eq!(
+            pass.roles
+                .iter()
+                .find(|role| role.role == "scholar")
+                .unwrap()
+                .status,
+            "work"
+        );
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn successful_review_queue_work_has_detail_but_no_error() {

@@ -42,7 +42,7 @@ pub(super) fn self_promote_verified_findings(
                     a.independence_key
                  FROM scholar_findings f
                  JOIN scholar_source_assessments a ON a.finding_id = f.id
-                 WHERE lower(trim(f.subject)) = lower(trim(?1))
+                 WHERE (lower(trim(f.subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(f.subject)) AND e.right_name = lower(trim(?1))))
                    AND lower(trim(f.relation)) = lower(trim(?2))
                    AND lower(trim(f.object)) = lower(trim(?3))
                    AND f.valid_from IS ?4 AND f.valid_until IS ?5
@@ -106,7 +106,7 @@ pub(super) fn self_promote_verified_findings(
         let mut statement = tx
             .prepare(
                 "SELECT id, object, valid_from, valid_until FROM semantic_claims
-                 WHERE retracted_by IS NULL AND lower(trim(subject)) = lower(trim(?1))
+                 WHERE retracted_by IS NULL AND (lower(trim(subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(subject)) AND e.right_name = lower(trim(?1))))
                    AND lower(trim(relation)) = lower(trim(?2))",
             )
             .map_err(database_error)?;
@@ -154,7 +154,7 @@ pub(super) fn self_promote_verified_findings(
     let claim_id: Option<i64> = tx
         .query_row(
             "SELECT id FROM semantic_claims WHERE retracted_by IS NULL
-               AND lower(trim(subject)) = lower(trim(?1))
+               AND (lower(trim(subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(subject)) AND e.right_name = lower(trim(?1))))
                AND lower(trim(relation)) = lower(trim(?2))
                AND lower(trim(object)) = lower(trim(?3))
                AND valid_from IS ?4 AND valid_until IS ?5
@@ -303,7 +303,7 @@ pub(super) fn automatically_review_source_pair(
                 "SELECT f.id, f.source_url, f.evidence_text
                  FROM scholar_findings f
                  JOIN scholar_source_assessments a ON a.finding_id = f.id
-                 WHERE lower(trim(f.subject)) = lower(trim(?1))
+                 WHERE (lower(trim(f.subject)) = lower(trim(?1)) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(f.subject)) AND e.right_name = lower(trim(?1))))
                    AND lower(trim(f.relation)) = lower(trim(?2))
                    AND lower(trim(f.object)) = lower(trim(?3))
                    AND f.valid_from IS ?4 AND f.valid_until IS ?5

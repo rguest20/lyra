@@ -12,10 +12,46 @@ struct Passage {
     section_id: usize,
 }
 
+/// Reject website controls and footer bundles, not ordinary mentions of cookies
+/// or privacy in article prose. Also applied to findings saved before this guard.
+pub(crate) fn is_site_chrome(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let lines = lower
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['*', '-', '#', '>']).trim())
+        .collect::<Vec<_>>();
+    let consent_controls = lines.iter().any(|line| {
+        matches!(
+            *line,
+            "i accept" | "i do not accept" | "accept all cookies" | "reject all cookies"
+        )
+    });
+    let consent_text = [
+        "cookie choices",
+        "consenting to",
+        "use certain cookies",
+        "cookie preferences",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker));
+    let footer_markers = [
+        "privacy policy",
+        "do not sell my info",
+        "terms of use",
+        "all rights reserved",
+        "cookie choices",
+        "popular research",
+    ]
+    .iter()
+    .filter(|marker| lower.contains(**marker))
+    .count();
+    (consent_controls && consent_text) || footer_markers >= 3
+}
+
 pub(super) fn coherent_passages(question: &str, page: &str) -> Vec<String> {
     let query_words = crate::storage::relevant_words(question);
     let mut passages = split_sections(page);
-    passages.retain(|passage| !passage.text.trim().is_empty());
+    passages.retain(|passage| !passage.text.trim().is_empty() && !is_site_chrome(&passage.text));
     let mut ranked = passages
         .into_iter()
         .filter_map(|passage| {
@@ -163,6 +199,21 @@ fn push_chunk(passages: &mut Vec<Passage>, chunk: &str, heading_context: &str, s
 #[cfg(test)]
 mod tests {
     use super::coherent_passages;
+
+    #[test]
+    fn cofresh_footer_is_not_an_article_passage_even_with_query_word_overlap() {
+        let footer = include_str!("../../tests/fixtures/cofresh-footer.txt");
+        assert!(super::is_site_chrome(footer));
+        assert!(coherent_passages("Research crisp flavours", footer).is_empty());
+        assert!(!super::is_site_chrome(
+            "HTTP cookies store small pieces of data. A privacy policy describes their use."
+        ));
+        let article = format!("# Cofresh\nCofresh makes savoury snacks.\n\n## Footer\n{footer}");
+        let selected = coherent_passages("Cofresh snacks research", &article);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].contains("savoury snacks"));
+        assert!(!selected[0].contains("I ACCEPT"));
+    }
 
     #[test]
     fn inherited_article_title_does_not_select_related_navigation() {

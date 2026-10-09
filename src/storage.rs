@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 47;
 
 #[derive(Debug)]
 pub struct ScholarFeedbackTask {
@@ -589,6 +589,8 @@ pub struct StoredAssistantClaim {
 
 mod assistant_audit;
 mod candidate_review;
+mod entities;
+pub(crate) use entities::EntityAliases;
 mod evidence_policy;
 mod maintenance;
 mod model_lineage;
@@ -596,6 +598,9 @@ mod observations;
 mod operations;
 mod queries;
 mod research;
+pub(crate) use research::ScoutAdmission;
+pub(crate) use research::baskets::{ClaimPair, ResearchBaskets, ResearchSource};
+pub(crate) use research::network::{MEDIAWIKI_TRANSIENT_ERROR, wikipedia_interval_ms};
 mod schema;
 
 impl LearningStore {
@@ -745,6 +750,7 @@ fn curate_candidate(
     let today: String = tx
         .query_row("SELECT date('now')", [], |row| row.get(0))
         .map_err(database_error)?;
+    let aliases = entities::EntityAliases::load(tx)?;
     for (id, subject, relation, object, valid_from, valid_until) in existing {
         let overlaps = claim_periods_overlap(
             candidate.valid_from.as_deref(),
@@ -756,7 +762,7 @@ fn curate_candidate(
         if !overlaps {
             continue;
         }
-        if canonical(&subject) == canonical(&candidate.subject)
+        if aliases.same(&subject, &candidate.subject)
             && canonical(&relation) == canonical(&candidate.relation)
             && canonical(&object) == canonical(&candidate.object)
             && valid_from.as_deref() == candidate.valid_from.as_deref()
@@ -766,7 +772,7 @@ fn curate_candidate(
             candidate.decision_reason = Some("equivalent active claim; source attached".into());
             return Ok(Ok(id));
         }
-        if canonical(&subject) == canonical(&candidate.subject)
+        if aliases.same(&subject, &candidate.subject)
             && canonical(&relation) == canonical(&candidate.relation)
             && canonical(&object) != canonical(&candidate.object)
         {
@@ -811,7 +817,7 @@ fn attach_equivalent_sources(
     let mut statement = tx
         .prepare(
             "SELECT id, observation_id FROM candidate_claims
-             WHERE lower(trim(subject)) = lower(?1)
+             WHERE (lower(trim(subject)) = lower(?1) OR EXISTS (SELECT 1 FROM entity_equivalences e WHERE e.left_name = lower(trim(subject)) AND e.right_name = lower(?1)))
                AND lower(trim(relation)) = lower(?2)
                AND lower(trim(object)) = lower(?3)
                AND valid_from IS ?4 AND valid_until IS ?5

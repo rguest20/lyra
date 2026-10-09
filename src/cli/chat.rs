@@ -1,19 +1,16 @@
 use super::Cli;
 use crate::{
-    agent::ReplyServices, curator, inference::LocalModel, knowledge::KnowledgeMap, storage, web,
+    agent::ReplyServices, curator, inference::assignments::AgentRole, knowledge::KnowledgeMap,
+    storage, web,
 };
 use std::{
     env,
     io::{self, Write},
-    sync::{Arc, Mutex},
 };
 
 impl Cli {
     pub(super) fn chat(&mut self, args: Vec<String>) -> Result<(), String> {
         let mut args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
         let state_path = &self.state_path;
@@ -28,14 +25,13 @@ impl Cli {
                 database_path.display()
             )
         })?;
-        let backend = Arc::new(Mutex::new(
-            LocalModel::load(model_dir, adapter_path, cpu)
-                .map_err(|e| format!("could not load local model: {e}"))?,
-        ));
+        let mut backend = self.model_runtime.model(AgentRole::Interaction);
+        let mut research_model = self.model_runtime.model(AgentRole::Curmudgeon);
+        let mut scholar_model = self.model_runtime.model(AgentRole::Scholar);
         let curator = curator::CuratorHandle::spawn(
             database_path.to_string_lossy().into_owned(),
             knowledge_path.to_string_lossy().into_owned(),
-            backend.clone(),
+            self.model_runtime.clone(),
         );
         println!(
             "Community is ready. Type /quit to leave. Conversation: {}",
@@ -61,16 +57,16 @@ impl Cli {
                 continue;
             }
             *map = KnowledgeMap::load(knowledge_path).map_err(|e| e.to_string())?;
-            let mut model_guard = backend
-                .lock()
-                .map_err(|_| "local model lock was poisoned".to_owned())?;
             let reply = agent
                 .reply(
                     input,
-                    &mut model_guard,
+                    &mut backend,
                     map,
                     ReplyServices {
                         store: &store,
+                        database_path,
+                        research_model: &mut research_model,
+                        scholar_model: &mut scholar_model,
                         curator: Some(&curator),
                         state_path,
                     },
@@ -82,7 +78,7 @@ impl Cli {
             }
             println!("Community: {}", reply.text);
             if reply.research_queued {
-                println!("[Scholar queued an encyclopedia lookup]");
+                println!("[Scholar research requested for this question]");
             }
             if let Some(thinking) = reply.thinking {
                 println!("[model thinking]\n{thinking}");
@@ -110,9 +106,6 @@ impl Cli {
 
     pub(super) fn say(&mut self, args: Vec<String>) -> Result<(), String> {
         let args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
         let database_path = &self.database_path;
         let state_path = &self.state_path;
         let agent = &mut self.agent;
@@ -127,8 +120,9 @@ impl Cli {
                 database_path.display()
             )
         })?;
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-            .map_err(|e| format!("could not load local model: {e}"))?;
+        let mut backend = self.model_runtime.model(AgentRole::Interaction);
+        let mut research_model = self.model_runtime.model(AgentRole::Curmudgeon);
+        let mut scholar_model = self.model_runtime.model(AgentRole::Scholar);
         let reply = agent
             .reply(
                 &input,
@@ -136,6 +130,9 @@ impl Cli {
                 map,
                 ReplyServices {
                     store: &store,
+                    database_path,
+                    research_model: &mut research_model,
+                    scholar_model: &mut scholar_model,
                     curator: None,
                     state_path,
                 },

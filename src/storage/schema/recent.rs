@@ -624,6 +624,129 @@ impl LearningStore {
             .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 43 {
+            self.connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS scholar_lookup_plans (
+                   job_id TEXT PRIMARY KEY REFERENCES scholar_jobs(id),
+                   queries_json TEXT NOT NULL
+                 ); PRAGMA user_version = 43;",
+                )
+                .map_err(database_error)?;
+        }
+        if version < 44 {
+            self.connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS entity_alias_links (
+                    left_name TEXT NOT NULL, right_name TEXT NOT NULL,
+                    source_url TEXT NOT NULL, evidence_text TEXT NOT NULL,
+                    source_finding_id INTEGER REFERENCES scholar_findings(id),
+                    assessment_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY (left_name, right_name, source_url)
+                );
+                CREATE VIEW IF NOT EXISTS active_entity_aliases AS
+                    SELECT left_name, right_name FROM entity_alias_links l
+                    WHERE l.source_finding_id IS NULL OR EXISTS (
+                        SELECT 1 FROM scholar_findings f WHERE f.id = l.source_finding_id
+                        AND (f.status = 'needs_review' OR (f.status = 'promoted' AND EXISTS (
+                            SELECT 1 FROM semantic_claims c WHERE c.id = f.semantic_claim_id
+                            AND c.retracted_by IS NULL AND c.status IN ('active','uncertain')))));
+                CREATE VIEW IF NOT EXISTS entity_alias_candidates AS
+                    SELECT left_name,right_name FROM active_entity_aliases
+                    UNION SELECT right_name,left_name FROM active_entity_aliases;
+                CREATE VIEW IF NOT EXISTS entity_equivalences AS
+                    SELECT a.left_name,a.right_name FROM entity_alias_candidates a
+                    WHERE (SELECT COUNT(DISTINCT b.right_name) FROM entity_alias_candidates b
+                           WHERE b.left_name=a.left_name) = 1
+                      AND (SELECT COUNT(DISTINCT b.right_name) FROM entity_alias_candidates b
+                           WHERE b.left_name=a.right_name) = 1;
+                PRAGMA user_version = 44;",
+                )
+                .map_err(database_error)?;
+        }
+        if version < 45 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('scholar_jobs') WHERE name='next_attempt_at_ms')",[],|row|row.get::<_,bool>(0)).map_err(database_error)? {
+                tx.execute_batch("ALTER TABLE scholar_jobs ADD COLUMN next_attempt_at_ms INTEGER NOT NULL DEFAULT 0;").map_err(database_error)?;
+            }
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS scholar_jobs_by_retry ON scholar_jobs(status,next_attempt_at_ms);
+                 PRAGMA user_version = 45;"
+            ).map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 46 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('scholar_host_backoff') WHERE name='failures')",[],|row|row.get::<_,bool>(0)).map_err(database_error)? {
+                tx.execute_batch("ALTER TABLE scholar_host_backoff ADD COLUMN failures INTEGER NOT NULL DEFAULT 1;").map_err(database_error)?;
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS wikipedia_response_cache (
+                    request_key TEXT PRIMARY KEY, request_kind TEXT NOT NULL,
+                    response_json TEXT NOT NULL, expires_at_ms INTEGER NOT NULL
+                 );
+                      CREATE TABLE IF NOT EXISTS research_page_cache (
+                          url TEXT PRIMARY KEY,content_type TEXT NOT NULL,body TEXT NOT NULL,
+                          expires_at_ms INTEGER NOT NULL
+                      );
+                 PRAGMA user_version = 46;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 47 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS research_sources (
+                          id INTEGER PRIMARY KEY,job_id TEXT NOT NULL REFERENCES scholar_jobs(id),
+                          title TEXT NOT NULL,url TEXT NOT NULL,content_hash TEXT NOT NULL,body TEXT NOT NULL,
+                          harvest_cursor INTEGER NOT NULL DEFAULT 0,claimed_until_ms INTEGER NOT NULL DEFAULT 0,
+                          next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,last_error TEXT,created_at TEXT NOT NULL,
+                          UNIQUE(url,content_hash)
+                      );
+                     CREATE TABLE IF NOT EXISTS research_claims (
+                          id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES research_sources(id),
+                          subject TEXT NOT NULL,relation TEXT NOT NULL,object TEXT NOT NULL,
+                          subject_key TEXT NOT NULL,relation_key TEXT NOT NULL,
+                          evidence_text TEXT NOT NULL,qualifications TEXT NOT NULL,
+                          extraction_confidence REAL NOT NULL CHECK(extraction_confidence BETWEEN 0 AND 1),
+                          created_at TEXT NOT NULL,UNIQUE(source_id,subject,relation,object,evidence_text)
+                      );
+                     CREATE INDEX IF NOT EXISTS research_claims_by_subject ON research_claims(subject_key,relation_key);
+                     CREATE TABLE IF NOT EXISTS research_questions (
+                          id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL REFERENCES research_sources(id),
+                          question TEXT NOT NULL,question_key TEXT NOT NULL UNIQUE,evidence_text TEXT NOT NULL,
+                          depth INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN ('pending','queued','researched','unanswered')),
+                          scholar_job_id TEXT REFERENCES scholar_jobs(id),created_at TEXT NOT NULL
+                      );
+                     CREATE TABLE IF NOT EXISTS research_question_sources (
+                          question_id INTEGER NOT NULL REFERENCES research_questions(id),
+                          source_id INTEGER NOT NULL REFERENCES research_sources(id),evidence_text TEXT NOT NULL,
+                          PRIMARY KEY(question_id,source_id)
+                      );
+                     CREATE TABLE IF NOT EXISTS research_evidence_links (
+                          left_claim_id INTEGER NOT NULL REFERENCES research_claims(id),
+                          right_claim_id INTEGER NOT NULL REFERENCES research_claims(id),
+                          relation TEXT NOT NULL CHECK(relation IN ('supports','contradicts','qualifies','unrelated','insufficient')),
+                          rationale TEXT NOT NULL,reviewer_model_id TEXT NOT NULL,
+                          next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
+                          PRIMARY KEY(left_claim_id,right_claim_id),CHECK(left_claim_id < right_claim_id)
+                      );
+                      PRAGMA user_version = 47;"
+                ).map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }
