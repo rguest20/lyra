@@ -5,25 +5,6 @@ use sha2::{Digest, Sha256};
 use std::fs;
 
 impl Cli {
-    pub(super) fn train(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
-        let model_dir = &self.model_dir;
-        let adapter_path = &self.adapter_path;
-        let cpu = self.cpu;
-        let values: Vec<_> = args.collect();
-        if values.len() != 2 {
-            return Err("train needs PROMPT ANSWER".into());
-        }
-        let mut backend = LocalModel::load(model_dir, adapter_path, cpu)
-            .map_err(|e| format!("could not load local model: {e}"))?;
-        let (tokens, loss) = backend
-            .train(&values[0], &values[1])
-            .map_err(|e| format!("training failed: {e}"))?;
-        println!("Updated adapter: {tokens} target tokens, mean loss {loss:.3}");
-        println!("Saved: {}", adapter_path.display());
-        Ok(())
-    }
-
     pub(super) fn model(&mut self, args: Vec<String>) -> Result<(), String> {
         let args = args.into_iter();
         let model_dir = &self.model_dir;
@@ -58,6 +39,15 @@ impl Cli {
                         println!("  lineage manifest: unavailable (legacy consolidation)");
                     }
                 }
+            }
+            [action, title, passage] if action == "probe-baskets" => {
+                let mut backend = self.model_runtime.model(AgentRole::Scholar);
+                let baskets = crate::scholar::probe_baskets(title, passage, &mut backend)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "{}",
+                    serde_json::to_string(&baskets).map_err(|error| error.to_string())?
+                );
             }
             [action, question, title, passage] if action == "probe-scholar" => {
                 let mut backend = self.model_runtime.model(AgentRole::Scholar);
@@ -135,8 +125,17 @@ impl Cli {
                 println!("Approved active SQLite claim db#{id} for model training");
             }
             [action, id] if action == "consolidate" => {
+                require_training_readiness(
+                    std::env::var("COMMUNITY_MODEL_TRAINING_READINESS")
+                        .ok()
+                        .as_deref(),
+                )?;
                 let id: i64 = id.parse().map_err(|_| "claim ID must be an integer")?;
                 let claim = store.approved_model_claim(id).map_err(|e| e.to_string())?;
+                let (approval_reason, approved_at) = store
+                    .model_claim_approval_record(id)
+                    .map_err(|e| e.to_string())?;
+                let evidence = store.claim_evidence(id).map_err(|e| e.to_string())?;
                 let source =
                     crate::inference::checkpoint_path(model_dir).map_err(|e| e.to_string())?;
                 let source_text = source.to_string_lossy().into_owned();
@@ -222,6 +221,9 @@ impl Cli {
                         source: claim.source.clone(),
                         valid_from: claim.valid_from.clone(),
                         valid_until: claim.valid_until.clone(),
+                        approval_reason,
+                        approved_at,
+                        evidence,
                     });
                 let training_adapter = output_dir.join("training-adapter.safetensors");
                 if adapter_path.exists() {
@@ -323,6 +325,11 @@ impl Cli {
                 );
             }
             [action, run_id] if action == "rebuild" => {
+                require_training_readiness(
+                    std::env::var("COMMUNITY_MODEL_TRAINING_READINESS")
+                        .ok()
+                        .as_deref(),
+                )?;
                 let run_id: i64 = run_id.parse().map_err(|_| "run ID must be an integer")?;
                 rebuild_model_checkpoint(&mut store, run_id, model_dir, cpu)?;
             }
@@ -333,6 +340,20 @@ impl Cli {
             }
         }
         Ok(())
+    }
+}
+
+const TRAINING_READINESS_TOKEN: &str = "learning-quality-v1-passed";
+
+fn training_readiness_is_enabled(value: Option<&str>) -> bool {
+    value == Some(TRAINING_READINESS_TOKEN)
+}
+
+fn require_training_readiness(value: Option<&str>) -> Result<(), String> {
+    if training_readiness_is_enabled(value) {
+        Ok(())
+    } else {
+        Err("model consolidation and rebuild are paused until the blind-adjudicated learning-quality v1 benchmark passes; set COMMUNITY_MODEL_TRAINING_READINESS=learning-quality-v1-passed only after reviewing that result".into())
     }
 }
 
@@ -409,7 +430,7 @@ fn rebuild_model_checkpoint(
     let mut included = Vec::new();
     for revision in &manifest.included_claims {
         if store
-            .claim_is_active_and_approved(revision.id)
+            .model_revision_matches(revision)
             .map_err(|e| e.to_string())?
         {
             included.push(revision.clone());
@@ -555,6 +576,15 @@ fn rebuild_model_checkpoint(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn model_weight_changes_require_explicit_quality_gate_readiness() {
+        assert!(!super::training_readiness_is_enabled(None));
+        assert!(!super::training_readiness_is_enabled(Some("true")));
+        assert!(super::training_readiness_is_enabled(Some(
+            "learning-quality-v1-passed"
+        )));
+    }
+
     #[test]
     fn checkpoint_hash_detects_shard_changes_without_index_changes() {
         let dir = std::env::temp_dir().join(format!(

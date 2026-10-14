@@ -76,7 +76,8 @@ pub fn run() -> Result<(), String> {
     let interaction_model = model_runtime
         .model_id(AgentRole::Interaction)
         .map_err(|error| error.to_string())?;
-    let agent = Agent::load(&state_path, &interaction_model).map_err(|e| e.to_string())?;
+    let agent =
+        Agent::load_for_model_change(&state_path, &interaction_model).map_err(|e| e.to_string())?;
     let map = KnowledgeMap::load(&knowledge_path).map_err(|e| e.to_string())?;
     let mut cli = Cli {
         model,
@@ -106,7 +107,7 @@ impl Cli {
             "curmudgeon" => self.curmudgeon(args),
             "say" => self.say(args),
             "learn" => self.learn(args),
-            "train" => self.train(args),
+            "train" => Err("unrestricted prompt/answer training is disabled; approve a provenance-complete stable claim with `model approve`, then use `model consolidate`".into()),
             "model" => self.model(args),
             "revise" => self.revise(args),
             "retract" => self.retract(args),
@@ -127,8 +128,8 @@ impl Cli {
 
 fn usage() {
     println!(
-        "Usage: cargo run -- [chat | serve | say MESSAGE | train PROMPT ANSWER | model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | model probe-scholar QUESTION TITLE PASSAGE | model probe-review CONTEXT_JSON | model probe-support CONTEXT_JSON | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | maintenance [runs [LIMIT] | history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-] | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | queue | show JOB_ID | sites [LIMIT] | blocked [LIMIT] | review FINDING_ID accept|reject REASON] | scholar-once | curmudgeon [audit REPLY_TEXT] | curmudgeon-once | scout | scout-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
-        Environment: COMMUNITY_MLX_PYTHON, COMMUNITY_MODEL_ID, COMMUNITY_CONTEXT_TOKENS, COMMUNITY_MODEL_LOCK, COMMUNITY_CHAT_MODEL_LOCK, COMMUNITY_MODEL_CACHE_SIZE, COMMUNITY_<AGENT>_MODEL_DIR, COMMUNITY_<AGENT>_MODEL_ID, COMMUNITY_<AGENT>_ADAPTER (SCOUT, SCHOLAR, CURMUDGEON, ARCHIVIST, INTERACTION), COMMUNITY_MODEL_DIR, COMMUNITY_ADAPTER, COMMUNITY_DEVICE, COMMUNITY_STATE, COMMUNITY_KNOWLEDGE, COMMUNITY_DB, COMMUNITY_MAINTENANCE_INTERVAL_SECS, COMMUNITY_MAINTENANCE_MAX_MS, COMMUNITY_MAINTENANCE_INFERENCE_BUDGET, COMMUNITY_AUTONOMOUS_RESEARCH, COMMUNITY_MAX_RESEARCH_PER_DAY, COMMUNITY_SCOUT_MODEL_PROBES_PER_DAY, COMMUNITY_SCOUT_MIN_INTERVAL_SECONDS"
+        "Usage: cargo run -- [chat | serve | say MESSAGE | model approve CLAIM_ID REASON | model consolidate CLAIM_ID | model history | model rebuild RUN_ID | model probe PROMPT | model probe-chat PROMPT | model probe-scholar QUESTION TITLE PASSAGE | model probe-baskets TITLE PASSAGE | model probe-review CONTEXT_JSON | model probe-support CONTEXT_JSON | learn SUBJECT RELATION OBJECT SOURCE | revise ID SUBJECT RELATION OBJECT SOURCE | retract ID SOURCE | knowledge | maintenance [runs [LIMIT] | history [LIMIT] | resolve CLAIM_ID confirm|challenge|qualify|retract REASON | supersede OLD_CLAIM_ID NEW_CLAIM_ID REASON | review CLAIM_ID active|uncertain|challenged [CHECKED_AT] [NEXT_REVIEW_AT] | schedule CLAIM_ID stable|slow_changing|fast_changing [NEXT_REVIEW_AT] | scope CLAIM_ID VALID_FROM|- VALID_UNTIL|-] | inbox [show OBSERVATION_ID] | scholar [ask QUESTION | queue | show JOB_ID | sites [LIMIT] | blocked [LIMIT] | review FINDING_ID accept|reject REASON] | scholar-once | curmudgeon [audit REPLY_TEXT] | curmudgeon-once | scout | scout-once | review CANDIDATE_ID accept|reject REASON | migrate-knowledge | status]\n\
+        Environment: COMMUNITY_MLX_PYTHON, COMMUNITY_MODEL_ID, COMMUNITY_CONTEXT_TOKENS, COMMUNITY_MODEL_LOCK, COMMUNITY_CHAT_MODEL_LOCK, COMMUNITY_MODEL_CACHE_SIZE, COMMUNITY_<AGENT>_MODEL_DIR, COMMUNITY_<AGENT>_MODEL_ID, COMMUNITY_<AGENT>_ADAPTER (SCOUT, SCHOLAR, CURMUDGEON, ARCHIVIST, INTERACTION), COMMUNITY_MODEL_DIR, COMMUNITY_ADAPTER, COMMUNITY_DEVICE, COMMUNITY_STATE, COMMUNITY_KNOWLEDGE, COMMUNITY_DB, COMMUNITY_MAINTENANCE_INTERVAL_SECS, COMMUNITY_MAINTENANCE_MAX_MS, COMMUNITY_MAINTENANCE_INFERENCE_BUDGET, COMMUNITY_AUTONOMOUS_RESEARCH, COMMUNITY_MAX_RESEARCH_PER_DAY, COMMUNITY_SCOUT_MODEL_PROBES_PER_DAY, COMMUNITY_SCOUT_MIN_INTERVAL_SECONDS, COMMUNITY_MODEL_TRAINING_READINESS (requires learning-quality-v1-passed)"
     );
     println!(
         "Research: scholar usage | scholar baskets [claims | questions | sources | claim ID | source ID | retry SOURCE_ID | import]"

@@ -136,9 +136,25 @@ impl LearningStore {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.id, f.source_url, f.subject, f.relation, f.object,
-                    f.evidence_text, f.confidence, a.gate_status, a.reason,
-                    a.research_relevance
+                "SELECT f.id, f.source_archive_id, f.evidence_byte_start, f.evidence_byte_end,
+                    f.source_url, f.subject, f.relation, f.object,
+                    f.attribution, f.polarity, f.modality, f.geographic_scope, f.context_scope,
+                    f.evidence_text, f.confidence, f.status, a.gate_status, a.reason,
+                    a.research_relevance, a.topic_class, a.source_kind, f.freshness,
+                    a.currency, a.direct_support, a.independence_key,
+                    a.independence_verified, a.published_at,
+                    COALESCE((SELECT json_group_array(subject || ' ' || relation || ' ' || object ||
+                        ' [valid ' || COALESCE(valid_from, 'unknown start') || ' to ' ||
+                        COALESCE(valid_until, 'unknown end') || '; geography ' || COALESCE(geographic_scope, 'unknown') ||
+                        '; context ' || COALESCE(context_scope, 'unknown') || ']')
+                      FROM semantic_claims c
+                      WHERE c.retracted_by IS NULL AND c.status IN ('active','uncertain','challenged')
+                        AND lower(trim(c.subject)) = lower(trim(f.subject))
+                        AND lower(trim(c.relation)) = lower(trim(f.relation))
+                        AND lower(trim(c.object)) != lower(trim(f.object))
+                        AND EXISTS (SELECT 1 FROM scholar_finding_claim_links l
+                                    WHERE l.finding_id = f.id AND l.claim_id = c.id
+                                      AND l.relation = 'contradicts')), '[]')
                  FROM scholar_findings f
                  JOIN scholar_source_assessments a ON a.finding_id = f.id
                  WHERE (f.status = 'needs_review' OR (?1 AND f.status = 'promoted' AND EXISTS(
@@ -154,15 +170,34 @@ impl LearningStore {
             .query_map([include_promoted], |row| {
                 Ok(ScholarEvidenceForAnswer {
                     id: row.get(0)?,
-                    source_url: row.get(1)?,
-                    subject: row.get(2)?,
-                    relation: row.get(3)?,
-                    object: row.get(4)?,
-                    evidence_text: row.get(5)?,
-                    confidence: row.get(6)?,
-                    gate_status: row.get(7)?,
-                    reason: row.get(8)?,
-                    research_relevance: row.get(9)?,
+                    source_archive_id: row.get(1)?,
+                    evidence_byte_start: row.get(2)?,
+                    evidence_byte_end: row.get(3)?,
+                    source_url: row.get(4)?,
+                    subject: row.get(5)?,
+                    relation: row.get(6)?,
+                    object: row.get(7)?,
+                    attribution: row.get(8)?,
+                    polarity: row.get(9)?,
+                    modality: row.get(10)?,
+                    geographic_scope: row.get(11)?,
+                    context_scope: row.get(12)?,
+                    evidence_text: row.get(13)?,
+                    confidence: row.get(14)?,
+                    finding_status: row.get(15)?,
+                    gate_status: row.get(16)?,
+                    reason: row.get(17)?,
+                    research_relevance: row.get(18)?,
+                    topic_class: row.get(19)?,
+                    source_kind: row.get(20)?,
+                    freshness: row.get(21)?,
+                    currency: row.get(22)?,
+                    direct_support: row.get::<_, Option<bool>>(23)?.unwrap_or(false),
+                    independence_key: row.get(24)?,
+                    independence_verified: row.get(25)?,
+                    published_at: row.get(26)?,
+                    conflicting_claims: serde_json::from_str(&row.get::<_, String>(27)?)
+                        .unwrap_or_default(),
                 })
             })
             .map_err(database_error)?;

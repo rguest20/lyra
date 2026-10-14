@@ -131,12 +131,88 @@ pub(super) fn structured_list_finding(question: &str, passage: &str) -> Option<S
             valid_until: None,
             source_quality: "unknown".into(),
             source_updated_at: None,
+            proposition: Default::default(),
         };
         if finding.object.chars().count() <= 500
             && finding.evidence_text.chars().count() <= 2_200
             && crate::storage::evidence_supports_claim(&finding)
         {
             return Some(finding);
+        }
+    }
+    inline_list_finding(question, passage)
+}
+
+fn inline_list_finding(question: &str, passage: &str) -> Option<ScholarFinding> {
+    let question_lower = question.to_lowercase();
+    if !["which", "list", "name", "what"].iter().any(|cue| {
+        question_lower
+            .split(|ch: char| !ch.is_alphanumeric())
+            .any(|word| word == *cue)
+    }) {
+        return None;
+    }
+    let query_words = crate::storage::relevant_words(question);
+    let named_constraints = crate::entities::literal_name_constraints(question);
+    let predicates = [
+        (" include ", "include"),
+        (" includes ", "includes"),
+        (" contain ", "contain"),
+        (" contains ", "contains"),
+        (" comprise ", "comprise"),
+        (" comprises ", "comprises"),
+        (" consist of ", "consist of"),
+    ];
+    for sentence in passage
+        .split_inclusive(|ch| matches!(ch, '.' | '?' | '!' | '\n'))
+        .map(str::trim)
+        .filter(|sentence| !sentence.is_empty())
+    {
+        let lower = sentence.to_ascii_lowercase();
+        for (marker, relation) in predicates {
+            let Some(index) = lower.find(marker) else {
+                continue;
+            };
+            let subject = sentence[..index].trim();
+            let object = sentence[index + marker.len()..]
+                .trim()
+                .trim_end_matches(['.', '?', '!'])
+                .trim();
+            let subject_words = crate::storage::relevant_words(subject);
+            let has_list = object.contains(',')
+                || object.to_lowercase().contains(" and ")
+                || object.contains(';');
+            let names_match = named_constraints.is_empty()
+                || named_constraints
+                    .iter()
+                    .all(|name| subject.to_lowercase().contains(&name.to_lowercase()));
+            let subject_matches_request = !subject_words.is_empty()
+                && crate::storage::lexical_overlap(&query_words, &subject_words) * 100
+                    / subject_words.len()
+                    >= 50;
+            if !has_list
+                || !names_match
+                || !subject_matches_request
+                || !(1..=500).contains(&object.chars().count())
+            {
+                continue;
+            }
+            let finding = ScholarFinding {
+                semantic_support: None,
+                subject: subject.to_owned(),
+                relation: relation.to_owned(),
+                object: object.to_owned(),
+                evidence_text: sentence.to_owned(),
+                confidence: 0.98,
+                valid_from: None,
+                valid_until: None,
+                source_quality: "unknown".into(),
+                source_updated_at: None,
+                proposition: Default::default(),
+            };
+            if crate::storage::evidence_supports_claim(&finding) {
+                return Some(finding);
+            }
         }
     }
     None
@@ -234,6 +310,7 @@ pub(super) fn explicit_list_finding(
             valid_until: None,
             source_quality: "reference".into(),
             source_updated_at,
+            proposition: Default::default(),
         });
     }
     None

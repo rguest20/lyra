@@ -434,6 +434,7 @@ mod tests {
                     valid_until: None,
                     source_quality: "reference".into(),
                     source_updated_at: None,
+                    proposition: Default::default(),
                 }),
                 None,
             )?;

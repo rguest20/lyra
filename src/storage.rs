@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 47;
+const SCHEMA_VERSION: i64 = 62;
 
 #[derive(Debug)]
 pub struct ScholarFeedbackTask {
@@ -28,6 +28,18 @@ pub struct ScholarFeedbackTask {
     pub rejected_claim: String,
     pub suggested_evidence: Option<String>,
     pub exclusion_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScholarTaskTarget {
+    pub job_id: String,
+    pub original_question: String,
+    pub entity_constraints: Vec<String>,
+    pub scope_constraints: Vec<String>,
+    pub evidence_gap: String,
+    pub acceptable_evidence: Vec<String>,
+    pub sources_tried: Vec<ScholarSearchAttempt>,
+    pub stop_reason: Option<String>,
 }
 const PROMOTION_CONFIDENCE: f64 = 0.95;
 const DEFAULT_AUTO_PROMOTION_CONFIDENCE: f64 = 0.90;
@@ -172,7 +184,7 @@ pub struct SemanticClaimDetail {
     pub sources: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClaimEvidence {
     pub id: i64,
     pub source_kind: String,
@@ -236,7 +248,7 @@ pub struct ScoutModelProbe {
     pub scholar_job_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScholarSearchAttempt {
     pub provider: String,
     pub trigger_reason: String,
@@ -358,6 +370,7 @@ pub struct MaintenanceStatus {
     pub last_pass: Option<MaintenancePass>,
     pub curator: MaintenanceQueue,
     pub scout: MaintenanceQueue,
+    pub scout_bucket_questions_pending: usize,
     pub scholar: MaintenanceQueue,
     pub scan_cursor: i64,
     pub scout_priority_order: Vec<&'static str>,
@@ -425,6 +438,12 @@ pub struct ConsolidatedClaimRevision {
     pub source: String,
     pub valid_from: Option<String>,
     pub valid_until: Option<String>,
+    #[serde(default)]
+    pub approval_reason: String,
+    #[serde(default)]
+    pub approved_at: String,
+    #[serde(default)]
+    pub evidence: Vec<ClaimEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -454,6 +473,58 @@ pub struct ScholarFinding {
     pub valid_until: Option<String>,
     pub source_quality: String,
     pub source_updated_at: Option<String>,
+    pub proposition: PropositionMetadata,
+}
+
+/// Explicit linguistic scope extracted from the passage. Unknown values stay
+/// unknown; these fields do not assert that the proposition is true.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PropositionMetadata {
+    pub attribution: Option<String>,
+    pub geographic_scope: Option<String>,
+    pub context_scope: Option<String>,
+    pub polarity: ClaimPolarity,
+    pub modality: ClaimModality,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClaimPolarity {
+    Asserted,
+    Negated,
+    #[default]
+    Unknown,
+}
+
+impl ClaimPolarity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Asserted => "asserted",
+            Self::Negated => "negated",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClaimModality {
+    Factual,
+    Possible,
+    Necessary,
+    Conditional,
+    #[default]
+    Unknown,
+}
+
+impl ClaimModality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Factual => "factual",
+            Self::Possible => "possible",
+            Self::Necessary => "necessary",
+            Self::Conditional => "conditional",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// Source facts established by an adapter or reviewer, never inferred from a
@@ -478,6 +549,9 @@ pub struct ScholarEvidence {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredScholarFinding {
     pub id: i64,
+    pub source_archive_id: Option<i64>,
+    pub evidence_byte_start: Option<i64>,
+    pub evidence_byte_end: Option<i64>,
     pub source_url: String,
     pub subject: String,
     pub relation: String,
@@ -491,20 +565,43 @@ pub struct StoredScholarFinding {
     pub source_quality: String,
     pub freshness: String,
     pub source_updated_at: Option<String>,
+    pub attribution: Option<String>,
+    pub polarity: String,
+    pub modality: String,
+    pub geographic_scope: Option<String>,
+    pub context_scope: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScholarEvidenceForAnswer {
     pub id: i64,
+    pub source_archive_id: Option<i64>,
+    pub evidence_byte_start: Option<i64>,
+    pub evidence_byte_end: Option<i64>,
     pub source_url: String,
     pub subject: String,
     pub relation: String,
     pub object: String,
+    pub attribution: Option<String>,
+    pub polarity: String,
+    pub modality: String,
+    pub geographic_scope: Option<String>,
+    pub context_scope: Option<String>,
     pub evidence_text: String,
     pub confidence: f64,
+    pub finding_status: String,
     pub gate_status: String,
     pub reason: String,
     pub research_relevance: String,
+    pub topic_class: String,
+    pub source_kind: String,
+    pub freshness: String,
+    pub currency: String,
+    pub direct_support: bool,
+    pub independence_key: Option<String>,
+    pub independence_verified: bool,
+    pub published_at: Option<String>,
+    pub conflicting_claims: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -699,16 +796,33 @@ fn record_policy_decision(
     resulting_claim_id: Option<i64>,
     resulting_state: Option<&str>,
 ) -> io::Result<()> {
+    let decision_method = if outcome.starts_with("ai_") {
+        "ai"
+    } else if outcome.starts_with("human_") {
+        "human"
+    } else {
+        "deterministic_policy"
+    };
+    let model_id = (decision_method == "ai")
+        .then(|| std::env::var("COMMUNITY_MODEL_ID").ok())
+        .flatten();
+    let model_version = (decision_method == "ai")
+        .then(|| std::env::var("COMMUNITY_MODEL_VERSION").ok())
+        .flatten();
     tx.execute(
         "INSERT INTO policy_decisions
-         (proposal_id, outcome, reason, resulting_claim_id, resulting_state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+         (proposal_id, outcome, reason, resulting_claim_id, resulting_state, created_at,
+          decision_method, model_id, model_version)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6, ?7, ?8)",
         params![
             proposal_id,
             outcome,
             reason,
             resulting_claim_id,
-            resulting_state
+            resulting_state,
+            decision_method,
+            model_id,
+            model_version
         ],
     )
     .map_err(database_error)?;
@@ -910,7 +1024,14 @@ fn is_time_sensitive(question: &str, relation: &str, object: &str) -> bool {
         "specification",
     ]
     .iter()
-    .any(|term| text.contains(term))
+    .any(|term| {
+        if matches!(*term, "now" | "current" | "today" | "latest") {
+            text.split(|ch: char| !ch.is_alphanumeric())
+                .any(|word| word == *term)
+        } else {
+            text.contains(term)
+        }
+    })
 }
 
 fn is_consequential(question: &str, subject: &str, relation: &str) -> bool {
@@ -1159,5 +1280,9 @@ pub(crate) fn lexical_overlap(
         .count()
 }
 
+#[cfg(test)]
+mod grounding_tests;
+#[cfg(test)]
+mod policy_tests;
 #[cfg(test)]
 mod tests;

@@ -622,6 +622,7 @@ mod tests {
             valid_until: None,
             source_quality: "reference".into(),
             source_updated_at: None,
+            proposition: Default::default(),
         };
         let url = "https://en.wikipedia.org/wiki/Photosynthesis";
         let stable = assess_scholar_finding(
@@ -721,6 +722,7 @@ mod tests {
             valid_until: None,
             source_quality: "unknown".into(),
             source_updated_at: None,
+            proposition: Default::default(),
         };
         let assessment = assess_scholar_finding(
             "What are common ingredients in chicken soup?",

@@ -1,4 +1,6 @@
+//! Host reservations, provider budgets, cache and network accounting.
 use super::*;
+use sha2::{Digest, Sha256};
 pub(crate) const MEDIAWIKI_TRANSIENT_ERROR: &str = "MediaWiki API returned a retryable error";
 
 fn configured_limit(name: &str, default: i64, maximum: i64) -> i64 {
@@ -408,5 +410,638 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+pub(crate) fn robots_block_key(path_query: &str) -> String {
+    format!("{:x}", Sha256::digest(path_query.as_bytes()))
+}
+
+impl LearningStore {
+    pub fn last_scholar_provider_search_ms(&self, provider: &str) -> io::Result<Option<i64>> {
+        let table = match provider {
+            "serpapi" => "serpapi_usage",
+            "tavily" => "tavily_usage",
+            _ => return Err(invalid("unsupported Scholar search provider")),
+        };
+        self.connection
+            .query_row(
+                &format!("SELECT scheduled_at_ms FROM {table} ORDER BY id DESC LIMIT 1"),
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    pub fn robots_blocked(&self, host: &str, path_query: &str) -> io::Result<bool> {
+        let key = robots_block_key(path_query);
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM scholar_robots_blocks
+                 WHERE host = ?1 AND url_key IN (?2, '*')
+                   AND expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                params![host, key],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn remember_robots_block(
+        &self,
+        host: &str,
+        path_query: &str,
+        display_path: &str,
+        reason: &str,
+        host_wide: bool,
+    ) -> io::Result<()> {
+        let key = if host_wide {
+            "*".to_owned()
+        } else {
+            robots_block_key(path_query)
+        };
+        self.connection
+            .execute(
+                "INSERT INTO scholar_robots_blocks
+                    (host, url_key, display_path, reason, checked_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 days'))
+                 ON CONFLICT(host, url_key) DO UPDATE SET
+                    display_path = excluded.display_path,
+                    reason = excluded.reason,
+                    checked_at = excluded.checked_at,
+                    expires_at = excluded.expires_at",
+                params![
+                    host,
+                    key,
+                    if host_wide { "/*" } else { display_path },
+                    reason,
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn scholar_robots_blocks(&self, limit: usize) -> io::Result<Vec<ScholarRobotsBlock>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT host, display_path, reason, expires_at
+                 FROM scholar_robots_blocks
+                 WHERE expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 ORDER BY checked_at DESC LIMIT ?1",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([i64::try_from(limit.min(100)).unwrap_or(100)], |row| {
+                Ok(ScholarRobotsBlock {
+                    host: row.get(0)?,
+                    display_path: row.get(1)?,
+                    reason: row.get(2)?,
+                    expires_at: row.get(3)?,
+                })
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    /// Reserves the single SerpAPI slot only after its persisted cooldown has
+    /// elapsed. Reservations are written before issuing network requests.
+    pub fn reserve_serpapi_search(
+        &mut self,
+        minimum_interval_ms: i64,
+        job_id: &str,
+        query: &str,
+    ) -> io::Result<SerpApiReservation> {
+        if minimum_interval_ms < 1 || query.trim().is_empty() {
+            return Err(invalid("SerpAPI interval must be positive"));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let now = i64::try_from(now_ms).map_err(|_| invalid("search timestamp too large"))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let previous: Option<i64> = tx
+            .query_row(
+                "SELECT scheduled_at_ms FROM serpapi_usage ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if previous.is_some_and(|last| now < last.saturating_add(minimum_interval_ms)) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "SerpAPI search is cooling down",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO serpapi_usage (scheduled_at_ms, outcome, job_id, query)
+             VALUES (?1, 'reserved', ?2, ?3)",
+            params![now, job_id, query.chars().take(1_000).collect::<String>()],
+        )
+        .map_err(database_error)?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(database_error)?;
+        Ok(SerpApiReservation {
+            id,
+            scheduled_at_ms: now,
+        })
+    }
+
+    pub fn record_serpapi_search_domains(
+        &self,
+        search_id: i64,
+        domains: &[(String, usize)],
+    ) -> io::Result<()> {
+        let tx = self
+            .connection
+            .unchecked_transaction()
+            .map_err(database_error)?;
+        for (domain, result_count) in domains {
+            let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+            let domain = domain.strip_prefix("www.").unwrap_or(&domain);
+            if domain.is_empty() || *result_count == 0 {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO serpapi_search_domains (search_id, domain, result_count)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(search_id, domain) DO UPDATE SET
+                    result_count = excluded.result_count",
+                params![
+                    search_id,
+                    domain,
+                    i64::try_from(*result_count).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)
+    }
+
+    pub fn serpapi_domain_history(
+        &self,
+        limit: usize,
+    ) -> io::Result<Vec<SerpApiDomainObservation>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT u.scheduled_at_ms, u.query, d.domain, d.result_count
+             FROM serpapi_search_domains d
+             JOIN serpapi_usage u ON u.id = d.search_id
+             ORDER BY u.scheduled_at_ms DESC, d.domain
+             LIMIT ?1",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([i64::try_from(limit.min(1_000)).unwrap_or(1_000)], |row| {
+                Ok(SerpApiDomainObservation {
+                    searched_at_ms: row.get(0)?,
+                    query: row.get(1)?,
+                    domain: row.get(2)?,
+                    result_count: usize::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                })
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn complete_serpapi_search(
+        &self,
+        request_id: i64,
+        response_status: Option<u16>,
+        error: Option<&str>,
+    ) -> io::Result<()> {
+        let completed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let completed_at_ms = i64::try_from(completed_at_ms)
+            .map_err(|_| invalid("search completion timestamp too large"))?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE serpapi_usage SET completed_at_ms = ?2, response_status = ?3,
+                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'",
+                params![
+                    request_id,
+                    completed_at_ms,
+                    response_status,
+                    if error.is_some() {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    },
+                    error.map(|value| value.chars().take(500).collect::<String>()),
+                ],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(invalid("SerpAPI search reservation was not pending"));
+        }
+        Ok(())
+    }
+
+    pub fn reserve_tavily_search_with_interval(
+        &mut self,
+        search_depth: &str,
+        minimum_interval_ms: i64,
+    ) -> io::Result<TavilyReservation> {
+        if minimum_interval_ms < 0 {
+            return Err(invalid("Tavily interval must not be negative"));
+        }
+        let credits = match search_depth {
+            "basic" => 1_i64,
+            "advanced" => 2_i64,
+            _ => return Err(invalid("unsupported Tavily search depth")),
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let now = i64::try_from(now_ms).map_err(|_| invalid("search timestamp too large"))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let previous: Option<i64> = tx
+            .query_row(
+                "SELECT scheduled_at_ms FROM tavily_usage ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if previous.is_some_and(|last| now < last.saturating_add(minimum_interval_ms)) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Tavily search is cooling down",
+            ));
+        }
+        let (daily_calls, month_credits): (i64, i64) = tx
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tavily_usage
+                     WHERE scheduled_at_ms >= ?1),
+                    (SELECT COALESCE(SUM(credits), 0) FROM tavily_usage
+                     WHERE strftime('%Y-%m', scheduled_at_ms / 1000, 'unixepoch') = strftime('%Y-%m', 'now'))",
+                [now.saturating_sub(86_400_000)],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(database_error)?;
+        if daily_calls >= 25 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Scholar reached the rolling Tavily search-call limit",
+            ));
+        }
+        if month_credits.saturating_add(credits) > 750 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Scholar reached the monthly Tavily credit limit",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO tavily_usage
+                (scheduled_at_ms, search_depth, credits, outcome)
+             VALUES (?1, ?2, ?3, 'reserved')",
+            params![now, search_depth, credits],
+        )
+        .map_err(database_error)?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(database_error)?;
+        Ok(TavilyReservation { id, credits })
+    }
+
+    pub fn complete_tavily_search(
+        &self,
+        request_id: i64,
+        response_status: Option<u16>,
+        error: Option<&str>,
+    ) -> io::Result<()> {
+        let completed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let completed_at_ms = i64::try_from(completed_at_ms)
+            .map_err(|_| invalid("search completion timestamp too large"))?;
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE tavily_usage SET completed_at_ms = ?2, response_status = ?3,
+                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'",
+                params![
+                    request_id,
+                    completed_at_ms,
+                    response_status,
+                    if error.is_some() {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    },
+                    error.map(|value| value.chars().take(500).collect::<String>()),
+                ],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(invalid("Tavily search reservation was not pending"));
+        }
+        Ok(())
+    }
+
+    /// Atomically reserve a persisted host slot. Unfinished reservations count
+    /// against the global and per-host caps until completion or lease expiry.
+    pub fn reserve_host_request_with_interval(
+        &mut self,
+        host: &str,
+        request_kind: &str,
+        minimum_interval_ms: i64,
+    ) -> io::Result<HostRequestReservation> {
+        let valid_host = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            && !host.starts_with('.')
+            && !host.ends_with('.')
+            && !host.contains("..");
+        if !valid_host
+            || minimum_interval_ms < 10_000
+            || !matches!(
+                request_kind,
+                "wikipedia_search"
+                    | "wikipedia_sections"
+                    | "wikipedia_page_content"
+                    | "external_robots_txt"
+                    | "external_llms_txt"
+                    | "external_manifest_txt"
+                    | "external_page_content"
+                    | "serpapi_search"
+                    | "tavily_search"
+                    | "searxng_search"
+            )
+        {
+            return Err(invalid("unsupported Scholar host request"));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let now = i64::try_from(now_ms).map_err(|_| invalid("request timestamp too large"))?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let retry_until: Option<i64> = tx
+            .query_row(
+                "SELECT retry_until_ms FROM scholar_host_backoff
+                 WHERE host = ?1 AND retry_until_ms > ?2",
+                params![host, now],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if retry_until.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "host is in persisted Retry-After backoff",
+            ));
+        }
+        network::check_wikipedia_budget(&tx, host, now, network::wikipedia_limits())?;
+        let previous: Option<(i64, Option<i64>)> = tx
+            .query_row(
+                "SELECT scheduled_at_ms, completed_at_ms FROM host_request_log
+                 WHERE host = ?1 ORDER BY id DESC LIMIT 1",
+                [host],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        let minimum_next = previous.map_or(now, |(scheduled, completed)| {
+            let spaced_after_reservation = scheduled.saturating_add(minimum_interval_ms);
+            let after_completion = completed
+                .map(|completed| completed.saturating_add(minimum_interval_ms))
+                .unwrap_or_else(|| scheduled.saturating_add(15_000));
+            spaced_after_reservation.max(after_completion)
+        });
+        let scheduled_at_ms = now.max(minimum_next);
+        const REQUEST_LEASE_MS: i64 = 30_000;
+        let host_in_flight: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM host_request_log
+                 WHERE host = ?1 AND outcome = 'reserved' AND lease_until_ms > ?2",
+                params![host, now],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let global_in_flight: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM host_request_log
+                 WHERE outcome = 'reserved' AND lease_until_ms > ?1",
+                [now],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if host_in_flight >= 1 || global_in_flight >= 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Scholar HTTP in-flight limit reached",
+            ));
+        }
+        tx.execute(
+            "INSERT INTO host_request_log
+                (host, request_kind, scheduled_at_ms, outcome, lease_until_ms)
+             VALUES (?1, ?2, ?3, 'reserved', ?4)",
+            params![
+                host,
+                request_kind,
+                scheduled_at_ms,
+                scheduled_at_ms.saturating_add(REQUEST_LEASE_MS)
+            ],
+        )
+        .map_err(database_error)?;
+        let id = tx.last_insert_rowid();
+        tx.commit().map_err(database_error)?;
+        Ok(HostRequestReservation {
+            id,
+            scheduled_at_ms: u128::try_from(scheduled_at_ms)
+                .map_err(|_| invalid("invalid scheduled request timestamp"))?,
+        })
+    }
+
+    pub fn complete_host_request(
+        &mut self,
+        request_id: i64,
+        response_status: Option<u16>,
+        error: Option<&str>,
+    ) -> io::Result<()> {
+        self.complete_host_request_with_retry_after(request_id, response_status, None, error)
+    }
+
+    pub fn complete_host_request_with_retry_after(
+        &mut self,
+        request_id: i64,
+        response_status: Option<u16>,
+        retry_after_ms: Option<i64>,
+        error: Option<&str>,
+    ) -> io::Result<()> {
+        let completed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let completed_at_ms = i64::try_from(completed_at_ms)
+            .map_err(|_| invalid("request completion timestamp too large"))?;
+        let error = error.map(|value| value.chars().take(500).collect::<String>());
+        let api_throttled = error.as_deref() == Some(network::MEDIAWIKI_TRANSIENT_ERROR);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let host: String = tx
+            .query_row(
+                "SELECT host FROM host_request_log WHERE id = ?1 AND outcome = 'reserved'",
+                [request_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| invalid("Scholar request reservation was not pending"))?;
+        let changed = tx
+            .execute(
+                "UPDATE host_request_log SET completed_at_ms = ?2, response_status = ?3,
+                    outcome = ?4, error = ?5, lease_until_ms = ?2
+                 WHERE id = ?1 AND outcome = 'reserved'",
+                params![
+                    request_id,
+                    completed_at_ms,
+                    response_status,
+                    if error.is_some() || response_status.is_some_and(|code| code >= 300) {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    },
+                    error.map(|value| value.chars().take(500).collect::<String>()),
+                ],
+            )
+            .map_err(database_error)?;
+        if changed != 1 {
+            return Err(invalid("Scholar request reservation was not pending"));
+        }
+        if response_status.is_some_and(|code| matches!(code, 429 | 503)) || api_throttled {
+            let previous: i64 = tx
+                .query_row(
+                    "SELECT failures FROM scholar_host_backoff WHERE host=?1",
+                    [&host],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?
+                .unwrap_or(0);
+            let failures = previous.saturating_add(1).min(7);
+            let delay = retry_after_ms
+                .unwrap_or(60_000_i64.saturating_mul(1_i64 << (failures - 1)))
+                .max(1_000);
+            let retry_until = completed_at_ms.saturating_add(delay);
+            tx.execute(
+                "INSERT INTO scholar_host_backoff (host, retry_until_ms, response_status, updated_at_ms,failures)
+                 VALUES (?1, ?2, ?3, ?4,?5)
+                 ON CONFLICT(host) DO UPDATE SET retry_until_ms = excluded.retry_until_ms,
+                    response_status = excluded.response_status, updated_at_ms = excluded.updated_at_ms,failures=excluded.failures",
+                params![host, retry_until, if api_throttled {Some(429)} else {response_status}, completed_at_ms,failures],
+            )
+            .map_err(database_error)?;
+        } else if response_status.is_some_and(|code| code < 400) {
+            tx.execute("DELETE FROM scholar_host_backoff WHERE host = ?1", [&host])
+                .map_err(database_error)?;
+        }
+        tx.commit().map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn cached_site_policy(
+        &self,
+        origin: &str,
+        request_kind: &str,
+    ) -> io::Result<Option<(u16, String, String)>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT response_status, content_type, body FROM scholar_site_policy_cache
+                 WHERE origin = ?1 AND request_kind = ?2
+                   AND expires_at_ms > CAST(strftime('%s', 'now') AS INTEGER) * 1000",
+                params![origin, request_kind],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        Ok(row)
+    }
+
+    pub fn cache_site_policy(
+        &self,
+        origin: &str,
+        request_kind: &str,
+        response_status: u16,
+        content_type: &str,
+        body: &str,
+        ttl_ms: i64,
+    ) -> io::Result<()> {
+        if !matches!(
+            request_kind,
+            "external_robots_txt" | "external_llms_txt" | "external_manifest_txt"
+        ) || !matches!(response_status, 200 | 401 | 403 | 404 | 410)
+            || ttl_ms <= 0
+            || body.len() > 512 * 1024
+        {
+            return Err(invalid("invalid site-policy cache entry"));
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .as_millis();
+        let now = i64::try_from(now_ms).map_err(|_| invalid("policy timestamp too large"))?;
+        self.connection
+            .execute(
+                "INSERT INTO scholar_site_policy_cache
+                    (origin, request_kind, response_status, content_type, body, fetched_at_ms, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(origin, request_kind) DO UPDATE SET
+                    response_status = excluded.response_status,
+                    content_type = excluded.content_type, body = excluded.body,
+                    fetched_at_ms = excluded.fetched_at_ms, expires_at_ms = excluded.expires_at_ms",
+                params![origin, request_kind, response_status, content_type, body, now, now.saturating_add(ttl_ms)],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn reserve_host_request_wait(
+        &mut self,
+        host: &str,
+        request_kind: &str,
+        minimum_interval_ms: i64,
+        max_wait: std::time::Duration,
+    ) -> io::Result<HostRequestReservation> {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            match self.reserve_host_request_with_interval(host, request_kind, minimum_interval_ms) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && error.to_string().contains("in-flight")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                result => return result,
+            }
+        }
     }
 }

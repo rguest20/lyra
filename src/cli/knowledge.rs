@@ -214,11 +214,12 @@ impl Cli {
             println!("Maintenance has not run yet");
         }
         println!(
-            "Queues: Curator {} (oldest {:?}s), Scout {} candidate claim(s) (oldest {:?}s), Scholar {} (oldest {:?}s)",
+            "Queues: Curator {} (oldest {:?}s), Scout {} claim review(s) (oldest {:?}s), {} bucket question(s) waiting, Scholar {} (oldest {:?}s)",
             status.curator.pending,
             status.curator.oldest_age_seconds,
             status.scout.pending,
             status.scout.oldest_age_seconds,
+            status.scout_bucket_questions_pending,
             status.scholar.pending,
             status.scholar.oldest_age_seconds,
         );

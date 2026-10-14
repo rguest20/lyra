@@ -747,6 +747,524 @@ impl LearningStore {
                 ).map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 48 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS research_claim_relations (
+                    left_claim_id INTEGER NOT NULL REFERENCES research_claims(id),
+                    right_claim_id INTEGER NOT NULL REFERENCES research_claims(id),
+                    relation TEXT NOT NULL CHECK(relation IN ('same_subject','related_facts')),
+                    rationale TEXT NOT NULL,
+                    reviewer_model_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    PRIMARY KEY(left_claim_id,right_claim_id),
+                    CHECK(left_claim_id < right_claim_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS research_claim_relations_by_right
+                    ON research_claim_relations(right_claim_id);
+                 PRAGMA user_version = 48;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 49 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS research_claim_terms (
+                    term TEXT NOT NULL,
+                    claim_id INTEGER NOT NULL REFERENCES research_claims(id) ON DELETE CASCADE,
+                    PRIMARY KEY(term,claim_id)
+                 );
+                 CREATE INDEX IF NOT EXISTS research_claim_terms_by_claim
+                    ON research_claim_terms(claim_id,term);
+                 PRAGMA user_version = 49;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 50 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for (column, definition) in [
+                ("source_scope", "TEXT NOT NULL DEFAULT 'legacy_excerpt'"),
+                ("input_characters", "INTEGER NOT NULL DEFAULT 0"),
+                ("retained_characters", "INTEGER NOT NULL DEFAULT 0"),
+                ("truncated", "INTEGER NOT NULL DEFAULT 0"),
+                ("provider", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("query", "TEXT"),
+                ("published_at", "TEXT"),
+                ("capture_status", "TEXT NOT NULL DEFAULT 'excerpted'"),
+            ] {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('research_sources') WHERE name = ?1)",
+                        [column],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE research_sources ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(database_error)?;
+                }
+            }
+            tx.execute(
+                "UPDATE research_sources SET input_characters=length(body),
+                    retained_characters=length(body)
+                 WHERE input_characters=0 AND retained_characters=0",
+                [],
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 50)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 51 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for (table, column) in [
+                ("research_claims", "evidence_byte_start"),
+                ("research_claims", "evidence_byte_end"),
+                ("research_questions", "evidence_byte_start"),
+                ("research_questions", "evidence_byte_end"),
+                ("research_question_sources", "evidence_byte_start"),
+                ("research_question_sources", "evidence_byte_end"),
+            ] {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                        rusqlite::params![table, column],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if !exists {
+                    tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER;"))
+                        .map_err(database_error)?;
+                }
+            }
+            tx.pragma_update(None, "user_version", 51)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 52 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for (column, definition) in [
+                (
+                    "source_archive_id",
+                    "INTEGER REFERENCES research_sources(id)",
+                ),
+                ("evidence_byte_start", "INTEGER"),
+                ("evidence_byte_end", "INTEGER"),
+            ] {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('scholar_findings') WHERE name = ?1)",
+                        [column],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE scholar_findings ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(database_error)?;
+                }
+            }
+            tx.pragma_update(None, "user_version", 52)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 53 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scholar_finding_claim_links (
+                    finding_id INTEGER NOT NULL REFERENCES scholar_findings(id),
+                    claim_id INTEGER NOT NULL REFERENCES semantic_claims(id),
+                    relation TEXT NOT NULL CHECK (relation IN ('supports', 'contradicts')),
+                    rationale TEXT NOT NULL,
+                    assessment_method TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                    PRIMARY KEY(finding_id, claim_id, relation)
+                 );
+                 CREATE INDEX IF NOT EXISTS scholar_finding_claim_links_by_claim
+                    ON scholar_finding_claim_links(claim_id, relation);
+                 PRAGMA user_version = 53;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 54 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for (table, column, definition) in [
+                ("semantic_claims", "attribution", "TEXT"),
+                (
+                    "semantic_claims",
+                    "polarity",
+                    "TEXT NOT NULL DEFAULT 'unknown' CHECK (polarity IN ('asserted','negated','unknown'))",
+                ),
+                (
+                    "semantic_claims",
+                    "modality",
+                    "TEXT NOT NULL DEFAULT 'unknown' CHECK (modality IN ('factual','possible','necessary','conditional','unknown'))",
+                ),
+                ("scholar_findings", "attribution", "TEXT"),
+                (
+                    "scholar_findings",
+                    "polarity",
+                    "TEXT NOT NULL DEFAULT 'unknown' CHECK (polarity IN ('asserted','negated','unknown'))",
+                ),
+                (
+                    "scholar_findings",
+                    "modality",
+                    "TEXT NOT NULL DEFAULT 'unknown' CHECK (modality IN ('factual','possible','necessary','conditional','unknown'))",
+                ),
+            ] {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                        rusqlite::params![table, column],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(database_error)?;
+                }
+            }
+            tx.pragma_update(None, "user_version", 54)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 55 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let definition: Option<String> = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='scholar_finding_claim_links'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            if !definition.is_some_and(|sql| sql.contains("'qualifies'")) {
+                tx.execute_batch(
+                    "CREATE TABLE scholar_finding_claim_links_v55 (
+                        finding_id INTEGER NOT NULL REFERENCES scholar_findings(id),
+                        claim_id INTEGER NOT NULL REFERENCES semantic_claims(id),
+                        relation TEXT NOT NULL CHECK (relation IN ('supports','contradicts','qualifies','does_not_address')),
+                        rationale TEXT NOT NULL,
+                        assessment_method TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                        PRIMARY KEY(finding_id, claim_id, relation)
+                    );
+                    INSERT INTO scholar_finding_claim_links_v55
+                        (finding_id,claim_id,relation,rationale,assessment_method,created_at)
+                    SELECT finding_id,claim_id,relation,rationale,assessment_method,created_at
+                    FROM scholar_finding_claim_links;
+                    DROP TABLE scholar_finding_claim_links;
+                    ALTER TABLE scholar_finding_claim_links_v55
+                        RENAME TO scholar_finding_claim_links;
+                    CREATE INDEX scholar_finding_claim_links_by_claim
+                        ON scholar_finding_claim_links(claim_id, relation);",
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 55)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 56 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for (column, definition) in [
+                (
+                    "decision_method",
+                    "TEXT NOT NULL DEFAULT 'deterministic_policy' CHECK (decision_method IN ('deterministic_policy','human','ai'))",
+                ),
+                ("model_id", "TEXT"),
+                ("model_version", "TEXT"),
+            ] {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('policy_decisions') WHERE name = ?1)",
+                        [column],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE policy_decisions ADD COLUMN {column} {definition};"
+                    ))
+                    .map_err(database_error)?;
+                }
+            }
+            tx.pragma_update(None, "user_version", 56)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 57 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let has_scope: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('entity_alias_links') WHERE name='identity_scope')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(database_error)?;
+            if !has_scope {
+                tx.execute_batch("ALTER TABLE entity_alias_links ADD COLUMN identity_scope TEXT;")
+                    .map_err(database_error)?;
+            }
+            tx.execute_batch(
+                "DROP VIEW IF EXISTS entity_equivalences;
+                 DROP VIEW IF EXISTS entity_alias_candidates;
+                 DROP VIEW IF EXISTS active_entity_aliases;
+                 CREATE VIEW active_entity_aliases AS
+                    SELECT left_name,right_name FROM entity_alias_links l
+                    WHERE l.identity_scope IS NULL AND (l.source_finding_id IS NULL OR EXISTS (
+                        SELECT 1 FROM scholar_findings f WHERE f.id=l.source_finding_id
+                          AND (f.status='needs_review' OR (f.status='promoted' AND EXISTS (
+                            SELECT 1 FROM semantic_claims c WHERE c.id=f.semantic_claim_id
+                              AND c.retracted_by IS NULL AND c.status IN ('active','uncertain'))))));
+                 CREATE VIEW entity_alias_candidates AS
+                    SELECT left_name,right_name FROM active_entity_aliases
+                    UNION SELECT right_name,left_name FROM active_entity_aliases;
+                 CREATE VIEW entity_equivalences AS
+                    SELECT a.left_name,a.right_name FROM entity_alias_candidates a
+                    WHERE (SELECT COUNT(DISTINCT b.right_name) FROM entity_alias_candidates b
+                           WHERE b.left_name=a.left_name)=1
+                      AND (SELECT COUNT(DISTINCT b.right_name) FROM entity_alias_candidates b
+                           WHERE b.left_name=a.right_name)=1;",
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 57)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 58 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            for table in ["semantic_claims", "scholar_findings"] {
+                for column in ["geographic_scope", "context_scope"] {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+                            rusqlite::params![table, column],
+                            |row| row.get(0),
+                        )
+                        .map_err(database_error)?;
+                    if !exists {
+                        tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))
+                            .map_err(database_error)?;
+                    }
+                }
+            }
+            tx.pragma_update(None, "user_version", 58)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 59 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let definition: Option<String> = tx
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='scholar_finding_claim_links'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(database_error)?;
+            if !definition.is_some_and(|sql| sql.contains("'unresolved'")) {
+                tx.execute_batch(
+                    "CREATE TABLE scholar_finding_claim_links_v59 (
+                        finding_id INTEGER NOT NULL REFERENCES scholar_findings(id),
+                        claim_id INTEGER NOT NULL REFERENCES semantic_claims(id),
+                        relation TEXT NOT NULL CHECK (relation IN ('supports','contradicts','qualifies','does_not_address','unresolved')),
+                        rationale TEXT NOT NULL,
+                        assessment_method TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                        PRIMARY KEY(finding_id, claim_id, relation)
+                    );
+                    INSERT INTO scholar_finding_claim_links_v59
+                        (finding_id,claim_id,relation,rationale,assessment_method,created_at)
+                    SELECT finding_id,claim_id,relation,rationale,assessment_method,created_at
+                    FROM scholar_finding_claim_links;
+                    DROP TABLE scholar_finding_claim_links;
+                    ALTER TABLE scholar_finding_claim_links_v59
+                        RENAME TO scholar_finding_claim_links;
+                    CREATE INDEX scholar_finding_claim_links_by_claim
+                        ON scholar_finding_claim_links(claim_id, relation);",
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 59)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 60 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scholar_task_targets (
+                    job_id TEXT PRIMARY KEY REFERENCES scholar_jobs(id) ON DELETE CASCADE,
+                    original_question TEXT NOT NULL,
+                    entity_constraints_json TEXT NOT NULL DEFAULT '[]',
+                    scope_constraints_json TEXT NOT NULL DEFAULT '[]',
+                    evidence_gap TEXT NOT NULL,
+                    acceptable_evidence_json TEXT NOT NULL DEFAULT '[\"direct source passage that addresses the question\"]',
+                    stop_reason TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                 );
+                 INSERT OR IGNORE INTO scholar_task_targets(job_id,original_question,evidence_gap)
+                    SELECT id,question,question FROM scholar_jobs;
+                 CREATE TRIGGER IF NOT EXISTS scholar_job_target_after_insert
+                 AFTER INSERT ON scholar_jobs BEGIN
+                    INSERT OR IGNORE INTO scholar_task_targets(job_id,original_question,evidence_gap)
+                    VALUES (NEW.id,NEW.question,NEW.question);
+                 END;
+                 PRAGMA user_version = 60;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 61 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "UPDATE semantic_claims SET status='challenged',
+                    checked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    last_reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    next_review_at=NULL
+                 WHERE status IN ('active','uncertain') AND retracted_by IS NULL
+                   AND id IN (
+                     SELECT DISTINCT f.semantic_claim_id
+                     FROM scholar_findings f
+                     JOIN scholar_source_assessments a ON a.finding_id=f.id
+                     JOIN scholar_source_origin_reviews automatic_origin
+                       ON automatic_origin.finding_id=f.id AND automatic_origin.review_method='automatic'
+                     WHERE f.status='promoted' AND f.decision_reason LIKE 'automatically accepted after two directly supporting%'
+                       AND a.independence_verified=1
+                       AND NOT EXISTS (SELECT 1 FROM scholar_source_origin_reviews human_origin
+                                       WHERE human_origin.finding_id=f.id AND human_origin.review_method='human')
+                       AND NOT EXISTS (SELECT 1 FROM claim_evidence_links l
+                                       JOIN claim_evidence e ON e.id=l.evidence_id
+                                       WHERE l.claim_id=f.semantic_claim_id
+                                         AND l.stance='supports' AND e.source_kind IN ('user_observation','manual'))
+                       AND NOT EXISTS (SELECT 1 FROM scholar_findings independently_reviewed
+                                       JOIN scholar_source_assessments verified
+                                         ON verified.finding_id=independently_reviewed.id
+                                       JOIN scholar_source_origin_reviews human_origin
+                                         ON human_origin.finding_id=independently_reviewed.id
+                                         AND human_origin.review_method='human'
+                                       WHERE independently_reviewed.semantic_claim_id=f.semantic_claim_id
+                                         AND independently_reviewed.status='promoted'
+                                         AND verified.independence_verified=1)
+                   );
+
+                 UPDATE scholar_findings SET status='needs_review'
+                 WHERE status='promoted' AND decision_reason LIKE 'automatically accepted after two directly supporting%'
+                   AND EXISTS (SELECT 1 FROM scholar_source_origin_reviews automatic_origin
+                               WHERE automatic_origin.finding_id=scholar_findings.id
+                                 AND automatic_origin.review_method='automatic')
+                   AND NOT EXISTS (SELECT 1 FROM scholar_source_origin_reviews human_origin
+                                   WHERE human_origin.finding_id=scholar_findings.id
+                                     AND human_origin.review_method='human');
+
+                 UPDATE scholar_source_assessments SET independence_verified=0,
+                    gate_status=CASE WHEN gate_status='eligible' THEN 'awaiting_corroboration' ELSE gate_status END,
+                    reason=substr(reason,1,800) || '; automatic domain-based origin verification withdrawn: distinct hosts alone do not prove independent reporting'
+                 WHERE independence_verified=1
+                   AND EXISTS (SELECT 1 FROM scholar_source_origin_reviews automatic_origin
+                               WHERE automatic_origin.finding_id=scholar_source_assessments.finding_id
+                                 AND automatic_origin.review_method='automatic')
+                   AND NOT EXISTS (SELECT 1 FROM scholar_source_origin_reviews human_origin
+                                   WHERE human_origin.finding_id=scholar_source_assessments.finding_id
+                                     AND human_origin.review_method='human');
+                 PRAGMA user_version = 61;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 62 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "UPDATE scholar_source_assessments SET direct_support=0,
+                    gate_status='unsupported',
+                    reason='plural claim exceeds the exact finding evidence: one example does not establish multiple options'
+                 WHERE direct_support=1 AND finding_id IN (
+                   SELECT f.id FROM scholar_findings f
+                   WHERE (
+                     lower(f.relation || ' ' || f.object) LIKE '%variety of%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%range of%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%various%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%multiple%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%several%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%numerous%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%different%'
+                     OR lower(f.relation || ' ' || f.object) LIKE '%both%'
+                   )
+                   AND NOT (
+                     lower(f.evidence_text) LIKE '%variety of%'
+                     OR lower(f.evidence_text) LIKE '%range of%'
+                     OR lower(f.evidence_text) LIKE '%various%'
+                     OR lower(f.evidence_text) LIKE '%multiple%'
+                     OR lower(f.evidence_text) LIKE '%several%'
+                     OR lower(f.evidence_text) LIKE '%numerous%'
+                     OR lower(f.evidence_text) LIKE '%different%'
+                     OR lower(f.evidence_text) LIKE '%both%'
+                     OR (instr(f.evidence_text, ',') > 0
+                         AND (instr(lower(f.evidence_text), ' and ') > 0
+                              OR instr(lower(f.evidence_text), ' or ') > 0))
+                     OR length(f.evidence_text) - length(replace(f.evidence_text, char(10) || '* ', '')) >= 6
+                     OR length(f.evidence_text) - length(replace(f.evidence_text, char(10) || '- ', '')) >= 6
+                     OR length(f.evidence_text) - length(replace(f.evidence_text, char(10) || '• ', '')) >= 8
+                   )
+                 );
+                 PRAGMA user_version = 62;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

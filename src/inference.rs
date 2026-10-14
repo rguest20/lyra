@@ -276,10 +276,6 @@ impl LocalModel {
             }
         }
     }
-    pub fn train(&mut self, prompt: &str, answer: &str) -> io::Result<(usize, f32)> {
-        self.train_with_system("/no_think", prompt, answer)
-    }
-
     pub fn train_with_system(
         &mut self,
         system: &str,
@@ -556,10 +552,6 @@ impl CandleModel {
     }
 
     /// Train the output adapter on one reviewed prompt/answer pair and persist it.
-    pub fn train(&mut self, prompt: &str, answer: &str) -> io::Result<(usize, f32)> {
-        self.train_with_system("/no_think", prompt, answer)
-    }
-
     pub fn train_with_system(
         &mut self,
         system: &str,

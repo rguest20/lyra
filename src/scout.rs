@@ -65,6 +65,15 @@ fn process_once_with_request(
 ) -> io::Result<usize> {
     let mut store = LearningStore::open(database_path)?;
     let map = KnowledgeMap::load(knowledge_path)?;
+    // User questions already have Scholar jobs. Let those run before Scout
+    // creates any background work, then drain source-derived questions before
+    // asking Scout to invent new research leads.
+    if store.has_pending_user_research()? {
+        return Ok(0);
+    }
+    if store.has_pending_retained_question()? {
+        return Ok(usize::from(store.queue_retained_question()?));
+    }
     if let Some(task) = store.claim_scholar_feedback("new_source")? {
         crate::diagnostics::event(
             "scout.research_feedback",
@@ -115,9 +124,6 @@ fn process_once_with_request(
             &question,
             "Claim has passed its scheduled review date",
         )?));
-    }
-    if store.queue_retained_question()? {
-        return Ok(1);
     }
     for claim in &review_batch {
         if matches!(
@@ -220,6 +226,33 @@ fn process_once_with_request(
     };
     let seed = model_probe_seed(probe_id);
     store.set_model_probe_seed(probe_id, &seed)?;
+    let seeded_topic = seed
+        .split_once(':')
+        .map_or(seed.as_str(), |(_, topic)| topic.trim());
+    if previous_topics
+        .iter()
+        .any(|old| same_topic_family(old, seeded_topic))
+    {
+        store.complete_model_probe(
+            probe_id,
+            "rejected",
+            "Seed topic was explored during the previous 24 hours",
+            Some(seeded_topic),
+            None,
+            None,
+        )?;
+        crate::diagnostics::event(
+            "scout.model_probe_decision",
+            serde_json::json!({
+                "probe_id": probe_id,
+                "seed": seed,
+                "decision": "rejected",
+                "reason": "seed topic was explored during the previous 24 hours",
+                "topic": seeded_topic,
+            }),
+        );
+        return Ok(0);
+    }
     let raw = match ask(ScoutRequest::Model { seed: &seed }) {
         Ok(raw) => raw,
         Err(error) => {
@@ -750,22 +783,12 @@ mod tests {
         drop(LearningStore::open(&database).unwrap());
         let connection = rusqlite::Connection::open(&database).unwrap();
         for topic in ["Axolotl", "Renewable energy and climate resilience"] {
-            connection.execute("INSERT INTO scout_model_probes(seed,status,topic,selection_reason,created_at) VALUES('open public knowledge','rejected',?1,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now','-2 days'))", [topic]).unwrap();
+            connection.execute("INSERT INTO scout_model_probes(seed,status,topic,selection_reason,created_at) VALUES('open public knowledge','rejected',?1,'fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now','-2 hours'))", [topic]).unwrap();
         }
         drop(connection);
         assert_eq!(
-            process_once_with_request(&database, &knowledge, |request| {
-                match request {
-                    ScoutRequest::Model { seed } => {
-                        assert_eq!(seed, model_probe_seed(3));
-                        assert!(!seed.contains("renewable"));
-                        Ok(
-                            "TOPIC: Axolotl\nQUESTION: How does an axolotl regenerate its limbs?"
-                                .into(),
-                        )
-                    }
-                    ScoutRequest::Map { .. } => panic!("no map gaps in fixture"),
-                }
+            process_once_with_request(&database, &knowledge, |_| {
+                panic!("recently explored model topic should not invoke the model")
             })
             .unwrap(),
             0
@@ -839,6 +862,7 @@ mod tests {
                     valid_until: None,
                     source_quality: "reference".into(),
                     source_updated_at: None,
+                    proposition: Default::default(),
                 }),
                 None,
             )
@@ -949,6 +973,7 @@ mod tests {
                     valid_until: None,
                     source_quality: "reference".into(),
                     source_updated_at: None,
+                    proposition: Default::default(),
                 }),
                 None,
             )

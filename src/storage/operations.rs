@@ -93,6 +93,7 @@ impl LearningStore {
         tx.commit().map_err(database_error)
     }
 
+    #[cfg(test)]
     pub fn mark_maintenance_worker_interrupted(&self, worker_pid: u32) -> io::Result<()> {
         self.connection
             .execute(
@@ -184,6 +185,14 @@ impl LearningStore {
                (status = 'challenged' OR (next_review_at IS NOT NULL AND
                 next_review_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))",
         )?;
+        let scout_bucket_questions_pending: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM research_questions WHERE status='pending'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
         let scholar = queue(
             "SELECT COUNT(*), CAST((julianday('now') - julianday(MIN(created_at))) * 86400 AS INTEGER)
              FROM scholar_jobs WHERE status IN ('pending', 'processing')",
@@ -209,6 +218,8 @@ impl LearningStore {
             last_pass: self.maintenance_recent_passes(1)?.into_iter().next(),
             curator,
             scout,
+            scout_bucket_questions_pending: usize::try_from(scout_bucket_questions_pending)
+                .unwrap_or(usize::MAX),
             scholar,
             scan_cursor,
             scout_priority_order: vec![

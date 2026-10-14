@@ -10,6 +10,9 @@ impl LearningStore {
                 "model approval needs a printable reason (1 to 500 characters)",
             ));
         }
+        if let Some(reason) = self.model_claim_training_block(claim_id)? {
+            return Err(invalid(reason));
+        }
         let changed = self.connection.execute(
             "INSERT INTO model_claim_approvals (claim_id, reason, approved_at)
              SELECT id, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -24,7 +27,7 @@ impl LearningStore {
     }
 
     pub fn approved_model_claim(&self, claim_id: i64) -> io::Result<SemanticClaim> {
-        self.connection
+        let claim = self.connection
             .query_row(
                 "SELECT c.id, c.subject, c.relation, c.object, c.source, c.source_observation_id,
                     c.status, c.volatility, c.valid_from, c.valid_until, c.observed_at, c.checked_at,
@@ -50,7 +53,145 @@ impl LearningStore {
             )
             .optional()
             .map_err(database_error)?
-            .ok_or_else(|| invalid("claim is inactive or has not been approved for model training"))
+            .ok_or_else(|| invalid("claim is inactive or has not been approved for model training"))?;
+        if let Some(reason) = self.model_claim_training_block(claim_id)? {
+            return Err(invalid(reason));
+        }
+        Ok(claim)
+    }
+
+    fn model_claim_training_block(&self, claim_id: i64) -> io::Result<Option<&'static str>> {
+        let claim = self
+            .connection
+            .query_row(
+                "SELECT status, retracted_by, volatility, valid_from, valid_until, next_review_at
+             FROM semantic_claims WHERE id = ?1",
+                [claim_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((status, retracted_by, volatility, valid_from, valid_until, next_review_at)) =
+            claim
+        else {
+            return Ok(Some("no semantic claim with that ID"));
+        };
+        if status != "active" || retracted_by.is_some() {
+            return Ok(Some(
+                "only active, non-withdrawn claims may enter model training",
+            ));
+        }
+        if volatility != "stable" || valid_from.is_some() || valid_until.is_some() {
+            return Ok(Some(
+                "time-scoped or changing claims must stay in retrieval",
+            ));
+        }
+        let review_due: bool = self
+            .connection
+            .query_row(
+                "SELECT ?1 IS NOT NULL AND ?1 <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+                [next_review_at],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if review_due {
+            return Ok(Some("claims due for review must stay in retrieval"));
+        }
+        let conflict: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM semantic_claims c JOIN semantic_claims other ON other.id != c.id
+                WHERE c.id = ?1 AND other.retracted_by IS NULL
+                  AND other.status IN ('active', 'uncertain', 'challenged')
+                  AND (lower(trim(other.subject)) = lower(trim(c.subject)) OR EXISTS (
+                    SELECT 1 FROM entity_equivalences e
+                    WHERE lower(trim(e.left_name)) = lower(trim(c.subject))
+                      AND lower(trim(e.right_name)) = lower(trim(other.subject))
+                  ))
+                  AND lower(trim(other.relation)) = lower(trim(c.relation))
+                  AND lower(trim(other.object)) != lower(trim(c.object))
+             )",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if conflict {
+            return Ok(Some(
+                "claims with an unresolved competing value must stay in retrieval",
+            ));
+        }
+        let disputed_evidence: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM claim_evidence_links
+                 WHERE claim_id = ?1 AND stance IN ('contradicts', 'qualifies'))",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if disputed_evidence {
+            return Ok(Some(
+                "claims with contradictory or qualifying evidence must stay in retrieval",
+            ));
+        }
+        let provenance: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM claim_evidence_links l JOIN claim_evidence e ON e.id = l.evidence_id
+                WHERE l.claim_id = ?1 AND l.stance = 'supports' AND e.source_kind = 'web'
+                  AND (e.source_uri LIKE 'https://%' OR e.source_uri LIKE 'http://%')
+                  AND length(trim(e.excerpt)) > 0
+             )",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if !provenance {
+            return Ok(Some(
+                "model training requires linked supporting web evidence with a source URL and excerpt",
+            ));
+        }
+        Ok(None)
+    }
+
+    pub fn model_claim_approval_record(&self, claim_id: i64) -> io::Result<(String, String)> {
+        self.connection
+            .query_row(
+                "SELECT reason, approved_at FROM model_claim_approvals WHERE claim_id = ?1",
+                [claim_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| invalid("claim has no explicit model-training approval"))
+    }
+
+    pub fn model_revision_matches(&self, revision: &ConsolidatedClaimRevision) -> io::Result<bool> {
+        let Ok(claim) = self.approved_model_claim(revision.id) else {
+            return Ok(false);
+        };
+        let (approval_reason, approved_at) = self.model_claim_approval_record(revision.id)?;
+        let evidence = self.claim_evidence(revision.id)?;
+        Ok(claim.subject == revision.subject
+            && claim.relation == revision.relation
+            && claim.object == revision.object
+            && claim.source == revision.source
+            && claim.valid_from == revision.valid_from
+            && claim.valid_until == revision.valid_until
+            && approval_reason == revision.approval_reason
+            && approved_at == revision.approved_at
+            && evidence == revision.evidence)
     }
 
     pub fn record_model_consolidation_with_lineage(
@@ -68,6 +209,20 @@ impl LearningStore {
             return Err(invalid(
                 "checkpoint manifest is invalid or has no included claims",
             ));
+        }
+        if !manifest
+            .included_claims
+            .iter()
+            .any(|revision| revision.id == claim_id)
+        {
+            return Err(invalid("checkpoint manifest omits its consolidated claim"));
+        }
+        for revision in &manifest.included_claims {
+            if !self.model_revision_matches(revision)? {
+                return Err(invalid(
+                    "checkpoint manifest contains a claim revision that is no longer approved and eligible",
+                ));
+            }
         }
         let tx = self
             .connection
@@ -119,18 +274,6 @@ impl LearningStore {
             .map_err(database_error)?;
         json.map(|value| serde_json::from_str(&value).map_err(invalid_json))
             .transpose()
-    }
-
-    pub fn claim_is_active_and_approved(&self, claim_id: i64) -> io::Result<bool> {
-        self.connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM semantic_claims c
-             JOIN model_claim_approvals a ON a.claim_id = c.id
-             WHERE c.id = ?1 AND c.status = 'active' AND c.retracted_by IS NULL)",
-                [claim_id],
-                |row| row.get(0),
-            )
-            .map_err(database_error)
     }
 
     pub fn model_consolidations(&self) -> io::Result<Vec<ModelConsolidation>> {

@@ -389,6 +389,12 @@ impl Cli {
                     );
                     println!("  Source: {}", finding.source_url);
                     println!(
+                        "  Source archive: {:?}; evidence byte span: {:?}..{:?}",
+                        finding.source_archive_id,
+                        finding.evidence_byte_start,
+                        finding.evidence_byte_end
+                    );
+                    println!(
                         "  Source quality: {}; freshness: {}; revised: {:?}",
                         finding.source_quality, finding.freshness, finding.source_updated_at
                     );
