@@ -319,7 +319,12 @@ mod tests {
         ModelSpec {
             id: "small".into(),
             directory: "models/small".into(),
-            adapter: "state/small.safetensors".into(),
+            // Other tests may create `state` while this fixture is cached.
+            // Use an existing parent so canonicalization stays stable.
+            adapter: std::env::temp_dir().join(format!(
+                "lyra-cache-test-{}.safetensors",
+                std::process::id()
+            )),
             cpu: false,
         }
     }
