@@ -58,6 +58,13 @@ impl ModelRuntime {
             .map_err(|_| io::Error::other("model registry lock was poisoned"))?;
         Ok(pool.assignments.model(role).id.clone())
     }
+
+    /// Load an agent's assigned backend now and retain it in this runtime's
+    /// cache. This is useful for long-lived frontends that should pay model
+    /// startup cost once, before serving the first request.
+    pub fn warm(&self, role: AgentRole) -> io::Result<()> {
+        self.model(role).is_consolidated().map(|_| ())
+    }
 }
 
 impl RoutedModel {

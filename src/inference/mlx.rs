@@ -176,14 +176,86 @@ impl MlxModel {
                 ));
             }
             let limit = reply_budget(ids.len(), extra, self.max_context, cap);
+            let initial_budget = thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1));
             let stops = [
                 self.tokenizer.token_to_id("<|im_end|>").unwrap(),
                 self.tokenizer.token_to_id("<|endoftext|>").unwrap(),
             ];
-            let response = self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
-                "thinking":use_thinking,"thinking_budget":thinking_budget(),"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
-            let tokens: Vec<u32> =
+            let mut response = self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
+                "thinking":use_thinking,"thinking_budget":initial_budget,"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+            let mut tokens: Vec<u32> =
                 serde_json::from_value(response["tokens"].clone()).map_err(other)?;
+            if use_thinking && response["finish_reason"] == "thinking_budget" {
+                let expanded_budget = initial_budget
+                    .saturating_mul(4)
+                    .min(2048)
+                    .min(limit.saturating_sub(MIN_REPLY));
+                let extra_budget = expanded_budget.saturating_sub(initial_budget);
+                let mut continuation = ids.clone();
+                continuation.extend_from_slice(&tokens);
+                let remaining = limit
+                    .saturating_sub(tokens.len())
+                    .min(self.max_context.saturating_sub(continuation.len()));
+                if extra_budget > 0 && remaining > MIN_REPLY {
+                    let extended = self.request(serde_json::json!({"op":"generate",
+                        "ids":continuation,"max_tokens":remaining,"temperature":temperature,
+                        "stop_ids":stops,"thinking":true,
+                        "thinking_budget":extra_budget.min(remaining.saturating_sub(MIN_REPLY)),
+                        "think_start_id":self.tokenizer.token_to_id("<think>"),
+                        "think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+                    tokens.extend(
+                        serde_json::from_value::<Vec<u32>>(extended["tokens"].clone())
+                            .map_err(other)?,
+                    );
+                    response["thinking_tokens"] = serde_json::json!(
+                        response["thinking_tokens"].as_u64().unwrap_or(0)
+                            + extended["thinking_tokens"].as_u64().unwrap_or(0)
+                    );
+                    response["finish_reason"] = extended["finish_reason"].clone();
+                    crate::diagnostics::event(
+                        "model.thinking_budget_extended",
+                        serde_json::json!({"initial_budget":initial_budget,"expanded_budget":expanded_budget,
+                            "reasoning_retained":true}),
+                    );
+                }
+            }
+            if use_thinking && response["finish_reason"] == "thinking_budget" {
+                let close = self
+                    .tokenizer
+                    .token_to_id("</think>")
+                    .ok_or_else(|| invalid("thinking model omitted its closing token"))?;
+                tokens.push(close);
+                tokens.extend(
+                    self.tokenizer
+                        .encode("\n\n", false)
+                        .map_err(other)?
+                        .get_ids(),
+                );
+                let mut continuation = ids.clone();
+                continuation.extend_from_slice(&tokens);
+                let remaining = limit
+                    .saturating_sub(tokens.len())
+                    .min(self.max_context.saturating_sub(continuation.len()));
+                if remaining == 0 {
+                    return Err(invalid(
+                        "thinking left no context space for a visible answer",
+                    ));
+                }
+                let completion = self.request(serde_json::json!({"op":"generate",
+                    "ids":continuation,"max_tokens":remaining,"temperature":temperature,
+                    "stop_ids":stops,"thinking":false,"thinking_budget":thinking_budget(),
+                    "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":close}))?;
+                tokens.extend(
+                    serde_json::from_value::<Vec<u32>>(completion["tokens"].clone())
+                        .map_err(other)?,
+                );
+                response["finish_reason"] = completion["finish_reason"].clone();
+                crate::diagnostics::event(
+                    "model.thinking_completed_at_budget",
+                    serde_json::json!({"thinking_tokens":response["thinking_tokens"],"answer_budget":remaining,
+                        "reasoning_retained":true}),
+                );
+            }
             let decoded = self.tokenizer.decode(&tokens, true).map_err(other)?;
             crate::diagnostics::event(
                 "model.generation",
@@ -297,6 +369,11 @@ fn generation_reply(decoded: &str, thinking: bool) -> io::Result<(Option<String>
     if answer.trim().is_empty() {
         return Err(invalid("model returned no visible answer"));
     }
+    if answer.contains("<think>") || answer.contains("</think>") {
+        return Err(invalid(
+            "model emitted another thinking boundary in its visible answer",
+        ));
+    }
     Ok((thought.filter(|value| !value.is_empty()), answer.to_owned()))
 }
 
@@ -323,6 +400,7 @@ mod tests {
         assert!(generation_reply("Reasoning without a closing tag", true).is_err());
         assert!(generation_reply("<think>unfinished reasoning", false).is_err());
         assert!(generation_reply("Reasoning</think>  ", true).is_err());
+        assert!(generation_reply("Reasoning</think>More reasoning</think>Answer", true).is_err());
         assert!(generation_reply("", false).is_err());
         assert_eq!(
             generation_reply("Reasoning</think>Soup is ready.", true).unwrap(),
@@ -354,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_thinking_gets_one_automatic_retry_and_keeps_debug_trace() {
+    fn thinking_budget_expands_then_preserves_reasoning_into_the_answer() {
         let vocabulary = [
             ("<unk>".into(), 0),
             ("<|im_end|>".into(), 1),
@@ -363,6 +441,7 @@ mod tests {
             ("unfinished".into(), 4),
             ("Soup.".into(), 5),
             ("</think>".into(), 6),
+            ("\n\n".into(), 7),
         ]
         .into_iter()
         .collect();
@@ -382,7 +461,7 @@ mod tests {
                 .as_nanos()
         ));
         let worker = worker(
-            "import sys,json\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert request['thinking'] == (attempt==0)\n assert attempt<2\n print(json.dumps({'tokens':[3,4] if attempt==0 else [5],'finish_reason':'thinking_budget' if attempt==0 else 'stop_token'}),flush=True)",
+            "import sys,json\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n assert request['thinking'] == (attempt<2)\n if attempt==0: initial=request['thinking_budget']\n if attempt==1:\n  assert request['thinking_budget']>initial\n  assert request['ids'][-2:]==[3,4]\n if attempt==2: assert request['ids'][-5:]==[3,4,4,6,7]\n print(json.dumps({'tokens':[[3,4],[4],[5]][attempt],'thinking_tokens':initial if attempt==0 else request['thinking_budget'] if attempt==1 else 0,'finish_reason':'thinking_budget' if attempt<2 else 'stop_token'}),flush=True)",
         );
         let mut model = MlxModel {
             worker: Mutex::new(worker),
@@ -398,20 +477,10 @@ mod tests {
             role: "user".into(),
             content: "How do I make soup?".into(),
         }];
-        assert_eq!(model.chat(&messages, 0, 128, 0.1, true).unwrap(), "Soup.");
-        assert!(
-            model
-                .last_thinking
-                .as_ref()
-                .unwrap()
-                .contains("discarded attempt")
-        );
-        assert!(
-            model
-                .last_thinking
-                .as_ref()
-                .unwrap()
-                .ends_with("unfinished")
+        assert_eq!(model.chat(&messages, 0, 4096, 0.1, true).unwrap(), "Soup.");
+        assert_eq!(
+            model.last_thinking.as_deref(),
+            Some("unfinished unfinished")
         );
         drop(model);
         fs::remove_file(path).unwrap();
