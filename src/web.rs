@@ -1,23 +1,22 @@
-//! Loopback-only browser interface. The CLI handles each reply in a short
-//! process, then a second short process curates staged observations.
+//! Loopback-only browser interface with one long-lived local model runtime.
 
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::maintenance;
+use crate::agent::{Agent, ReplyServices};
+use crate::curator::CuratorHandle;
+use crate::inference::assignments::{AgentRole, ModelRuntime};
+use crate::knowledge::KnowledgeMap;
 use crate::storage::LearningStore;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
-const MAX_IMMEDIATE_MAINTENANCE_PASSES: usize = 3;
 const PAGE: &str = include_str!("../web/index.html");
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SIGNAL_HANDLER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
@@ -30,7 +29,12 @@ struct ChatRequest {
     show_thinking: bool,
 }
 
-pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
+pub fn serve(
+    address: SocketAddr,
+    database_path: &str,
+    knowledge_path: &str,
+    models: ModelRuntime,
+) -> io::Result<()> {
     if !address.ip().is_loopback() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -50,72 +54,24 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
+    models.warm(AgentRole::Interaction)?;
     println!("Community web UI: http://{address}");
-    let executable = std::env::current_exe()?;
     let session_state_directory = Path::new(database_path)
         .parent()
         .unwrap_or_else(|| Path::new("state"))
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
-    let mut curator: Option<Child> = None;
-    let mut productive_passes = 0;
-    // Scan durable queues once at startup, then recover on the periodic tick.
-    let mut pending_maintenance = true;
-    let interval = maintenance::interval();
-    let mut next_tick = Instant::now() + interval;
+    let curator = CuratorHandle::spawn_for_web(
+        database_path.to_owned(),
+        knowledge_path.to_owned(),
+        models.clone(),
+    );
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        if let Some(child) = curator.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let mut output = Vec::new();
-                    if let Some(mut stdout) = child.stdout.take() {
-                        stdout.read_to_end(&mut output)?;
-                    }
-                    if !status.success() {
-                        eprintln!("background maintenance process exited with {status}");
-                        let store = LearningStore::open(Path::new(database_path))?;
-                        store.mark_maintenance_worker_interrupted(child.id())?;
-                        productive_passes = 0;
-                    } else if maintenance_summary_did_work(&output)
-                        && productive_passes < MAX_IMMEDIATE_MAINTENANCE_PASSES
-                    {
-                        productive_passes += 1;
-                        wake_maintenance(&mut pending_maintenance);
-                    } else {
-                        productive_passes = 0;
-                    }
-                    curator = None;
-                    next_tick = Instant::now() + interval;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("could not poll background maintenance process: {error}");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let store = LearningStore::open(Path::new(database_path))?;
-                    store.mark_maintenance_worker_interrupted(child.id())?;
-                    curator = None;
-                    next_tick = Instant::now() + interval;
-                }
-            }
-        }
-
-        if tick_due(Instant::now(), &mut next_tick, interval) {
-            wake_maintenance(&mut pending_maintenance);
-        }
-        if pending_maintenance && curator.is_none() {
-            match spawn_maintenance(&executable, database_path) {
-                Ok(child) => curator = Some(child),
-                Err(error) => eprintln!("could not start scheduled maintenance: {error}"),
-            }
-            pending_maintenance = false;
-        }
-
         let (mut stream, _) = match listener.accept() {
             Ok(stream) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
             Err(error) => {
@@ -126,67 +82,31 @@ pub fn serve(address: SocketAddr, database_path: &str) -> io::Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(15)))?;
         match handle_request(
             &mut stream,
-            &executable,
             address,
             &session_state_directory,
             Path::new(database_path),
+            Path::new(knowledge_path),
+            Some((&models, &curator)),
         ) {
             Ok(should_curate) if should_curate => {
-                wake_maintenance(&mut pending_maintenance);
-                next_tick = Instant::now() + interval;
+                curator.wake();
             }
             Ok(_) => {}
             Err(error) => eprintln!("could not handle web request: {error}"),
         }
     }
-    if let Some(mut child) = curator {
-        let status = child.wait()?;
-        if !status.success() {
-            let store = LearningStore::open(Path::new(database_path))?;
-            store.mark_maintenance_worker_interrupted(child.id())?;
-        }
-    }
+    curator.stop();
     Ok(())
-}
-
-fn tick_due(now: Instant, next_tick: &mut Instant, interval: Duration) -> bool {
-    if now < *next_tick {
-        return false;
-    }
-    *next_tick = now + interval;
-    true
-}
-
-fn wake_maintenance(pending: &mut bool) {
-    *pending = true;
-}
-
-fn spawn_maintenance(executable: &Path, database_path: &str) -> io::Result<Child> {
-    Command::new(executable)
-        .arg("curate-once")
-        .env("COMMUNITY_DB", database_path)
-        .env("COMMUNITY_MAINTENANCE_MODE", "serve")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-}
-
-fn maintenance_summary_did_work(output: &[u8]) -> bool {
-    output
-        .split(|byte| *byte == b'\n')
-        .rev()
-        .find_map(|line| serde_json::from_slice::<maintenance::PassSummary>(line).ok())
-        .is_some_and(|summary| summary.did_work())
 }
 
 /// Returns true after a chat request, which triggers one curation pass.
 fn handle_request(
     stream: &mut TcpStream,
-    executable: &std::path::Path,
     address: SocketAddr,
     session_state_directory: &Path,
     database_path: &Path,
+    knowledge_path: &Path,
+    chat_runtime: Option<(&ModelRuntime, &CuratorHandle)>,
 ) -> io::Result<bool> {
     let request = read_request(stream)?;
     let mut lines = request.split(|byte| *byte == b'\n');
@@ -318,101 +238,83 @@ fn handle_request(
             return Ok(false);
         }
     };
-    let output = Command::new(executable)
-        .arg("say")
-        .arg(parsed.message)
-        .env(
-            "COMMUNITY_STATE",
-            session_state_directory.join(format!("{}.json", parsed.session_id)),
-        )
-        .env("COMMUNITY_WEB_REPLY", "1")
-        .env(
-            "COMMUNITY_DEBUG_THINKING",
-            if parsed.show_thinking { "1" } else { "0" },
-        )
-        .stdin(Stdio::null())
-        .output();
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            respond(
-                stream,
-                "500 Internal Server Error",
-                "application/json; charset=utf-8",
-                &json!({"error": format!("could not start reply process: {error}")})
-                    .to_string()
-                    .into_bytes(),
-            )?;
-            return Ok(false);
-        }
-    };
-    // Child diagnostics belong in the server log on successful replies too.
-    if !output.stderr.is_empty() {
-        io::stderr().lock().write_all(&output.stderr)?;
-    }
-    if output.status.success() {
-        let result: serde_json::Value =
-            match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
-                Ok(result) if result["reply"].as_str().is_some() => result,
-                _ => {
-                    respond(
-                        stream,
-                        "500 Internal Server Error",
-                        "application/json; charset=utf-8",
-                        br#"{"error":"reply process returned an invalid response"}"#,
-                    )?;
-                    return Ok(true);
-                }
-            };
-        respond(
-            stream,
-            "200 OK",
-            "application/json; charset=utf-8",
-            &json!({
-                "reply": result["reply"],
-                "thinking": result["thinking"],
-                "new_conversation": result["new_conversation"],
-                "research_queued": result["research_queued"]
-            })
-            .to_string()
-            .into_bytes(),
-        )?;
-    } else {
-        let reason = reply_error(&output.stderr);
-        #[cfg(unix)]
-        let signal = {
-            use std::os::unix::process::ExitStatusExt;
-            output.status.signal()
-        };
-        #[cfg(not(unix))]
-        let signal: Option<i32> = None;
-        crate::diagnostics::event(
-            "web.reply_process_failed",
-            json!({"exit_code":output.status.code(),"signal":signal,"reason":reason}),
-        );
+    let Some((models, curator)) = chat_runtime else {
         respond(
             stream,
             "500 Internal Server Error",
             "application/json; charset=utf-8",
-            &json!({"error": if reason.is_empty() { "reply process failed" } else { &reason }})
+            br#"{"error":"chat runtime is unavailable"}"#,
+        )?;
+        return Ok(false);
+    };
+    let state_path = session_state_directory.join(format!("{}.json", parsed.session_id));
+    let result = browser_reply(
+        &parsed,
+        &state_path,
+        database_path,
+        knowledge_path,
+        models,
+        curator,
+    );
+    match result {
+        Ok(result) => {
+            respond(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                &json!({
+                    "reply": result.text,
+                    "thinking": result.thinking,
+                    "new_conversation": result.new_conversation,
+                    "research_queued": result.research_queued
+                })
                 .to_string()
                 .into_bytes(),
-        )?;
+            )?;
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            crate::diagnostics::event("web.reply_failed", json!({"reason":reason}));
+            respond(
+                stream,
+                "500 Internal Server Error",
+                "application/json; charset=utf-8",
+                &json!({"error": reason}).to_string().into_bytes(),
+            )?;
+        }
     }
     Ok(true)
 }
 
-fn reply_error(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
-        .lines()
-        .rev()
-        .find(|line| {
-            !line.trim().is_empty()
-                && !serde_json::from_str::<serde_json::Value>(line)
-                    .is_ok_and(|value| value.get("event").is_some())
-        })
-        .map(|line| line.trim().chars().take(1000).collect())
-        .unwrap_or_else(|| "reply process failed; see the server log for details".into())
+fn browser_reply(
+    request: &ChatRequest,
+    state_path: &Path,
+    database_path: &Path,
+    knowledge_path: &Path,
+    models: &ModelRuntime,
+    curator: &CuratorHandle,
+) -> io::Result<crate::agent::AgentReply> {
+    let model_id = models.model_id(AgentRole::Interaction)?;
+    let mut agent = Agent::load_for_model_change(state_path, &model_id)?;
+    let map = KnowledgeMap::load(knowledge_path)?;
+    let store = LearningStore::open(database_path)?;
+    let mut backend = models.model(AgentRole::Interaction);
+    let mut research_model = models.model(AgentRole::Curmudgeon);
+    let mut scholar_model = models.model(AgentRole::Scholar);
+    agent.reply(
+        &request.message,
+        &mut backend,
+        &map,
+        ReplyServices {
+            store: &store,
+            database_path,
+            research_model: &mut research_model,
+            scholar_model: &mut scholar_model,
+            curator: Some(curator),
+            state_path,
+        },
+        request.show_thinking,
+    )
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -478,46 +380,11 @@ fn respond(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        handle_request, maintenance_summary_did_work, read_request, serve, tick_due,
-        valid_session_id, wake_maintenance,
-    };
+    use super::{handle_request, read_request, serve, valid_session_id};
+    use crate::inference::assignments::{ModelRuntime, ModelSpec};
     use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-
-    #[test]
-    fn browser_maintenance_tick_fires_without_chat_activity() {
-        let now = std::time::Instant::now();
-        let interval = std::time::Duration::from_millis(10);
-        let mut next = now + interval;
-        assert!(!tick_due(now, &mut next, interval));
-        assert!(tick_due(now + interval, &mut next, interval));
-        assert!(!tick_due(now + interval, &mut next, interval));
-    }
-
-    #[test]
-    fn repeated_chat_events_coalesce_until_maintenance_starts() {
-        let mut pending = false;
-        wake_maintenance(&mut pending);
-        wake_maintenance(&mut pending);
-        assert!(pending);
-        pending = false;
-        assert!(!pending);
-    }
-
-    #[test]
-    fn productive_maintenance_pass_requests_one_bounded_follow_up() {
-        assert!(maintenance_summary_did_work(
-            br#"{"curated":1,"audited":0,"scouted":0,"researched":0,"errors":0}"#
-        ));
-        assert!(!maintenance_summary_did_work(
-            br#"{"curated":0,"audited":0,"scouted":0,"researched":0,"errors":0}"#
-        ));
-        assert!(!maintenance_summary_did_work(
-            b"worker failed before writing a summary"
-        ));
-    }
 
     #[test]
     fn reads_a_json_post_body() {
@@ -553,19 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn reply_errors_show_the_failure_and_keep_startup_diagnostics_out_of_the_bubble() {
-        let stderr = b"{\"event\":\"model.loaded\",\"details\":{\"adapter_loaded\":false}}\nmodel returned no visible answer\n";
-        assert_eq!(
-            super::reply_error(stderr),
-            "model returned no visible answer"
-        );
-        assert_eq!(
-            super::reply_error(b"{\"event\":\"model.loaded\"}\n"),
-            "reply process failed; see the server log for details"
-        );
-    }
-
-    #[test]
     fn serves_the_chat_page_on_a_loopback_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -573,10 +427,11 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             handle_request(
                 &mut stream,
-                std::path::Path::new("unused"),
                 address,
                 std::path::Path::new("/tmp"),
                 std::path::Path::new("/tmp/unused-learning.db"),
+                std::path::Path::new("/tmp/unused-knowledge.json"),
+                None,
             )
             .unwrap();
         });
@@ -621,10 +476,11 @@ mod tests {
                 let (mut stream, _) = listener.accept().unwrap();
                 handle_request(
                     &mut stream,
-                    std::path::Path::new("unused"),
                     address,
                     std::path::Path::new("/tmp"),
                     &database_path,
+                    std::path::Path::new("/tmp/unused-knowledge.json"),
+                    None,
                 )
                 .unwrap();
             }
@@ -696,10 +552,11 @@ mod tests {
             let (mut stream, _) = listener.accept().unwrap();
             handle_request(
                 &mut stream,
-                std::path::Path::new("unused"),
                 address,
                 &directory_for_server,
                 &directory_for_server.join("learning.db"),
+                &directory_for_server.join("knowledge.json"),
+                None,
             )
             .unwrap();
         });
@@ -720,7 +577,20 @@ mod tests {
 
     #[test]
     fn refuses_non_loopback_bind_addresses() {
-        let error = serve("0.0.0.0:0".parse().unwrap(), "/unused.db").unwrap_err();
+        let models = ModelRuntime::new(ModelSpec {
+            id: "small".into(),
+            directory: "models/small".into(),
+            adapter: "state/small.safetensors".into(),
+            cpu: false,
+        })
+        .unwrap();
+        let error = serve(
+            "0.0.0.0:0".parse().unwrap(),
+            "/unused.db",
+            "/unused-knowledge.json",
+            models,
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 

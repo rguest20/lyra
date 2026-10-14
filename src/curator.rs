@@ -18,6 +18,7 @@ use crate::storage::{CandidateClaim, LearningStore, Observation, valid_claim_per
 const LEASE_SECONDS: u64 = 600;
 const MAX_BATCH: usize = 4;
 const MAX_CANDIDATES: usize = 16;
+const MAX_WEB_FOLLOW_UP_PASSES: usize = 3;
 
 enum Command {
     Wake,
@@ -29,8 +30,7 @@ pub struct CuratorHandle {
     thread: Option<JoinHandle<()>>,
 }
 
-/// Process a bounded batch. The browser invokes this through a short-lived
-/// maintenance subprocess so model memory is available between turns.
+/// Process a bounded batch of staged observations.
 pub fn process_once_limited(
     database_path: &str,
     model: &mut LocalModel,
@@ -302,10 +302,37 @@ fn is_explicit_assertion(observation: &str) -> bool {
 
 impl CuratorHandle {
     pub fn spawn(database_path: String, knowledge_path: String, models: ModelRuntime) -> Self {
+        Self::spawn_with_mode(database_path, knowledge_path, models, "chat", false)
+    }
+
+    pub fn spawn_for_web(
+        database_path: String,
+        knowledge_path: String,
+        models: ModelRuntime,
+    ) -> Self {
+        Self::spawn_with_mode(database_path, knowledge_path, models, "serve", true)
+    }
+
+    fn spawn_with_mode(
+        database_path: String,
+        knowledge_path: String,
+        models: ModelRuntime,
+        mode: &'static str,
+        drain_productive_passes: bool,
+    ) -> Self {
         let (sender, receiver) = wake_queue();
         let thread = thread::Builder::new()
             .name("semantic-curator".into())
-            .spawn(move || run(database_path, knowledge_path, models, receiver));
+            .spawn(move || {
+                run(
+                    database_path,
+                    knowledge_path,
+                    models,
+                    mode,
+                    drain_productive_passes,
+                    receiver,
+                )
+            });
         let thread = match thread {
             Ok(thread) => Some(thread),
             Err(error) => {
@@ -345,20 +372,32 @@ fn run(
     database_path: String,
     knowledge_path: String,
     models: ModelRuntime,
+    mode: &'static str,
+    drain_productive_passes: bool,
     receiver: mpsc::Receiver<Command>,
 ) {
+    let mut productive_follow_ups = 0;
     loop {
         if drain_commands(&receiver) {
             break;
         }
-        if let Err(error) = maintenance::run_pass(
+        let did_work = match maintenance::run_pass(
             Path::new(&database_path),
             Path::new(&knowledge_path),
             &models,
-            "chat",
+            mode,
         ) {
-            eprintln!("semantic maintenance pass failed: {error}");
+            Ok(summary) => summary.did_work(),
+            Err(error) => {
+                eprintln!("semantic maintenance pass failed: {error}");
+                false
+            }
+        };
+        if drain_productive_passes && did_work && productive_follow_ups < MAX_WEB_FOLLOW_UP_PASSES {
+            productive_follow_ups += 1;
+            continue;
         }
+        productive_follow_ups = 0;
 
         if !wait_for_next_pass(&receiver, maintenance::interval()) {
             break;

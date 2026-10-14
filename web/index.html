@@ -108,7 +108,7 @@
         const last = pass
           ? `${pass.status} at ${new Date(pass.started_at).toLocaleTimeString()}`
           : 'waiting for its first pass';
-        maintenanceStatus.textContent = `Knowledge upkeep: ${last} · Scout ${upkeep.scout.pending} candidate(s) · Scholar ${upkeep.scholar.pending} queued`;
+        maintenanceStatus.textContent = `Knowledge upkeep: ${last} · Scout ${upkeep.scout.pending} claim review(s), ${upkeep.scout_bucket_questions_pending} bucket question(s) waiting · Scholar ${upkeep.scholar.pending} queued`;
       } catch {
         maintenanceStatus.textContent = 'Knowledge upkeep status unavailable';
       }

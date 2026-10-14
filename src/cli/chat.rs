@@ -100,7 +100,13 @@ impl Cli {
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()
             .map_err(|error| format!("invalid COMMUNITY_WEB_ADDR: {error}"))?;
-        web::serve(address, &database_path.to_string_lossy()).map_err(|e| e.to_string())?;
+        web::serve(
+            address,
+            &database_path.to_string_lossy(),
+            &self.knowledge_path.to_string_lossy(),
+            self.model_runtime.clone(),
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 

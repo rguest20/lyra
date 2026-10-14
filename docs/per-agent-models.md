@@ -31,13 +31,12 @@ their leases. Existing MLX cleanup kills and reaps the Python worker. Terminal
 chat shares its runtime with background maintenance, retaining models over idle
 ticks. Shutdown still waits for an already-running maintenance pass.
 
-The browser still launches separate `say` and maintenance subprocesses. Each
-subprocess has its own cache, which is released on exit. Residency and reuse
-therefore do not extend across browser turns or separate worker invocations.
-Different processes can hold duplicate resident weights, although routed
-inference is serialized. A persistent local inference service or in-process web
-runtime would be needed to remove that limitation; neither is introduced here.
-Prefer terminal `chat` when measuring shared resident memory and feedback loops.
+The browser server keeps its model runtime for its full lifetime. Browser replies
+and the maintenance thread share that runtime, so matching assignments reuse a
+single backend and workers stay resident between turns. The server warms
+Interaction before accepting requests and waits for an active maintenance pass
+when shutting down. Standalone `say` and `curate-once` commands remain
+short-lived processes.
 
 ## Configuration
 
@@ -66,9 +65,9 @@ configured differently on a desktop, but it does not add ROCm or CUDA support.
 
 ## MacBook Profile
 
-The existing Qwen3-0.6B installation supplies Scout, Archivist, and
-Interaction. Install the optional original BF16 2B checkpoint and the existing
-MLX requirements in new directories; do not replace the small checkpoint:
+All agents use one shared original BF16 2B checkpoint and adapter, avoiding
+model-size switches and duplicate resident workers. The 0.6B files remain
+available for rollback. Keep both checkpoints installed:
 
 ```sh
 python3 -m venv --system-site-packages .venv-qwen35
@@ -79,43 +78,34 @@ hf download Qwen/Qwen3.5-2B config.json tokenizer.json tokenizer_config.json mod
 Set local environment variables or the Git-ignored `.env`:
 
 ```dotenv
-COMMUNITY_MODEL_ID=Qwen/Qwen3-0.6B
-COMMUNITY_MODEL_DIR=models/qwen3-0.6b
-COMMUNITY_ADAPTER=state/adapter-qwen3-0.6b.safetensors
-COMMUNITY_CURMUDGEON_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_CURMUDGEON_MODEL_DIR=models/qwen3.5-2b
-COMMUNITY_CURMUDGEON_ADAPTER=state/adapter-qwen3.5-2b.safetensors
+COMMUNITY_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_MODEL_DIR=models/qwen3.5-2b
+COMMUNITY_ADAPTER=state/adapter-qwen3.5-2b.safetensors
 COMMUNITY_MLX_PYTHON=.venv-qwen35/bin/python
 COMMUNITY_CONTEXT_TOKENS=2048
-COMMUNITY_MODEL_CACHE_SIZE=1
 COMMUNITY_CURMUDGEON_OPENAI=off
-COMMUNITY_SCHOLAR_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_SCHOLAR_MODEL_DIR=models/qwen3.5-2b
-COMMUNITY_SCHOLAR_ADAPTER=state/adapter-qwen3.5-2b.safetensors
+COMMUNITY_MODEL_CACHE_SIZE=1
 ```
 
-Restart Lyra after configuration changes. All unspecified agents inherit 0.6B.
-When overriding Interaction, also select an appropriate `COMMUNITY_STATE` path
-to avoid mixing different models' conversation state.
+Restart Lyra after configuration changes. All agents inherit the 2B assignment.
+Changing Interaction's model preserves its saved conversation history and
+updates the model label when the next turn is saved.
 
 The development Mac reports 16 GiB of physical RAM and about 32% free at the
 time of inspection. The upstream BF16 weights are 1,503,300,328 bytes for 0.6B
-and 4,548,221,488 bytes for 2B: about 5.64 GiB combined, before KV caches,
-activations, adapters, Python/Metal allocation overhead, and other applications.
-Both weights alone exceed the free share reported at that initial inspection.
-The original BF16 2B checkpoint and isolated MLX environment are now installed
-locally, and the ignored `.env` assigns Curmudgeon and Scholar to 2B with cache capacity one.
+and 4,548,221,488 bytes for 2B. The single 2B backend avoids holding both
+checkpoint sizes at once, before KV caches, activations, adapters, Python/Metal
+allocation overhead, and other applications.
+The original BF16 2B checkpoint and isolated MLX environment are installed
+locally. The ignored `.env` now assigns every role to the same 2B adapter with
+cache capacity one, so only one backend needs to stay resident. The 2B model
+will take longer per generated token than 0.6B; monitor Activity Monitor and
+`memory_pressure` during normal use, especially while maintenance runs.
 Local review smoke probes accepted a supported crisp-flavours claim and rejected
 an off-topic US renewable-electricity claim for a food-production question.
 These synthetic fixtures check review decisions and routing, not general model
-accuracy or source classification. No dual-model residency benchmark was run;
-capacity one remains the conservative starting point.
-
-After closing memory-heavy applications, capacity two is an opt-in experiment:
-set `COMMUNITY_MODEL_CACHE_SIZE=2`, start terminal chat, run Scholar/Curmudgeon
-work, and monitor Activity Monitor and `memory_pressure`. Lower context limits
-reduce memory use. If pressure or swap grows, return to capacity one. Reloads
-are then expected when switching between model sizes.
+accuracy or source classification. Lower context limits reduce cache and
+attention memory if pressure or swap grows.
 
 ## Diagnostics And Validation
 
@@ -127,7 +117,14 @@ contents are added to these events. Candle reports re-tokenized visible output;
 it excludes hidden thinking and is not a billing count. That field is null for
 MLX; existing MLX generation diagnostics retain its native token counts.
 
-`model probe-scholar` and `model probe-support` use Scholar's assignment,
+Thinking is selected by the operation, independently of the assigned role:
+user-facing answers enable it, while JSON extraction and review disable it.
+Hiding the browser's debug trace does not disable answer reasoning. MLX extends
+an exhausted thinking budget before closing that phase, retaining the generated
+reasoning as context for the visible answer. The extension and final phase emit
+`model.thinking_budget_extended` and `model.thinking_completed_at_budget`.
+
+`model probe-scholar`, `model probe-baskets`, and `model probe-support` use Scholar's assignment,
 `model probe-review`, `model probe-lookup`, and `model probe-aliases` use Curmudgeon's, and `model probe-chat` uses Interaction's.
 The plain `model probe`, training, consolidation, and rebuild commands continue
 to use the global checkpoint.
