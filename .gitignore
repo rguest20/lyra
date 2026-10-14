@@ -5,5 +5,14 @@
 .env
 config.toml
 *.example
+evals/
+evals/__pycache__/
+evals/results/**/*.db
+evals/results/**/*.db-wal
+evals/results/**/*.db-shm
 
 /.venv-qwen35/
+
+# Local runtime and test output
+/community-lab.log
+/test.log
