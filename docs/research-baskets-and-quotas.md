@@ -69,9 +69,11 @@ website archive. Existing source-policy and raw HTTP response limits remain.
 Background Scholar work leases a source and processes at most 2,200 characters
 per pass. A durable cursor advances only after successful basket storage. Failed
 or malformed extraction gets one format-repair attempt, then keeps the text and
-schedules another attempt after five minutes. One pass extracts at most three
-assertions and two questions. User
-research, repair work, and corroboration retain their existing priority.
+schedules another attempt after five minutes. Each passage is asked for all
+distinct grounded assertions and follow-up questions; there is no fixed
+per-passage item count. Output remains bounded by the model's available context
+window. User research, repair work, and corroboration retain their existing
+priority.
 
 Claims are concrete, fact-shaped assertions, not verified facts. For example,
 an explicitly quoted assertion that the Amazon rainforest is made of chocolate
@@ -155,3 +157,27 @@ Diagnostics `internet.cache_hit`, `scholar.job_deferred`,
 `research.baskets_retained`, `research.harvest_deferred`,
 `research.question_queued`, and `research.evidence_link` record IDs, counts,
 status, and scheduling metadata rather than adding prompt contents to logs.
+
+### Bounded basket-output repair
+
+Basket extraction starts at 1,024 output tokens. An invalid response gets a fresh
+schema-guided attempt at 2,048 tokens, then one final attempt at 4,096 tokens.
+These are output budgets; structured extraction continues to disable thinking.
+The normal context budget still applies. Other extraction operations keep their
+existing default cap.
+
+After three invalid responses, the harvest stops and the source is parked until
+an explicit `scholar baskets retry SOURCE_ID`. Its body and harvest cursor are
+preserved; invalid partial baskets are not stored. The existing retry timestamp
+uses `i64::MAX` for parked sources, so no schema migration is required. Transient
+model errors and storage errors retain the existing five-minute retry cooldown.
+`research.harvest_abandoned` identifies exhausted schema/syntax retries; the source
+is preserved rather than deleted. Parse diagnostics include the
+actual schema/syntax error, attempt, output budget and bounded output excerpts.
+`research.basket_output_budget_extended` records each increase. A question must
+still be an object containing `question` and `evidence_text`; plain strings are
+not silently accepted as valid questions.
+
+Use `model probe-baskets TITLE PASSAGE` to replay extraction without inserting
+its generated claims or questions into the baskets. The probe follows the same
+budget and repair policy as normal harvesting.

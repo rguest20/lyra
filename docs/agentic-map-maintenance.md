@@ -319,9 +319,10 @@ through a policy rather than inventing its own state changes.
 
 ### E. Steward role decision
 
-- [ ] **E1. Reassess whether a Steward role is needed after A–D.** The scheduler
-  and deterministic policy own lifecycle coordination initially. Add a
-  Steward only if a recurring reasoning task has no clear owner.
+**Decision:** do not add a separate Steward role now. The scheduler and
+deterministic policy own lifecycle coordination; revisit only if recurring
+reasoning work has no clear owner. The broader learning-integrity work is
+tracked in [Learning Integrity Roadmap](learning-integrity-roadmap.md).
 
 ## Should there be a removal role?
 

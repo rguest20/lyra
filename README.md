@@ -28,7 +28,8 @@ COMMUNITY_MODEL_LOCK=state/model-inference.lock
 ```
 
 Then run `cargo run --release -- chat` or `cargo run --release -- serve`.
-Normal replies and extraction disable thinking. Only text inputs are supported.
+User-facing answers enable thinking; structured extraction disables it. The debug
+setting controls whether the reasoning trace is displayed. Only text inputs are supported.
 The MLX backend requires Apple Silicon Metal; `COMMUNITY_DEVICE=cpu` is available
 for the legacy Candle Qwen3 backend. Quantized Qwen3.5 checkpoints are rejected.
 
@@ -45,8 +46,11 @@ with a shared request lock derived from `COMMUNITY_MODEL_LOCK` (default
 does not hold this lock. A waiting process emits `model.waiting_for_lease`.
 `agent.inference` records agent/model identity, duration, and visible token usage
 where available, without prompt contents. Models remain cached up to
-`COMMUNITY_MODEL_CACHE_SIZE` (default 1). Browser subprocesses still reload
-models between turns. Restart running processes to pick up adapter changes.
+`COMMUNITY_MODEL_CACHE_SIZE` (default 1). The browser server and its background
+curator share one long-lived runtime, so cached models stay loaded between turns
+and maintenance passes. Agents with matching checkpoint, adapter, and device
+assignments share one backend. Restart running processes to pick up adapter
+changes.
 
 For per-agent configuration, the 0.6B/2B MacBook profile, measured memory
 constraints, and cache limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
@@ -64,10 +68,13 @@ reports `adapter_state` (`initialized_untrained`, `loaded_untrained`, or
 `loaded_trained`), whether the file exists, and its training-step count. Untrained
 adapters skip their unused output computation during generation.
 
-Debug thinking is limited to 256 tokens by default. Set
-`COMMUNITY_THINKING_TOKENS` to an integer from 1 to 2048 to change that limit.
-If thinking ends without a visible answer, generation retries once with thinking
-disabled and keeps the partial debug trace. `model.generation` records token
+Thinking initially receives 256 tokens by default. Set
+`COMMUNITY_THINKING_TOKENS` to an integer from 1 to 2048 to change that initial budget.
+When exhausted, MLX continues the existing reasoning with up to four times the
+initial budget, capped at 2048 tokens and the available context. At that cap it
+closes the reasoning phase and generates the answer while preserving the reasoning
+in context. Malformed output still gets one recovery attempt with thinking disabled
+and a labelled discarded trace. `model.generation` records token
 counts, stop reason, and MLX active/peak/cache memory; `model.reply_recovery`
 records the retry. The browser forwards reply diagnostics to server stderr on
 both success and failure, while error bubbles show the actual error message.
@@ -118,13 +125,10 @@ Run the local web server and open `http://127.0.0.1:8080`:
 cargo run --release -- serve
 ```
 
-The server accepts connections only on a loopback address. Each prompt launches
-the existing `say` command as a short-lived process, so its model is unloaded
-after the reply. A bounded maintenance subprocess runs after chat activity and
-on an idle timer; browser replies share the inference request lock, not the
-entire maintenance pass.
-This lets the roles update SQLite between turns without keeping the reply agent
-loaded. Each browser tab gets a separate conversation
+The server accepts connections only on a loopback address. It loads Interaction
+at startup and keeps the shared model runtime alive between turns. Background
+maintenance runs in a thread using that same runtime and cache. Each browser tab
+gets a separate conversation
 history under `state/web-sessions/`. Reloading a tab keeps its session; a new
 tab or **Start a new conversation** begins a fresh history. Learned knowledge
 is shared across sessions. The agent also starts a fresh history when you
