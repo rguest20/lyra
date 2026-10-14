@@ -1,0 +1,183 @@
+{
+  "fixture_set": "lyra-learning-quality-v1-runtime-inputs",
+  "notes": "Only runtime allowlisted fields from the unchanged versioned benchmark; no rubric.",
+  "cases": [
+    {
+      "id": "crisps_compound_flavours",
+      "question": "Which crisp flavours does Walkers sell?",
+      "entities": [
+        "Walkers"
+      ],
+      "scope_constraints": [
+        "current range, if established"
+      ],
+      "evidence": [
+        {
+          "id": "walkers-flavour-list",
+          "origin": "walkers.example",
+          "passage": "Walkers sells Cheese and Onion, Salt and Vinegar, and Ready Salted crisps."
+        },
+        {
+          "id": "crisp-opinion",
+          "origin": "forum.example",
+          "passage": "My favourite crisp flavour is barbecue."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "walkers_smiths_entity_mismatch",
+      "question": "Which flavours does Walkers sell?",
+      "entities": [
+        "Walkers"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "smiths-range",
+          "origin": "smiths.example",
+          "passage": "Smith's makes ready salted, salt and vinegar, and cheese and onion crisps."
+        },
+        {
+          "id": "walkers-identity",
+          "origin": "walkers.example",
+          "passage": "Walkers is a British snack brand."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "crisps_vs_renewable_energy",
+      "question": "What are popular crisp flavours?",
+      "entities": [],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "renewables",
+          "origin": "energy.example",
+          "passage": "Renewable energy investment in developing countries has increased."
+        },
+        {
+          "id": "flavour-examples",
+          "origin": "food.example",
+          "passage": "Popular crisp flavours include cheese and onion and salt and vinegar."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "cookie_navigation_contamination",
+      "question": "What does Cofresh make?",
+      "entities": [
+        "Cofresh"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "cofresh-footer",
+          "origin": "cofresh.example",
+          "passage": "Privacy Policy. I ACCEPT. I DO NOT ACCEPT. Copyright 2026."
+        },
+        {
+          "id": "cofresh-about",
+          "origin": "cofresh.example",
+          "passage": "Cofresh makes Indian snack foods, including Bombay mix and lentil-based snacks."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "false_completeness",
+      "question": "What is the complete current Walkers crisp range?",
+      "entities": [
+        "Walkers"
+      ],
+      "scope_constraints": [
+        "complete",
+        "current"
+      ],
+      "evidence": [
+        {
+          "id": "historical-flavours",
+          "origin": "archive.example",
+          "passage": "In 2018, Walkers sold cheese and onion and salt and vinegar crisps."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "nearby_question_extraction",
+      "question": "Who discovered penicillin?",
+      "entities": [
+        "penicillin"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "nearby-biography",
+          "origin": "history.example",
+          "passage": "Alexander Fleming discovered penicillin in 1928. He later shared the Nobel Prize with Howard Florey and Ernst Chain."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "conflicting_dates",
+      "question": "When did the organization begin operating?",
+      "entities": [
+        "Example Organization"
+      ],
+      "scope_constraints": [
+        "date"
+      ],
+      "evidence": [
+        {
+          "id": "source-a-date",
+          "origin": "source-a.example",
+          "passage": "Example Organization began operating in 1998."
+        },
+        {
+          "id": "source-b-date",
+          "origin": "source-b.example",
+          "passage": "Example Organization began operating in 2000."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "copied_sources_not_independent",
+      "question": "Is the claim independently corroborated?",
+      "entities": [
+        "Example Organization"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "report-a",
+          "origin": "wire-report-17",
+          "passage": "Example Organization opened its first clinic in 2019, according to a report by Newswire."
+        },
+        {
+          "id": "report-b",
+          "origin": "wire-report-17",
+          "passage": "Example Organization opened its first clinic in 2019, according to a report by Newswire."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "malformed_repair_is_bounded",
+      "question": "Which flavours are listed?",
+      "entities": [],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "malformed-extraction-source",
+          "origin": "food.example",
+          "passage": "The listed flavours are barbecue and prawn cocktail."
+        }
+      ],
+      "inject_malformed": true
+    }
+  ]
+}

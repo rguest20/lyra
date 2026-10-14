@@ -1,4 +1,5 @@
 mod chat;
+mod evaluation;
 mod knowledge;
 mod model_ops;
 mod workers;
@@ -97,6 +98,9 @@ pub fn run() -> Result<(), String> {
 impl Cli {
     fn dispatch(&mut self, command: &str, args: Vec<String>) -> Result<(), String> {
         match command {
+            "eval-fixture" => self.eval_fixture(args),
+            "eval-judge" => self.eval_judge(args),
+            "eval-lifecycle" => self.eval_lifecycle(args),
             "chat" => self.chat(args),
             "serve" => self.serve(args),
             "curate-once" => self.curate_once(args),
@@ -133,5 +137,8 @@ fn usage() {
     );
     println!(
         "Research: scholar usage | scholar baskets [claims | questions | sources | claim ID | source ID | retry SOURCE_ID | import]"
+    );
+    println!(
+        "Offline evaluation: eval-fixture INPUT_JSON NEW_OUTPUT_DIRECTORY | eval-judge BLINDED_REVIEW_PACKET_JSON | eval-lifecycle CONTROLLED_FIXTURE_PIPELINE_DIRECTORY"
     );
 }
