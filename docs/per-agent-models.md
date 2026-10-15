@@ -4,11 +4,12 @@
 
 The existing Candle Qwen3 and MLX Qwen3.5 backends remain unchanged. A
 `ModelRuntime` gives each agent a lightweight `LocalModel` handle. Handles route
-inference through a lazy, shared cache rather than loading their own checkpoint.
-Matching canonical model directory, adapter path, and device reuse one backend
-within a runtime, even if configured model labels differ. Different adapters
-intentionally select different instances. Model identifiers label local files;
-they do not download or select a hosted model.
+inference through a lazy cache rather than loading a checkpoint per handle.
+Foreground chat and background upkeep have separate caches; matching canonical
+model directory, adapter path, and device reuse one backend within each lane,
+even if configured model labels differ. Different adapters intentionally select
+different instances. Model identifiers label local files; they do not download
+or select a hosted model.
 
 The existing Curator is the Archivist for configuration purposes. Its recorded
 SQLite maintenance role remains `curator`. Maintenance still runs Archivist,
@@ -17,14 +18,15 @@ Semantic lookup and source-grounded entity aliases are described in the README.
 An unset assignment inherits the global model and adapter. Invalid assignments
 fail explicitly; unavailable checkpoints never fall back to a smaller model.
 
-The cache defaults to one resident backend. It evicts the least recently used
-backend before loading another at capacity. With capacity two, the shared small
-model and Curmudgeon's larger model remain loaded between calls. Loading and
-inference are serialized; network requests and database work do not hold the
-inference mutex. A request-scoped process lock derived from
-`COMMUNITY_MODEL_LOCK` with `.requests` appended serializes routed inference
-across Lyra processes. Raw training and checkpoint commands retain their existing
-loader; stop agents before manual training or consolidation.
+The background cache defaults to one resident backend. A separate chat cache
+keeps its own assigned backend warm, so a background generation already in
+progress cannot hold up a browser or terminal chat turn. Each lane is serialized
+internally and has its own process request lock: background uses
+`COMMUNITY_MODEL_LOCK` with `.requests` appended, and chat uses `.chat.requests`.
+This can keep two copies of the same model resident and generating at once; check
+memory pressure on smaller machines. Network requests and database work do not
+hold either inference mutex. Raw training and checkpoint commands retain their
+existing loader; stop agents before manual training or consolidation.
 
 Dropping the last runtime or agent handle drops its cached backends and releases
 their leases. Existing MLX cleanup kills and reaps the Python worker. Terminal
@@ -32,11 +34,10 @@ chat shares its runtime with background maintenance, retaining models over idle
 ticks. Shutdown still waits for an already-running maintenance pass.
 
 The browser server keeps its model runtime for its full lifetime. Browser replies
-and the maintenance thread share that runtime, so matching assignments reuse a
-single backend and workers stay resident between turns. The server warms
-Interaction before accepting requests and waits for an active maintenance pass
-when shutting down. Standalone `say` and `curate-once` commands remain
-short-lived processes.
+reuse the warm chat lane while the maintenance thread uses the separate
+background lane. The server warms Interaction before accepting requests and
+waits for an active maintenance pass when shutting down. Standalone `say` and
+`curate-once` commands remain short-lived processes.
 
 ## Configuration
 
@@ -91,16 +92,19 @@ Restart Lyra after configuration changes. All agents inherit the 2B assignment.
 Changing Interaction's model preserves its saved conversation history and
 updates the model label when the next turn is saved.
 
-The development Mac reports 16 GiB of physical RAM and about 32% free at the
-time of inspection. The upstream BF16 weights are 1,503,300,328 bytes for 0.6B
-and 4,548,221,488 bytes for 2B. The single 2B backend avoids holding both
-checkpoint sizes at once, before KV caches, activations, adapters, Python/Metal
-allocation overhead, and other applications.
-The original BF16 2B checkpoint and isolated MLX environment are installed
-locally. The ignored `.env` now assigns every role to the same 2B adapter with
-cache capacity one, so only one backend needs to stay resident. The 2B model
-will take longer per generated token than 0.6B; monitor Activity Monitor and
-`memory_pressure` during normal use, especially while maintenance runs.
+The development Mac has 16 GiB of physical RAM. The upstream BF16 weights are
+1,503,300,328 bytes for 0.6B and 4,548,221,488 bytes for 2B. Separate chat and
+upkeep lanes can each hold a copy, so two 2B BF16 backends require about 9.1 GB
+for weights alone, before KV caches, activations, adapters, Python/Metal
+allocation overhead, and other applications. Two simultaneous 4-bit MLX workers
+each reported about 1.07 GB active memory in a local probe. Monitor Activity
+Monitor and `memory_pressure` during normal use, especially while maintenance
+runs. Lower context limits reduce cache and attention memory if pressure or
+swap grows.
+The original BF16 2B checkpoint, experimental 4-bit checkpoint, and isolated
+MLX environment are installed locally. The ignored `.env` still assigns every
+role to the BF16 2B model; it has not been switched to 4-bit pending broader
+quality evaluation.
 Local review smoke probes accepted a supported crisp-flavours claim and rejected
 an off-topic US renewable-electricity claim for a food-production question.
 These synthetic fixtures check review decisions and routing, not general model

@@ -19,19 +19,13 @@ def main():
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx_lm.generate import generate_step
-    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+    from mlx_lm.utils import load_model
     from mlx_lm.sample_utils import make_sampler
 
     init = json.loads(sys.argv[1])
     config = json.loads((Path(init['model_dir']) / 'config.json').read_text())
-    if config.get('quantization') or config.get('quantization_config'):
-        raise ValueError('Quantized checkpoints are not supported by this BF16 backend')
-    base = Model(ModelArgs.from_dict(config))
-    weights = {}
-    for checkpoint in init['checkpoints']:
-        weights.update(mx.load(checkpoint))
-    base.load_weights(list(base.sanitize(weights).items()), strict=True)
-    del weights
+    base, config = load_model(Path(init['model_dir']), strict=True)
+    quantization = config.get('quantization') or config.get('quantization_config')
     base.eval()
     base.freeze()
     mx.eval(base.parameters())
@@ -89,7 +83,8 @@ def main():
 
     if not adapter_loaded:
         save_adapter(adapter)
-    send({'ready': True, 'backend': 'mlx', 'precision': 'BF16', 'adapter_loaded': adapter_loaded,
+    send({'ready': True, 'backend': 'mlx', 'precision': 'quantized' if quantization else 'BF16',
+          'quantization': quantization, 'adapter_loaded': adapter_loaded,
           'adapter_created': not adapter_loaded, 'adapter_active': model.adapter_active,
           'adapter_training_steps': training_steps, 'memory': memory_stats(mx)})
 
@@ -154,6 +149,8 @@ def main():
                 save_adapter(Path(request['adapter']))
                 send({'tokens': len(targets), 'loss': numeric_loss})
             elif op == 'merge':
+                if quantization:
+                    raise ValueError('Cannot merge an adapter into a quantized base; keep the adapter separate')
                 destination = Path(request['destination'])
                 if destination.exists():
                     raise ValueError('Destination checkpoint already exists')

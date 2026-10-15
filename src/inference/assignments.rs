@@ -1,14 +1,66 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use super::LocalModel;
 
 #[derive(Clone)]
 pub struct ModelRuntime {
     pool: Arc<Mutex<ModelPool>>,
+    chat_pool: Arc<Mutex<ModelPool>>,
+    chat_activity: Arc<ChatActivity>,
+    chat_turn: Option<Arc<ChatTurn>>,
+}
+
+const CHAT_QUIET_WINDOW: Duration = Duration::from_secs(120);
+const CHAT_ACTIVITY_POLL: Duration = Duration::from_millis(100);
+
+#[derive(Default)]
+struct ChatActivity {
+    last_activity: Mutex<Option<Instant>>,
+    active_turns: AtomicUsize,
+    stop_background: std::sync::atomic::AtomicBool,
+}
+
+struct ChatTurn(Arc<ChatActivity>);
+
+impl Drop for ChatTurn {
+    fn drop(&mut self) {
+        // A slow answer must not consume the user's entire quiet window.
+        self.0.record();
+        self.0.active_turns.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl ChatActivity {
+    fn record(&self) {
+        self.record_at(Instant::now());
+    }
+
+    fn record_at(&self, now: Instant) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
+    }
+
+    fn remaining(&self, now: Instant, quiet_window: Duration) -> Option<Duration> {
+        if self.active_turns.load(Ordering::SeqCst) > 0 {
+            return Some(quiet_window);
+        }
+        self.last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .and_then(|last_message| {
+                let remaining =
+                    quiet_window.saturating_sub(now.saturating_duration_since(last_message));
+                (remaining > Duration::ZERO).then_some(remaining)
+            })
+    }
 }
 
 struct ModelPool {
@@ -31,16 +83,80 @@ impl ModelRuntime {
     }
 
     fn with_assignments(assignments: Assignments) -> Self {
-        let mut lock = super::model_lease_path().into_os_string();
-        lock.push(".requests");
+        let mut background_lock = super::model_lease_path().into_os_string();
+        background_lock.push(".requests");
+        let mut chat_lock = super::model_lease_path().into_os_string();
+        chat_lock.push(".chat.requests");
         Self {
-            pool: Arc::new(Mutex::new(ModelPool {
-                cache: ModelCache::new(assignments.capacity),
-                assignments,
-                inference_lock: lock.into(),
-                loads: 0,
-            })),
+            pool: Arc::new(Mutex::new(ModelPool::new(
+                assignments.clone(),
+                background_lock.into(),
+            ))),
+            chat_pool: Arc::new(Mutex::new(ModelPool::new(assignments, chat_lock.into()))),
+            chat_activity: Arc::new(ChatActivity::default()),
+            chat_turn: None,
         }
+    }
+
+    /// Keep every model needed by this chat turn in the foreground. Upkeep
+    /// yields until the turn completes, then for a further two idle minutes.
+    pub fn for_chat(&self) -> Self {
+        self.chat_activity.record();
+        self.chat_activity
+            .active_turns
+            .fetch_add(1, Ordering::SeqCst);
+        Self {
+            pool: self.chat_pool.clone(),
+            chat_turn: Some(Arc::new(ChatTurn(self.chat_activity.clone()))),
+            ..self.clone()
+        }
+    }
+
+    fn chat_pause_remaining(&self, now: Instant) -> Option<Duration> {
+        self.chat_turn
+            .is_none()
+            .then(|| self.chat_activity.remaining(now, CHAT_QUIET_WINDOW))
+            .flatten()
+    }
+
+    fn wait_for_chat_quiet(&self, role: AgentRole) -> io::Result<Duration> {
+        let started = Instant::now();
+        let mut reported_wait = false;
+        while !self.chat_activity.stop_background.load(Ordering::SeqCst)
+            && let Some(remaining) = self.chat_pause_remaining(Instant::now())
+        {
+            if !reported_wait {
+                crate::diagnostics::event(
+                    "model.background_waiting_for_chat",
+                    serde_json::json!({
+                        "agent": role.name(),
+                        "quiet_window_ms": remaining.as_millis(),
+                    }),
+                );
+                reported_wait = true;
+            }
+            thread::sleep(remaining.min(CHAT_ACTIVITY_POLL));
+        }
+        if reported_wait {
+            crate::diagnostics::event(
+                "model.background_chat_wait_ended",
+                serde_json::json!({
+                    "agent": role.name(),
+                    "reason": if self.chat_activity.stop_background.load(Ordering::SeqCst) {
+                        "shutdown"
+                    } else {
+                        "quiet_window_elapsed"
+                    },
+                }),
+            );
+        }
+        if self.chat_turn.is_none() && self.chat_activity.stop_background.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "background inference stopped while waiting for chat",
+            ));
+        }
+        Ok(started.elapsed())
     }
 
     pub fn model(&self, role: AgentRole) -> LocalModel {
@@ -65,6 +181,12 @@ impl ModelRuntime {
     pub fn warm(&self, role: AgentRole) -> io::Result<()> {
         self.model(role).is_consolidated().map(|_| ())
     }
+
+    pub(crate) fn stop_background_waits(&self) {
+        self.chat_activity
+            .stop_background
+            .store(true, Ordering::SeqCst);
+    }
 }
 
 impl RoutedModel {
@@ -75,29 +197,78 @@ impl RoutedModel {
         &self,
         action: impl FnOnce(&mut LocalModel) -> io::Result<Result>,
     ) -> io::Result<Result> {
-        let mut pool = self
-            .runtime
-            .pool
-            .lock()
-            .map_err(|_| io::Error::other("model registry lock was poisoned"))?;
-        let _request_lease = super::acquire_model_lease(&pool.inference_lock)?;
-        let spec = pool.assignments.model(self.role).clone();
-        pool.loads += 1;
-        let lease = pool.inference_lock.with_extension(format!(
-            "resident-{}-{}",
-            std::process::id(),
-            pool.loads
-        ));
-        let model = pool.cache.get_or_load(&spec, || {
-            let result = (|| {
-                let checkpoint = super::checkpoint_path(&spec.directory)?;
-                LocalModel::load_checkpoint_with_lease(&spec.directory, &checkpoint, &spec.adapter, spec.cpu, &lease)
-            })();
-            let model = result.map_err(|error: io::Error| io::Error::new(error.kind(), format!("{} model {} ({}): {error}", self.role.name(), spec.id, spec.directory.display())))?;
-            crate::diagnostics::event("agent.model_loaded", serde_json::json!({"agent": self.role.name(), "model_id": spec.id, "model_dir": spec.directory}));
-            Ok(model)
-        })?;
-        action(model)
+        let mut quiet_wait = Duration::ZERO;
+        let mut pool_wait = Duration::ZERO;
+        let mut lease_wait = Duration::ZERO;
+        loop {
+            quiet_wait += self.runtime.wait_for_chat_quiet(self.role)?;
+            let pool_wait_started = Instant::now();
+            let mut pool = self
+                .runtime
+                .pool
+                .lock()
+                .map_err(|_| io::Error::other("model registry lock was poisoned"))?;
+            pool_wait += pool_wait_started.elapsed();
+            // A chat turn can start while this upkeep caller waits for its
+            // worker. Recheck the quiet window before occupying the lane.
+            if self.runtime.chat_pause_remaining(Instant::now()).is_some() {
+                drop(pool);
+                continue;
+            }
+            let lease_wait_started = Instant::now();
+            let _request_lease = super::acquire_model_lease(&pool.inference_lock)?;
+            lease_wait += lease_wait_started.elapsed();
+            crate::diagnostics::event(
+                "model.request_wait",
+                serde_json::json!({
+                    "agent": self.role.name(),
+                    "lane": if self.runtime.chat_turn.is_some() { "chat" } else { "background" },
+                    "quiet_wait_ms": quiet_wait.as_millis(),
+                    "pool_wait_ms": pool_wait.as_millis(),
+                    "process_lease_wait_ms": lease_wait.as_millis(),
+                }),
+            );
+            let spec = pool.assignments.model(self.role).clone();
+            pool.loads += 1;
+            let lease = pool.inference_lock.with_extension(format!(
+                "resident-{}-{}",
+                std::process::id(),
+                pool.loads
+            ));
+            let model = pool.cache.get_or_load(&spec, || {
+                let result = (|| {
+                    let checkpoint = super::checkpoint_path(&spec.directory)?;
+                    LocalModel::load_checkpoint_with_lease(
+                        &spec.directory,
+                        &checkpoint,
+                        &spec.adapter,
+                        spec.cpu,
+                        &lease,
+                    )
+                })();
+                let model = result.map_err(|error: io::Error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "{} model {} ({}): {error}",
+                            self.role.name(),
+                            spec.id,
+                            spec.directory.display()
+                        ),
+                    )
+                })?;
+                crate::diagnostics::event(
+                    "agent.model_loaded",
+                    serde_json::json!({
+                        "agent": self.role.name(),
+                        "model_id": spec.id,
+                        "model_dir": spec.directory
+                    }),
+                );
+                Ok(model)
+            })?;
+            return action(model);
+        }
     }
 
     pub(super) fn generate(
@@ -139,6 +310,17 @@ impl RoutedModel {
         let (text, thinking, _, _) = result?;
         self.last_thinking = thinking;
         Ok(text)
+    }
+}
+
+impl ModelPool {
+    fn new(assignments: Assignments, inference_lock: PathBuf) -> Self {
+        Self {
+            cache: ModelCache::new(assignments.capacity),
+            assignments,
+            inference_lock,
+            loads: 0,
+        }
     }
 }
 
@@ -466,17 +648,208 @@ mod tests {
     }
 
     #[test]
+    fn each_chat_message_extends_the_background_quiet_window() {
+        let activity = ChatActivity::default();
+        let started = Instant::now();
+        assert_eq!(activity.remaining(started, CHAT_QUIET_WINDOW), None);
+
+        activity.record_at(started);
+        assert_eq!(
+            activity.remaining(started + Duration::from_secs(119), CHAT_QUIET_WINDOW),
+            Some(Duration::from_secs(1))
+        );
+
+        let follow_up = started + Duration::from_secs(60);
+        activity.record_at(follow_up);
+        assert_eq!(
+            activity.remaining(started + Duration::from_secs(179), CHAT_QUIET_WINDOW),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            activity.remaining(started + Duration::from_secs(180), CHAT_QUIET_WINDOW),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_review_and_research_bypass_quiet_window_but_upkeep_does_not() {
+        let assignments = Assignments::with_lookup(default_model(), |_| None).unwrap();
+        let runtime = ModelRuntime::with_assignments(assignments);
+        let chat = runtime.for_chat();
+        let now = Instant::now();
+        runtime.chat_activity.record_at(now);
+
+        assert!(Arc::ptr_eq(&chat.pool, &runtime.chat_pool));
+        assert!(!Arc::ptr_eq(&chat.pool, &runtime.pool));
+        assert_ne!(
+            chat.pool.lock().unwrap().inference_lock,
+            runtime.pool.lock().unwrap().inference_lock,
+            "foreground and upkeep must not share the process request lock"
+        );
+        for role in [
+            AgentRole::Curmudgeon,
+            AgentRole::Scholar,
+            AgentRole::Interaction,
+        ] {
+            let LocalModel::Shared(chat_model) = chat.model(role) else {
+                panic!("expected shared handle")
+            };
+            assert_eq!(
+                chat_model.runtime.chat_pause_remaining(now),
+                None,
+                "{role:?} serving chat must proceed immediately"
+            );
+            assert_eq!(
+                runtime.chat_pause_remaining(now),
+                Some(CHAT_QUIET_WINDOW),
+                "{role:?} doing upkeep must yield to chat"
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_and_upkeep_request_leases_can_be_held_at_once() {
+        let runtime = ModelRuntime::with_assignments(
+            Assignments::with_lookup(default_model(), |_| None).unwrap(),
+        );
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let background_path = std::env::temp_dir().join(format!("lyra-background-{nonce}.lock"));
+        let chat_path = std::env::temp_dir().join(format!("lyra-chat-{nonce}.lock"));
+        runtime.pool.lock().unwrap().inference_lock = background_path.clone();
+        runtime.chat_pool.lock().unwrap().inference_lock = chat_path.clone();
+
+        let background_lease = super::super::acquire_model_lease(&background_path).unwrap();
+        let chat_lease = super::super::acquire_model_lease(&chat_path)
+            .expect("chat must acquire its lease while upkeep is using its own worker");
+        drop(chat_lease);
+        drop(background_lease);
+        let _ = std::fs::remove_file(background_path);
+        let _ = std::fs::remove_file(chat_path);
+    }
+
+    #[test]
+    fn slow_chat_and_its_cloned_models_keep_upkeep_paused_until_completion() {
+        let runtime = ModelRuntime::with_assignments(
+            Assignments::with_lookup(default_model(), |_| None).unwrap(),
+        );
+        let chat = runtime.for_chat();
+        let model = chat.model(AgentRole::Curmudgeon);
+        drop(chat);
+        let now = Instant::now();
+        runtime.chat_activity.record_at(now - CHAT_QUIET_WINDOW);
+        assert_eq!(runtime.chat_pause_remaining(now), Some(CHAT_QUIET_WINDOW));
+        drop(model);
+        // Completing the last foreground handle starts a fresh idle window.
+        assert!(runtime.chat_pause_remaining(Instant::now()).is_some());
+        runtime
+            .chat_activity
+            .record_at(Instant::now() - CHAT_QUIET_WINDOW);
+        assert_eq!(runtime.chat_pause_remaining(Instant::now()), None);
+    }
+
+    #[test]
+    fn shutdown_interrupts_background_waiting_for_the_chat_quiet_window() {
+        let runtime = ModelRuntime::with_assignments(
+            Assignments::with_lookup(default_model(), |_| None).unwrap(),
+        );
+        let chat = runtime.for_chat();
+        let LocalModel::Shared(background) = runtime.model(AgentRole::Curmudgeon) else {
+            panic!("expected shared handle")
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = thread::spawn(move || {
+            tx.send(background.with_model(|_| Ok(()))).unwrap();
+        });
+        thread::sleep(Duration::from_millis(30));
+        runtime.stop_background_waits();
+        let error = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown must release a quiet-window wait")
+            .unwrap_err();
+        thread.join().unwrap();
+        drop(chat);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn paused_upkeep_leaves_the_pool_available_for_chat_review_and_research() {
+        // Missing checkpoints exercise runtime scheduling without loading a
+        // model or competing with a running application for its request lock.
+        let mut spec = default_model();
+        spec.directory =
+            std::env::temp_dir().join(format!("lyra-chat-priority-absent-{}", std::process::id()));
+        let runtime =
+            ModelRuntime::with_assignments(Assignments::with_lookup(spec, |_| None).unwrap());
+        let lock = std::env::temp_dir().join(format!(
+            "lyra-chat-priority-requests-{}.lock",
+            std::process::id()
+        ));
+        runtime.pool.lock().unwrap().inference_lock = lock.clone();
+        let chat = runtime.for_chat();
+        let LocalModel::Shared(background) = runtime.model(AgentRole::Curmudgeon) else {
+            panic!("expected shared handle")
+        };
+        let (background_tx, background_rx) = std::sync::mpsc::channel();
+        let background_thread = thread::spawn(move || {
+            let result = background.with_model(|_| Ok(()));
+            background_tx.send(result).unwrap();
+        });
+        let background_paused = matches!(
+            background_rx.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let (chat_tx, chat_rx) = std::sync::mpsc::channel();
+        let chat_thread = thread::spawn(move || {
+            let results = [AgentRole::Curmudgeon, AgentRole::Scholar].map(|role| {
+                let LocalModel::Shared(model) = chat.model(role) else {
+                    panic!("expected shared handle")
+                };
+                model.with_model(|_| Ok(())).unwrap_err().to_string()
+            });
+            chat_tx.send(results).unwrap();
+        });
+        let errors = chat_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("chat models were delayed by the quiet window");
+        chat_thread.join().unwrap();
+        // Expire the idle window after the foreground handles are released.
+        runtime
+            .chat_activity
+            .record_at(Instant::now() - CHAT_QUIET_WINDOW);
+        background_thread.join().unwrap();
+        let _ = std::fs::remove_file(lock);
+        assert!(background_paused, "upkeep started during the quiet window");
+        assert!(errors[0].contains("curmudgeon model"));
+        assert!(errors[1].contains("scholar model"));
+    }
+
+    #[test]
     fn missing_role_checkpoint_does_not_load_a_fallback_model() {
         let mut spec = default_model();
         spec.directory =
             std::env::temp_dir().join(format!("lyra-absent-checkpoint-{}", std::process::id()));
         let assignments = Assignments::with_lookup(spec, |_| None).unwrap();
         let runtime = ModelRuntime::with_assignments(assignments);
+        // This missing-file test never performs inference. Give it its own
+        // request lock so a live resident model cannot delay the assertion.
+        let request_lock = std::env::temp_dir().join(format!(
+            "lyra-missing-checkpoint-requests-{}.lock",
+            std::process::id()
+        ));
+        runtime.pool.lock().unwrap().inference_lock = request_lock.clone();
         let LocalModel::Shared(model) = runtime.model(AgentRole::Curmudgeon) else {
             panic!("expected shared handle")
         };
         let error = model.with_model(|_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("curmudgeon model"));
         assert!(runtime.pool.lock().unwrap().cache.entries.is_empty());
+        let _ = std::fs::remove_file(request_lock);
     }
 }

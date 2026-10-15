@@ -12,13 +12,19 @@
 
 Qwen3.5 uses hybrid linear/full attention and is not interchangeable with Qwen3. This switch uses MLX-LM's Qwen3.5 implementation for text; the application does not expose vision inputs. Weights remain unquantized BF16.
 
+The original setup above selected BF16. The MLX worker now also accepts
+quantized Qwen3.5 checkpoints through MLX-LM's quantization-aware loader. A local
+4-bit 2B checkpoint is being evaluated separately; it is not the active
+configuration. Output adapters stay separate for quantized bases, and merge
+requests are refused to avoid writing an invalid checkpoint.
+
 ## Completed switch
 
 - Active configuration: `Qwen/Qwen3.5-2B`, `models/qwen3.5-2b`, a fresh
   `state/adapter-qwen3.5-2b.safetensors`, and `state/agent-qwen3.5-2b.json`.
 - Installed isolated `.venv-qwen35` with `mlx-lm==0.32.0`; the Python worker
   is embedded in the Rust binary and lives only while its model instance lives.
-- Downloaded official BF16 weights; quantized configurations are rejected.
+- Downloaded official BF16 weights; the initial runtime required BF16.
   Text inference uses MLX's Qwen3.5 hybrid attention implementation.
 - Preserved all 94 CLI messages (47 turns), plus nine browser conversations:
   168 messages in total. Verified full history equality and unchanged IDs.

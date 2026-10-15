@@ -7,6 +7,7 @@ config.toml
 *.example
 evals/
 evals/__pycache__/
+__pycache__/
 evals/results/**/*.db
 evals/results/**/*.db-wal
 evals/results/**/*.db-shm

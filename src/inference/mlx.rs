@@ -26,10 +26,33 @@ impl Worker {
         Ok(response)
     }
     fn request(&mut self, request: &serde_json::Value) -> io::Result<serde_json::Value> {
-        serde_json::to_writer(&mut self.input, request).map_err(other)?;
+        serde_json::to_writer(&mut self.input, request)?;
         self.input.write_all(b"\n")?;
         self.input.flush()?;
         self.read()
+    }
+
+    fn request_with_restart(
+        &mut self,
+        request: &serde_json::Value,
+        restart: impl FnOnce() -> io::Result<Worker>,
+    ) -> io::Result<serde_json::Value> {
+        match self.request(request) {
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                crate::diagnostics::event(
+                    "model.worker_restarting",
+                    serde_json::json!({"backend":"mlx","reason":error.to_string()}),
+                );
+                let mut replacement = restart()?;
+                let ready = replacement.read()?;
+                if ready["ready"] != true {
+                    return Err(other("restarted MLX worker did not signal readiness"));
+                }
+                *self = replacement;
+                self.request(request)
+            }
+            result => result,
+        }
     }
 }
 impl Drop for Worker {
@@ -41,6 +64,8 @@ impl Drop for Worker {
 
 pub struct MlxModel {
     worker: Mutex<Worker>,
+    python: PathBuf,
+    init: serde_json::Value,
     tokenizer: Tokenizer,
     supports_thinking: bool,
     max_context: usize,
@@ -64,15 +89,6 @@ impl MlxModel {
         }
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json"))?).map_err(other)?;
-        if config.get("quantization").is_some_and(|v| !v.is_null())
-            || config
-                .get("quantization_config")
-                .is_some_and(|v| !v.is_null())
-        {
-            return Err(invalid(
-                "Qwen3.5 must use the original non-quantized BF16 checkpoint",
-            ));
-        }
         let native = config["text_config"]["max_position_embeddings"]
             .as_u64()
             .ok_or_else(|| invalid("Qwen3.5 text context is missing"))?
@@ -89,24 +105,7 @@ impl MlxModel {
                 Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv-qwen35/bin/python")
             });
         let init = serde_json::json!({"model_dir": dir, "checkpoints": checkpoints, "adapter": adapter, "context_tokens": max_context});
-        let mut child = Command::new(python).arg("-u").arg("-c").arg(include_str!("../../scripts/mlx_worker.py")).arg(init.to_string())
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn()
-            .map_err(|error| other(format!("could not start MLX worker; install scripts/requirements-mlx.txt in .venv-qwen35: {error}")))?;
-        let input = child
-            .stdin
-            .take()
-            .ok_or_else(|| other("MLX worker stdin is unavailable"))?;
-        let output = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| other("MLX worker stdout is unavailable"))?,
-        );
-        let mut worker = Worker {
-            child,
-            input,
-            output,
-        };
+        let mut worker = spawn_worker(&python, &init)?;
         let ready = worker.read()?;
         if ready["ready"] != true {
             return Err(other("MLX worker did not signal readiness"));
@@ -120,10 +119,12 @@ impl MlxModel {
         }
         crate::diagnostics::event(
             "model.loaded",
-            serde_json::json!({"model_dir":dir,"backend":"mlx","precision":"BF16","shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":"qwen3_5_no_thinking","adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
+            serde_json::json!({"model_dir":dir,"backend":"mlx","precision":ready["precision"],"quantization":ready["quantization"],"shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":"qwen3_5_no_thinking","adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
         );
         Ok(Self {
             worker: Mutex::new(worker),
+            python,
+            init,
             tokenizer,
             supports_thinking,
             max_context,
@@ -134,10 +135,11 @@ impl MlxModel {
         })
     }
     fn request(&self, value: serde_json::Value) -> io::Result<serde_json::Value> {
-        self.worker
+        let mut worker = self
+            .worker
             .lock()
-            .map_err(|_| other("MLX worker lock is poisoned"))?
-            .request(&value)
+            .map_err(|_| other("MLX worker lock is poisoned"))?;
+        worker.request_with_restart(&value, || spawn_worker(&self.python, &self.init))
     }
     fn ids(&self, messages: &[Message], thinking: bool) -> io::Result<Vec<u32>> {
         self.tokenizer
@@ -167,7 +169,7 @@ impl MlxModel {
         thinking: bool,
     ) -> io::Result<String> {
         self.last_thinking = None;
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             let use_thinking = thinking && attempt == 0 && self.supports_thinking;
             let ids = self.ids(messages, use_thinking)?;
             if ids.is_empty() || ids.len() > self.max_context - MIN_REPLY {
@@ -175,7 +177,8 @@ impl MlxModel {
                     "full conversation exceeds the configured context limit; no history was discarded",
                 ));
             }
-            let limit = reply_budget(ids.len(), extra, self.max_context, cap);
+            let requested_cap = cap.saturating_mul(1usize << attempt);
+            let limit = reply_budget(ids.len(), extra, self.max_context, requested_cap);
             let initial_budget = thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1));
             let stops = [
                 self.tokenizer.token_to_id("<|im_end|>").unwrap(),
@@ -257,6 +260,25 @@ impl MlxModel {
                 );
             }
             let decoded = self.tokenizer.decode(&tokens, true).map_err(other)?;
+            if response["finish_reason"] == "max_tokens" {
+                if use_thinking && let Ok((Some(thought), _)) = generation_reply(&decoded, true) {
+                    self.last_thinking = Some(format!(
+                        "[Thinking retained from an output-cap retry.]\n{thought}"
+                    ));
+                }
+                if attempt < 2 {
+                    crate::diagnostics::event(
+                        "model.output_budget_extended",
+                        serde_json::json!({"attempt":attempt+1,"previous_budget":limit,
+                            "next_budget":requested_cap.saturating_mul(2).min(self.max_context),
+                            "reasoning_retained":self.last_thinking.is_some()}),
+                    );
+                    continue;
+                }
+                return Err(invalid(
+                    "generation remained truncated after two output-budget increases",
+                ));
+            }
             crate::diagnostics::event(
                 "model.generation",
                 serde_json::json!({"backend":"mlx","attempt":attempt+1,"prompt_tokens":ids.len(),"reply_limit":limit,"generated_tokens":tokens.len(),"thinking_enabled":use_thinking,"thinking_tokens":response["thinking_tokens"],"finish_reason":response["finish_reason"],"memory":response["memory"]}),
@@ -273,7 +295,7 @@ impl MlxModel {
                         "model.reply_recovery",
                         serde_json::json!({"attempt":attempt+1,"reason":error.to_string(),"finish_reason":response["finish_reason"],"generated_output_excerpt":decoded.chars().take(1200).collect::<String>(),"action":if attempt==0 {"retry_without_thinking"} else {"fail_after_retry"}}),
                     );
-                    if attempt == 1 {
+                    if attempt == 2 {
                         return Err(error);
                     }
                     if thinking {
@@ -352,6 +374,38 @@ impl MlxModel {
     }
 }
 
+fn spawn_worker(python: &std::path::Path, init: &serde_json::Value) -> io::Result<Worker> {
+    let mut child = Command::new(python)
+        .arg("-u")
+        .arg("-c")
+        .arg(include_str!("../../scripts/mlx_worker.py"))
+        .arg(init.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            other(format!(
+                "could not start MLX worker; install scripts/requirements-mlx.txt in .venv-qwen35: {error}"
+            ))
+        })?;
+    let input = child
+        .stdin
+        .take()
+        .ok_or_else(|| other("MLX worker stdin is unavailable"))?;
+    let output = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| other("MLX worker stdout is unavailable"))?,
+    );
+    Ok(Worker {
+        child,
+        input,
+        output,
+    })
+}
+
 fn thinking_budget() -> usize {
     std::env::var("COMMUNITY_THINKING_TOKENS")
         .ok()
@@ -393,6 +447,23 @@ mod tests {
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
         }
+    }
+
+    #[test]
+    fn broken_worker_pipe_restarts_once_and_replays_request() {
+        let mut dead_worker = worker(
+            "import sys,json,time\nprint(json.dumps({'ready':True}),flush=True)\nsys.stdin.close()\ntime.sleep(.2)",
+        );
+        dead_worker.child.wait().unwrap();
+        let request = serde_json::json!({"op":"generate"});
+        let response = dead_worker
+            .request_with_restart(&request, || {
+                Ok(worker(
+                    "import sys,json\nprint(json.dumps({'ready':True}),flush=True)\nfor line in sys.stdin: print(json.dumps({'replayed':json.loads(line)['op']}),flush=True)",
+                ))
+            })
+            .unwrap();
+        assert_eq!(response["replayed"], "generate");
     }
 
     #[test]
@@ -465,6 +536,8 @@ mod tests {
         );
         let mut model = MlxModel {
             worker: Mutex::new(worker),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
             tokenizer,
             supports_thinking: true,
             max_context: 8192,
@@ -482,6 +555,124 @@ mod tests {
             model.last_thinking.as_deref(),
             Some("unfinished unfinished")
         );
+        drop(model);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn capped_generation_retries_without_thinking_at_a_larger_budget() {
+        let vocabulary = [
+            ("<unk>".into(), 0),
+            ("<|im_end|>".into(), 1),
+            ("<|endoftext|>".into(), 2),
+            ("<think>".into(), 3),
+            ("reasoning".into(), 4),
+            ("</think>".into(), 5),
+            ("partial".into(), 6),
+            ("Soup.".into(), 7),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocabulary)
+                .unk_token("<unk>".into())
+                .build()
+                .unwrap(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "community-cap-retry-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worker = worker(
+            "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<2\n if attempt==0:\n  assert request['thinking']\n  previous=request['max_tokens']\n  tokens=[3,4,5,6]\n  finish='max_tokens'\n else:\n  assert not request['thinking'] and request['max_tokens']>previous\n  tokens=[7]\n  finish='stop_token'\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':finish}),flush=True)",
+        );
+        let mut model = MlxModel {
+            worker: Mutex::new(worker),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
+            tokenizer,
+            supports_thinking: true,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(&path).unwrap(),
+        };
+        let messages = [Message {
+            role: "user".into(),
+            content: "How do I make soup?".into(),
+        }];
+        assert_eq!(model.chat(&messages, 0, 512, 0.1, true).unwrap(), "Soup.");
+        assert!(
+            model
+                .last_thinking
+                .as_deref()
+                .is_some_and(|thought| thought.contains("reasoning"))
+        );
+        drop(model);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persistently_capped_generation_stops_after_two_budget_increases() {
+        let vocabulary = [
+            ("<unk>".into(), 0),
+            ("<|im_end|>".into(), 1),
+            ("<|endoftext|>".into(), 2),
+            ("<think>".into(), 3),
+            ("reasoning".into(), 4),
+            ("</think>".into(), 5),
+            ("partial".into(), 6),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocabulary)
+                .unk_token("<unk>".into())
+                .build()
+                .unwrap(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "community-cap-stop-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worker = worker(
+            "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n if attempt:\n  assert not request['thinking'] and request['max_tokens']>previous\n previous=request['max_tokens']\n tokens=[3,4,5,6] if attempt==0 else [6]\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':'max_tokens'}),flush=True)",
+        );
+        let mut model = MlxModel {
+            worker: Mutex::new(worker),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
+            tokenizer,
+            supports_thinking: true,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(&path).unwrap(),
+        };
+        let messages = [Message {
+            role: "user".into(),
+            content: "How do I make soup?".into(),
+        }];
+        assert!(
+            model
+                .chat(&messages, 0, 512, 0.1, true)
+                .unwrap_err()
+                .to_string()
+                .contains("after two output-budget increases")
+        );
+        assert!(model.last_thinking.is_some());
         drop(model);
         fs::remove_file(path).unwrap();
     }

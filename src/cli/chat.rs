@@ -16,6 +16,7 @@ impl Cli {
         let state_path = &self.state_path;
         let agent = &mut self.agent;
         let map = &mut self.map;
+        let chat_runtime = self.model_runtime.for_chat();
         if args.next().is_some() {
             return Err("chat takes no arguments".into());
         }
@@ -25,9 +26,9 @@ impl Cli {
                 database_path.display()
             )
         })?;
-        let mut backend = self.model_runtime.model(AgentRole::Interaction);
-        let mut research_model = self.model_runtime.model(AgentRole::Curmudgeon);
-        let mut scholar_model = self.model_runtime.model(AgentRole::Scholar);
+        let mut backend = chat_runtime.model(AgentRole::Interaction);
+        let mut research_model = chat_runtime.model(AgentRole::Curmudgeon);
+        let mut scholar_model = chat_runtime.model(AgentRole::Scholar);
         let curator = curator::CuratorHandle::spawn(
             database_path.to_string_lossy().into_owned(),
             knowledge_path.to_string_lossy().into_owned(),
@@ -84,6 +85,10 @@ impl Cli {
                 println!("[model thinking]\n{thinking}");
             }
         }
+        drop(backend);
+        drop(research_model);
+        drop(scholar_model);
+        drop(chat_runtime);
         curator.stop();
         Ok(())
     }
@@ -126,9 +131,10 @@ impl Cli {
                 database_path.display()
             )
         })?;
-        let mut backend = self.model_runtime.model(AgentRole::Interaction);
-        let mut research_model = self.model_runtime.model(AgentRole::Curmudgeon);
-        let mut scholar_model = self.model_runtime.model(AgentRole::Scholar);
+        let chat_runtime = self.model_runtime.for_chat();
+        let mut backend = chat_runtime.model(AgentRole::Interaction);
+        let mut research_model = chat_runtime.model(AgentRole::Curmudgeon);
+        let mut scholar_model = chat_runtime.model(AgentRole::Scholar);
         let reply = agent
             .reply(
                 &input,
