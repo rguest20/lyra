@@ -30,26 +30,140 @@ fn event_years_and_unquoted_scopes_do_not_become_claim_metadata() {
 }
 
 #[test]
-fn rejected_member_to_member_list_claim_recovers_only_a_matching_source_list() {
+fn dated_measurements_keep_the_event_date_and_value_in_the_claim() {
+    let passage = "The 2010 census recorded Willow Bay's population as 1,200.";
+    let raw = serde_json::json!({"claim":{
+        "subject":"Willow Bay",
+        "relation":"had a census-recorded population in 2010 of",
+        "object":"1,200",
+        "evidence_text":passage,
+        "confidence":0.98,
+        "question_relevance":"direct",
+        "valid_from":"2010",
+        "valid_until":null
+    }})
+    .to_string();
+    let mut reviews = 0;
+    let attempt = evaluate_extraction_semantically(
+        &raw,
+        "What population did Willow Bay have in 2010 and in 2020?",
+        "Willow Bay census",
+        passage,
+        "reference",
+        None,
+        |_| {
+            reviews += 1;
+            Ok(serde_json::json!({
+                "verdict":"entailed",
+                "reason":"The quote reports this census value for the named year.",
+                "evidence_text":passage
+            })
+            .to_string())
+        },
+    );
+    assert_eq!(attempt.status, "accepted", "{}", attempt.reason);
+    let finding = attempt.finding.unwrap();
+    assert!(finding.relation.contains("2010"));
+    assert_eq!(finding.object, "1,200");
+    assert_eq!(finding.valid_from, None);
+    assert_eq!(reviews, 2);
+}
+
+#[test]
+fn property_reconsideration_recovers_a_specific_part_of_a_multi_part_question() {
+    let passage = "The 2010 census recorded Willow Bay's population as 1,200.";
+    let attempt = evaluate_extraction(
+        &serde_json::json!({"claim":{
+            "subject":"Willow Bay",
+            "relation":"had a census-recorded population in 2010 of",
+            "object":"1,200",
+            "evidence_text":passage,
+            "confidence":0.98,
+            "question_relevance":"direct"
+        }})
+        .to_string(),
+        passage,
+        "Willow Bay census",
+        None,
+    );
+    let finding = attempt.finding.unwrap();
+    let mut calls = 0;
+    let mut ask = |messages: &[Message]| {
+        calls += 1;
+        Ok(match calls {
+            1 => {
+                assert!(
+                    messages[0]
+                        .content
+                        .contains("one explicit component or time slice of a multi-part question")
+                );
+                serde_json::json!({
+                    "matches_property":false,
+                    "reason":"This claim only answers one of the requested years."
+                })
+                .to_string()
+            }
+            2 => {
+                assert!(
+                    messages[0]
+                        .content
+                        .contains("Independently reconsider a prior finding")
+                );
+                serde_json::json!({
+                    "matches_property":true,
+                    "request_component":"2010",
+                    "reason":"This source directly answers the requested 2010 component."
+                })
+                .to_string()
+            }
+            _ => panic!("partial property reconsideration must be bounded"),
+        })
+    };
+    let (matches, _) = property_repair::requested_property_match(
+        "What population did Willow Bay have in 2010 and in 2020?",
+        &finding,
+        passage,
+        &mut ask,
+    )
+    .unwrap();
+    assert!(matches);
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn rejected_list_claim_recovers_through_a_bounded_semantic_repair() {
     let passage = "Birds recorded on Alder Island include puffins and Arctic terns.";
     let raw = serde_json::json!({"claim":{"subject":"puffins","relation":"include","object":"Arctic terns","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string();
-    let rejected = || {
-        serde_json::json!({"verdict":"insufficient","reason":"The quote does not state a relation between list members.","evidence_text":null}).to_string()
-    };
-    let recovered = evaluate_extraction_semantically(
-        &raw,
+    let mut calls = 0;
+    let recovered = extract_scholar_claim_with(
         "Which birds are recorded on Alder Island?",
         "Alder Island",
         passage,
         "reference",
         None,
-        |_| Ok(rejected()),
+        None,
+        |messages| {
+            calls += 1;
+            Ok(match calls {
+                1 => raw.clone(),
+                2 => serde_json::json!({"verdict":"insufficient","reason":"The quote does not state a relation between list members.","evidence_text":null}).to_string(),
+                3 => serde_json::json!({"verdict":"insufficient","reason":"The listed birds do not assert a relation between the two members.","evidence_text":null}).to_string(),
+                4 => {
+                    assert!(messages[0].content.contains("bounded repair attempt"));
+                    serde_json::json!({"claim":{"subject":"Birds recorded on Alder Island","relation":"include","object":"puffins and Arctic terns","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
+                }
+                5 => serde_json::json!({"verdict":"entailed","reason":"The source names both birds as members of the recorded list.","evidence_text":passage}).to_string(),
+                6 => serde_json::json!({"verdict":"entailed","reason":"The claim names the containing list and its members accurately.","evidence_text":passage}).to_string(),
+                _ => panic!("list extraction repair must remain bounded"),
+            })
+        },
     );
     assert_eq!(recovered.status, "accepted", "{}", recovered.reason);
+    assert_eq!(calls, 6);
     let finding = recovered.finding.unwrap();
     assert_eq!(finding.subject, "Birds recorded on Alder Island");
     assert_eq!(finding.object, "puffins and Arctic terns");
-    assert!(finding.semantic_support.is_none());
+    assert!(finding.semantic_support.is_some());
 
     let unrelated = evaluate_extraction_semantically(
         &raw,
@@ -58,14 +172,16 @@ fn rejected_member_to_member_list_claim_recovers_only_a_matching_source_list() {
         passage,
         "reference",
         None,
-        |_| Ok(rejected()),
+        |_| {
+            Ok(serde_json::json!({"verdict":"insufficient","reason":"The source does not name Birch Island.","evidence_text":null}).to_string())
+        },
     );
     assert_eq!(unrelated.status, "ungrounded");
     assert!(unrelated.finding.is_none());
 }
 
 #[test]
-fn exact_subject_relation_object_quote_survives_a_false_negative_semantic_review() {
+fn semantic_rejection_is_not_overridden_by_exact_claim_wording() {
     let quote = "The exact date of discovery of most elements cannot be accurately determined.";
     let raw = serde_json::json!({"claim":{"subject":"The exact date of discovery of most elements","relation":"cannot be","object":"accurately determined","evidence_text":quote,"confidence":0.98,"question_relevance":"direct"}}).to_string();
     let result = evaluate_extraction_semantically(
@@ -79,8 +195,8 @@ fn exact_subject_relation_object_quote_survives_a_false_negative_semantic_review
             Ok(serde_json::json!({"verdict":"insufficient","reason":"The source does not provide the specific dates.","evidence_text":null}).to_string())
         },
     );
-    assert_eq!(result.status, "accepted", "{}", result.reason);
-    assert_eq!(result.finding.unwrap().evidence_text, quote);
+    assert_eq!(result.status, "ungrounded", "{}", result.reason);
+    assert!(result.finding.is_none());
 }
 
 #[test]
@@ -167,20 +283,21 @@ fn currency_repair_can_extract_a_historical_property_without_claiming_currentnes
             }
             Ok(match calls {
                     1 => serde_json::json!({"claim":null}).to_string(),
-                    2 => serde_json::json!({"property_spans":["instruments", "exhibit"],"constraint_spans":[]}).to_string(),
-                    3 => {
+                2 | 3 => serde_json::json!({"requires_present_state":true,"requires_latest_knowledge":false,"uncertain":false,"reason":"The user asks about what is exhibited at present."}).to_string(),
+                4 => serde_json::json!({"property_spans":["instruments", "exhibit"],"constraint_spans":[]}).to_string(),
+                5 => {
                         assert!(!messages[1].content.contains("currently"));
                         assert!(messages[1].content.contains("Riverton Museum"));
                         serde_json::json!({"claim":{"subject":"Riverton Museum","relation":"displayed",
                             "object":"an astrolabe","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
                     },
-                    4 => serde_json::json!({"verdict":"entailed","reason":"The source states the dated exhibit.","evidence_text":passage}).to_string(),
+                6 | 7 => serde_json::json!({"verdict":"entailed","reason":"The source states the dated exhibit.","evidence_text":passage}).to_string(),
                     _ => panic!("repair must be bounded"),
                 })
         },
     );
     assert_eq!(result.status, "accepted", "{}", result.reason);
-    assert_eq!(calls, 4);
+    assert_eq!(calls, 7);
     let finding = result.finding.unwrap();
     assert_eq!(finding.evidence_text, passage);
     assert!(finding.valid_from.is_none());
@@ -202,17 +319,19 @@ fn physical_current_does_not_trigger_temporal_property_repair() {
             calls += 1;
             Ok(match calls {
                 1 => serde_json::json!({"claim":null}).to_string(),
-                2 => {
+                2 | 3 => serde_json::json!({"requires_present_state":false,"requires_latest_knowledge":false,"uncertain":false,"reason":"The question asks for a physical measurement."}).to_string(),
+                4 => {
                     assert!(messages[0].content.contains("bounded repair attempt"));
                     assert!(messages[1].content.contains("previous extraction failed validation"));
                     serde_json::json!({"claim":{"subject":"Meridian Laboratory","relation":"measured","object":"an electric current of two amperes","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
                 }
-                3 => serde_json::json!({"verdict":"entailed","reason":"The quoted passage states the measured electrical quantity.","evidence_text":passage}).to_string(),
+                5 => serde_json::json!({"verdict":"entailed","reason":"The quoted passage states the measured electrical quantity.","evidence_text":passage}).to_string(),
+                6 => serde_json::json!({"verdict":"entailed","reason":"The source directly states the measured quantity.","evidence_text":passage}).to_string(),
                 _ => panic!("repair must be bounded"),
             })
         },
     );
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 6);
     assert_eq!(result.status, "accepted", "{}", result.reason);
 }
 
@@ -240,20 +359,25 @@ fn property_mismatch_repairs_from_a_ranked_span_of_the_same_multi_fact_source() 
                         "confidence":0.98,
                         "question_relevance":"direct"
                     }}).to_string(),
-                    2 | 5 => serde_json::json!({
+                    2 => serde_json::json!({
                         "verdict":"entailed",
                         "reason":"The claim matches the quoted source sentence.",
-                        "evidence_text": if calls == 2 { chronology } else { date_limit }
+                        "evidence_text": chronology
                     }).to_string(),
-                    3 => {
-                        assert!(messages[0].content.contains("strict question-to-claim entailment"));
-                        assert!(messages[0].content.contains("chronology/order does not answer whether something is knowable or determinable"));
+                    3 => serde_json::json!({
+                        "verdict":"entailed",
+                        "reason":"The candidate faithfully represents the source passage.",
+                        "evidence_text":chronology
+                    }).to_string(),
+                    4 | 5 => {
+                        assert!(messages[0].content.contains(if calls == 4 { "strict question-to-claim entailment" } else { "Independently reconsider" }));
+                        if calls == 4 { assert!(messages[0].content.contains("chronology/order does not answer whether something is knowable or determinable")); }
                         serde_json::json!({
                             "matches_property":false,
                             "reason":"Chronological ordering does not state whether exact discovery dates can be determined."
                         }).to_string()
                     }
-                    4 => {
+                    6 => {
                         assert!(messages[0].content.contains("one bounded same-passage repair"));
                         assert!(messages[0].content.contains("identify the requested answer type"));
                         assert!(messages[1].content.contains("exact date of discovery of most elements cannot be accurately determined"));
@@ -268,7 +392,17 @@ fn property_mismatch_repairs_from_a_ranked_span_of_the_same_multi_fact_source() 
                             "question_relevance":"direct"
                         }}).to_string()
                     }
-                    6 => serde_json::json!({
+                    7 => serde_json::json!({
+                        "verdict":"entailed",
+                        "reason":"The repaired claim preserves the source's stated limitation.",
+                        "evidence_text":date_limit
+                    }).to_string(),
+                    8 => serde_json::json!({
+                        "verdict":"entailed",
+                        "reason":"The repaired claim preserves the source's uncertainty about dates.",
+                        "evidence_text":date_limit
+                    }).to_string(),
+                    9 => serde_json::json!({
                         "matches_property":true,
                         "reason":"The claim directly states the source's limit on determining exact discovery dates."
                     }).to_string(),
@@ -276,7 +410,7 @@ fn property_mismatch_repairs_from_a_ranked_span_of_the_same_multi_fact_source() 
                 })
         },
     );
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 9);
     assert_eq!(result.status, "accepted", "{}", result.reason);
     let finding = result.finding.unwrap();
     assert_eq!(finding.evidence_text, date_limit);
@@ -307,18 +441,24 @@ fn rejected_property_repair_keeps_the_original_supported_fact() {
                     "question_relevance":"direct"
                 }})
                 .to_string(),
-                2 | 5 => serde_json::json!({
+                2 | 7 => serde_json::json!({
                     "verdict":"entailed",
                     "reason":"The claim matches the quoted source sentence.",
                     "evidence_text":chronology
                 })
                 .to_string(),
-                3 | 6 => serde_json::json!({
+                3 | 8 => serde_json::json!({
+                    "verdict":"entailed",
+                    "reason":"The original chronology statement is accurately represented.",
+                    "evidence_text":chronology
+                })
+                .to_string(),
+                4 | 5 | 9 | 10 => serde_json::json!({
                     "matches_property":false,
                     "reason":"This sentence describes chronology, not discovery-date certainty."
                 })
                 .to_string(),
-                4 => serde_json::json!({"claim":{
+                6 => serde_json::json!({"claim":{
                     "subject":"The discoveries of the 118 chemical elements",
                     "relation":"are listed",
                     "object":"in chronological order",
@@ -331,7 +471,7 @@ fn rejected_property_repair_keeps_the_original_supported_fact() {
             })
         },
     );
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 10);
     let finding = result.finding.unwrap();
     assert_eq!(finding.evidence_text, chronology);
     assert_eq!(finding.object, "in chronological order");

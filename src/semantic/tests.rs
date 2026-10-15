@@ -24,8 +24,12 @@ fn evidence_entailment_is_not_primed_by_answer_requirements() {
         "What did Walkers sell in 2018?",
         "What is the complete current Walkers range?",
     ] {
+        let mut first_assessment = true;
         let support = assess_with(question, "Source", passage, &finding, |messages| {
-            packets.push(messages[1].content.clone());
+            if first_assessment {
+                packets.push(messages[1].content.clone());
+                first_assessment = false;
+            }
             Ok(serde_json::json!({"verdict":"entailed","reason":"The candidate is the dated source assertion.","evidence_text":passage}).to_string())
         }).unwrap();
         assert_eq!(support.verdict(), "entailed");
@@ -62,11 +66,19 @@ fn assessment_allows_paraphrase_and_is_bound_to_claim_quote_and_dates() {
     let mut finding = candidate();
     let passage = "The world is spherical.";
     let support = assess_with("What shape is the world?", "World", passage, &finding, |messages| {
-        assert!(messages[0].content.contains("topic similarity"));
-        assert!(messages[0].content.contains("A property of a part or member does not automatically apply to the whole"));
-        assert!(messages[0].content.contains("candidate's actual subject/relation/object is entailed by candidate_evidence_to_check_first"));
-        assert!(messages[1].content.contains("candidate_evidence_to_check_first"));
-        assert!(!messages[1].content.contains("source_passage"));
+        if messages[0].content.contains("independent semantic support reviewer") {
+            assert!(messages[0].content.contains("topic similarity"));
+            assert!(messages[0].content.contains("A property of a part or member does not automatically apply to the whole"));
+            assert!(messages[0].content.contains("candidate's actual subject/relation/object is entailed by candidate_evidence_to_check_first"));
+            assert!(messages[1].content.contains("candidate_evidence_to_check_first"));
+            assert!(!messages[1].content.contains("source_passage"));
+        } else {
+            assert!(messages[0]
+                .content
+                .contains("independent second semantic adjudicator"));
+            assert!(messages[1].content.contains("source_passage"));
+            assert!(!messages[1].content.contains("research_question"));
+        }
         Ok(serde_json::json!({"verdict":"entailed","reason":"Spherical entails round in this shape context.","evidence_text":passage}).to_string())
     }).unwrap();
     finding.evidence_text = passage.into();
@@ -112,4 +124,27 @@ fn qualified_contradicted_and_insufficient_are_not_support() {
         finding.evidence_text = support.evidence().into();
         assert!(!support.supports(&finding, "The world is not exactly spherical."));
     }
+}
+
+#[test]
+fn rejected_verdict_accepts_empty_quote_as_no_evidence_but_never_as_support() {
+    let finding = candidate();
+    let support = parse(
+        r#"{"verdict":"insufficient","reason":"The passage does not support the claim.","evidence_text":""}"#,
+        &finding,
+        "The world is spherical.",
+    )
+    .unwrap();
+    assert_eq!(support.verdict(), "insufficient");
+    assert!(support.evidence().is_empty());
+    assert!(!support.supports(&finding, "The world is spherical."));
+
+    assert!(
+        parse(
+            r#"{"verdict":"entailed","reason":"The passage supports it.","evidence_text":""}"#,
+            &finding,
+            "The world is spherical.",
+        )
+        .is_err()
+    );
 }

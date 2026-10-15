@@ -98,6 +98,22 @@ pub fn process_once(
         return review_retained_claims(&store, model).map(usize::from);
     };
     let result = (|| {
+        let context = store.assistant_reply_context(&job.id)?;
+        let review =
+            crate::agent::conversation_review::assess_with(&context, &job.reply_text, |messages| {
+                model.chat_for_extraction(messages)
+            });
+        store.record_conversation_review(
+            &job.id,
+            &review.verdict,
+            &review.reason,
+            &model.model_id()?,
+            &context,
+        )?;
+        crate::diagnostics::event(
+            "conversation.reply_quality_audited",
+            serde_json::json!({"reply_id":job.id,"verdict":review.verdict,"reason":review.reason,"advisory_only":true}),
+        );
         let claims = extract_claims(model, &job.reply_text)?;
         let map = KnowledgeMap::load(knowledge_path)?;
         let today = store.utc_date()?;

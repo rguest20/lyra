@@ -3,10 +3,12 @@ use crate::{agent::Message, storage::ScholarEvidenceForAnswer};
 use serde::{Deserialize, Serialize};
 use std::io;
 
+mod json;
+pub(crate) use json::{close_json_delimiters, json_object};
 mod request;
-pub(crate) use request::{
-    currentness_request_with, external_fact_request_with, property_request_with,
-};
+pub(crate) use request::{external_fact_request_with, property_request_with};
+mod currentness;
+pub(crate) use currentness::currentness_request_with;
 mod selection;
 pub(crate) use selection::select_evidence_with_context;
 pub use selection::select_sections_with;
@@ -44,22 +46,6 @@ pub(crate) fn source_independence_request(question: &str) -> bool {
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-pub(crate) fn json_object(raw: &str) -> io::Result<serde_json::Value> {
-    let start = raw
-        .find('{')
-        .ok_or_else(|| invalid("model omitted JSON object"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| invalid("model returned incomplete JSON"))?;
-    serde_json::from_str(&raw[start..=end]).map_err(|_| {
-        crate::diagnostics::event(
-            "research.invalid_json",
-            serde_json::json!({"output":raw.chars().take(2000).collect::<String>()}),
-        );
-        invalid("model returned invalid JSON")
-    })
 }
 
 /// Private-fact guard, separate from semantic intent: asking one's own favourite
@@ -139,6 +125,14 @@ pub fn plan_with(
     ];
     for attempt in 0..2 {
         let raw = ask(&messages)?;
+        crate::diagnostics::research_decision(
+            "conversation.fact_research_assessed",
+            serde_json::json!({
+                "request":question,
+                "attempt":attempt+1,
+                "model_output":raw.chars().take(1200).collect::<String>(),
+            }),
+        );
         let parsed = parse_plan(&raw).and_then(|plan| {
             if let Some(plan) = &plan {
                 for name in crate::entities::possessive_names(question) {
@@ -232,13 +226,76 @@ pub fn retrieval_queries_with(
 mod tests {
     use super::*;
 
+    fn select_test_evidence_with_context(
+        question: &str,
+        candidates: Vec<ScholarEvidenceForAnswer>,
+        entity_constraints: &[String],
+        aliases: &crate::storage::EntityAliases,
+        topic_queries: &[String],
+        mut ask: impl FnMut(&[Message]) -> io::Result<String>,
+    ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
+        select_evidence_with_context(
+            question,
+            candidates,
+            entity_constraints,
+            aliases,
+            topic_queries,
+            |messages| {
+                if messages[0]
+                    .content
+                    .contains("Extract requested PROPERTY or RELATION words")
+                {
+                    let data: serde_json::Value =
+                        serde_json::from_str(&messages[1].content).unwrap();
+                    let request = data["request"].as_str().unwrap();
+                    return Ok(serde_json::json!({
+                        "property_spans":[request],
+                        "constraint_spans":[]
+                    })
+                    .to_string());
+                }
+                ask(messages)
+            },
+        )
+    }
+
+    #[test]
+    fn conflicting_temporal_assessments_remain_unresolved() {
+        let mut calls = 0;
+        let classification = currentness_request_with(
+            "What population did Willow Bay have in 2010 and in 2020?",
+            |messages| {
+                calls += 1;
+                match calls {
+                    1 => {
+                        assert!(messages[0].content.contains(
+                            "A changing property can be requested at a specified earlier time"
+                        ));
+                        Ok(r#"{"requires_present_state":true,"requires_latest_knowledge":false,"uncertain":false,"reason":"Population changes, and the user asks for figures from 2010 and 2020."}"#.into())
+                    }
+                    2 => {
+                        assert!(
+                            messages[0]
+                                .content
+                                .contains("Independently reconsider whether answering")
+                        );
+                        Ok(r#"{"requires_present_state":false,"requires_latest_knowledge":false,"uncertain":false,"reason":"The two specified past years fully define the requested values; no present-day data is needed."}"#.into())
+                    }
+                    _ => panic!("currentness reconsideration must be bounded"),
+                }
+            },
+        );
+        assert_eq!(classification, None);
+        assert_eq!(calls, 2);
+    }
+
     #[test]
     fn selected_quotes_restore_source_apostrophes_and_keep_original_text() {
         let passage = "The Orion Nebula is seen in Orion’s sword.";
         let mut candidate = finding(105, passage);
         candidate.subject = "Orion Nebula".into();
         let mut calls = 0;
-        let selected = select_evidence_with_context("Where is the Orion Nebula seen?", vec![candidate],
+        let selected = select_test_evidence_with_context("Where is the Orion Nebula seen?", vec![candidate],
             &["Orion Nebula".into()], &crate::storage::EntityAliases::default(), &[], |_| {
                 calls += 1;
                 Ok(if calls == 1 { serde_json::json!({"selections":[{"id":1,"passage":"The Orion Nebula is seen in Orion's sword.","reason":"Describes its location"}]}).to_string() }
@@ -269,7 +326,7 @@ mod tests {
             let mut candidate = finding(102, passage);
             candidate.subject = "Meridian Observatory".into();
             let mut calls = 0;
-            let selected = select_evidence_with_context("Who initiated Meridian Observatory?",vec![candidate],
+            let selected = select_test_evidence_with_context("Who initiated Meridian Observatory?",vec![candidate],
                 &["Meridian Observatory".into()],&crate::storage::EntityAliases::default(),&[],|_| {
                     calls += 1;
                     Ok(if calls == 1 {serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"Names the initiator"}]}).to_string()}
@@ -285,13 +342,43 @@ mod tests {
         let mut candidate = finding(101, passage);
         candidate.subject = "Meridian Observatory".into();
         let mut calls = 0;
-        let selected = select_evidence_with_context("Who founded Meridian Observatory?", vec![candidate],
+        let selected = select_test_evidence_with_context("Who founded Meridian Observatory?", vec![candidate],
             &["Meridian Observatory".into()], &crate::storage::EntityAliases::default(), &[], |_| {
                 calls += 1;
                 Ok(if calls == 1 {serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"Contains founder words"}]}).to_string()}
                     else {r#"{"matches_property":false,"use":"irrelevant","reason":"Does not identify the requested observatory's founder."}"#.into()})
             }).unwrap();
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn yes_no_retrieval_keeps_evidence_that_negates_the_requested_property() {
+        let passage = "Meridian Laboratory did not demonstrate superconductivity.";
+        let mut candidate = finding(103, passage);
+        candidate.subject = "Meridian Laboratory".into();
+        candidate.polarity = "negated".into();
+        let mut calls = 0;
+        let mut relevance_prompt = String::new();
+        let selected = select_test_evidence_with_context(
+            "Did Meridian Laboratory demonstrate superconductivity?",
+            vec![candidate],
+            &["Meridian Laboratory".into()],
+            &crate::storage::EntityAliases::default(),
+            &[],
+            |messages| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"Answers the yes-or-no claim"}]}).to_string())
+                } else {
+                    relevance_prompt = messages[0].content.clone();
+                    Ok(r#"{"matches_property":true,"reason":"The passage addresses the same property with negative polarity."}"#.into())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert!(relevance_prompt.contains("Polarity changes the answer"));
     }
 
     #[test]
@@ -316,7 +403,7 @@ mod tests {
         different_scope.id = 100;
         different_scope.context_scope = Some("a different continuity".into());
         let mut calls = 0;
-        let selected = select_evidence_with_context("Is the claim independently corroborated?",
+        let selected = select_test_evidence_with_context("Is the claim independently corroborated?",
             vec![first, second, unrelated, unknown_origin, different_subject, different_scope], &["Helios Laboratory".into()],
             &crate::storage::EntityAliases::default(), &[], |_| {
                 calls += 1;
@@ -344,7 +431,7 @@ mod tests {
             let mut candidate = finding(94, passage);
             candidate.subject = "Riverton Museum".into();
             let mut calls = 0;
-            let selected = select_evidence_with_context("What instruments does Riverton Museum currently exhibit?",
+            let selected = select_test_evidence_with_context("What instruments does Riverton Museum currently exhibit?",
                 vec![candidate], &["Riverton Museum".into()], &crate::storage::EntityAliases::default(), &[], |messages| {
                     if messages[1].content.contains("extract_property_request") {
                         return Ok(serde_json::json!({"property_spans":["instruments","exhibit"],"constraint_spans":[]}).to_string());
@@ -362,7 +449,7 @@ mod tests {
         let mut candidate = finding(93, passage);
         candidate.subject = "Riverton Museum".into();
         let mut calls = 0;
-        let selected = select_evidence_with_context("What instruments does Riverton Museum currently exhibit?",
+        let selected = select_test_evidence_with_context("What instruments does Riverton Museum currently exhibit?",
             vec![candidate], &["Riverton Museum".into()], &crate::storage::EntityAliases::default(), &[], |messages| {
                     if messages[1].content.contains("extract_property_request") {
                         return Ok(serde_json::json!({"property_spans":["instruments","exhibit"],"constraint_spans":[]}).to_string());
@@ -371,6 +458,108 @@ mod tests {
                 Ok(if calls == 1 {serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"Dated context with an explicit currentness limit"}]}).to_string()}
                 else {r#"{"matches_property":true,"use":"historical_context","request_span":"currently exhibit","time_span":"2012","limitation":"The 2012 display does not establish today's collection.","reason":"Historical examples help explain what is known without asserting current exhibits."}"#.into()})
             }).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].research_relevance, "historical_context");
+    }
+
+    #[test]
+    fn semantic_reconsideration_recovers_historical_property_after_false_rejection() {
+        let passage = "In 2012, Riverton Museum displayed an astrolabe and a reflecting telescope.";
+        let mut candidate = finding(92, passage);
+        candidate.subject = "Riverton Museum".into();
+        candidate.gate_status = "unverified_temporal".into();
+        candidate.topic_class = "recent".into();
+        candidate.freshness = "stale".into();
+        candidate.currency = "historical".into();
+        let mut calls = 0;
+        let selected = select_test_evidence_with_context(
+            "What instruments does Riverton Museum currently exhibit?",
+            vec![candidate],
+            &["Riverton Museum".into()],
+            &crate::storage::EntityAliases::default(),
+            &[],
+            |messages| {
+                calls += 1;
+                match calls {
+                    1 => Ok(serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"States the museum's displayed instruments."}]}).to_string()),
+                    2 => Ok(serde_json::json!({"matches_property":false,"reason":"This is old evidence and may not describe the current collection."}).to_string()),
+                    3 => {
+                        assert!(messages[0].content.contains("Independently review a prior rejection"));
+                        Ok(serde_json::json!({
+                            "matches_property":false,
+                            "use":"historical_context",
+                            "request_span":"currently exhibit",
+                            "time_span":"2012",
+                            "limitation":"The 2012 display does not establish today's collection.",
+                            "reason":"This old evidence describes a past display, not current holdings."
+                        }).to_string())
+                    }
+                    4 => {
+                        assert!(messages[0].content.contains("conflicts with itself"));
+                        Ok(serde_json::json!({
+                            "matches_property":false,
+                            "reason":"The source does not prove current holdings."
+                        }).to_string())
+                    }
+                    5 => {
+                        assert!(messages[0].content.contains("useful, explicitly historical partial answer"));
+                        Ok(serde_json::json!({
+                            "matches_property":true,
+                            "use":"historical_context",
+                            "request_span":"currently exhibit",
+                            "time_span":"2012",
+                            "limitation":"The 2012 display does not establish today's collection.",
+                            "reason":"This is a dated instance of the requested display property and can be reported with its date."
+                        }).to_string())
+                    }
+                    _ => panic!("property reconsideration must be bounded"),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 5);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].research_relevance, "historical_context");
+    }
+
+    #[test]
+    fn malformed_relevance_json_gets_one_semantic_retry_before_failing_closed() {
+        let passage = "In 2012, Riverton Museum displayed an astrolabe.";
+        let mut candidate = finding(97, passage);
+        candidate.subject = "Riverton Museum".into();
+        candidate.gate_status = "unverified_temporal".into();
+        let mut calls = 0;
+        let selected = select_test_evidence_with_context(
+            "What instruments does Riverton Museum currently exhibit?",
+            vec![candidate],
+            &["Riverton Museum".into()],
+            &crate::storage::EntityAliases::default(),
+            &[],
+            |messages| {
+                calls += 1;
+                match calls {
+                    1 => Ok(serde_json::json!({"selections":[{"id":1,"passage":passage,"reason":"Dated evidence"}]}).to_string()),
+                    2 => Ok(r#"{"matches_property":false,"reason":"Current holdings are unknown."}"#.into()),
+                    3 => Ok(r#"{"matches_property":true,"use":"historical_context","request_span":"currently exhibit","time_span":"2012","limitation":"Current holdings are unknown.","reason":"A dated display is relevant"#.into()),
+                    4 => {
+                        assert!(messages.last().unwrap().content.contains("not valid JSON"));
+                        Ok(serde_json::json!({
+                            "matches_property":true,
+                            "use":"historical_context",
+                            "request_span":"currently exhibit",
+                            "time_span":"2012",
+                            "limitation":"The dated display does not establish today's collection.",
+                            "reason":"This is a dated instance of the requested property."
+                        }).to_string())
+                    }
+                    _ => panic!("malformed review repair must be bounded to one retry"),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls, 4);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].research_relevance, "historical_context");
     }
@@ -400,7 +589,7 @@ mod tests {
             let mut candidate = finding(91, passage);
             candidate.subject = actual.into();
             candidate.object = "source property".into();
-            let selected = select_evidence_with_context(
+            let selected = select_test_evidence_with_context(
                 question,
                 vec![candidate],
                 &[requested.into()],
@@ -430,7 +619,7 @@ mod tests {
         let mut second = first.clone();
         second.id = 72;
         let mut calls = 0;
-        let selected = select_evidence_with_context(
+        let selected = select_test_evidence_with_context(
             "Is Orion Foundation's claim independently corroborated?", vec![first, second],
             &["Orion Foundation".into()], &crate::storage::EntityAliases::default(), &[],
             |messages| {
@@ -459,7 +648,7 @@ mod tests {
         candidate.subject = "Dana".into();
         candidate.object = "Orion Workshop".into();
         let mut calls = 0;
-        let selected = select_evidence_with_context(
+        let selected = select_test_evidence_with_context(
             "Who initiated Orion Workshop?", vec![candidate], &["Orion Workshop".into()],
             &crate::storage::EntityAliases::default(), &[], |messages| {
                 calls += 1;
@@ -485,7 +674,7 @@ mod tests {
             let mut candidate = finding(82, "Orion Workshop paid its taxes.");
             candidate.subject = "Orion Workshop".into();
             let mut calls = 0;
-            let selected = select_evidence_with_context(
+            let selected = select_test_evidence_with_context(
                 "Who initiated Orion Workshop?", vec![candidate], &["Orion Workshop".into()],
                 &crate::storage::EntityAliases::default(), &[], |_| {
                     calls += 1;
@@ -501,7 +690,7 @@ mod tests {
         candidates: Vec<ScholarEvidenceForAnswer>,
         mut ask: impl FnMut(&[Message]) -> io::Result<String>,
     ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
-        select_evidence_with_context(
+        select_test_evidence_with_context(
             question,
             candidates,
             &[],
@@ -629,7 +818,7 @@ mod tests {
             38,
             "Lay's potato chips in Indonesia are available in honey butter, sour cream and onion, nori seaweed, beef barbecue, classic salty, and salmon teriyaki flavors.",
         );
-        let selected = select_evidence_with_context(
+        let selected = select_test_evidence_with_context(
             "What crisp flavours does Walkers currently sell?",
             vec![smiths, lays],
             &["Walkers".into()],
@@ -660,7 +849,7 @@ mod tests {
             12,
             "Renewable energy is increasingly used in developing countries as an alternative to fossil fuels.",
         );
-        let selected = select_evidence_with_context(
+        let selected = select_test_evidence_with_context(
             "What crisp flavours does Walkers sell?",
             vec![walkers, renewable],
             &[],
