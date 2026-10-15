@@ -200,7 +200,15 @@ fn semantic_disproof_blocks_promotion_despite_matching_candidate_words() {
     let job = store.claim_scholar_job().unwrap().unwrap();
     let passage = "Flat Earth is a scientifically disproven conception of the Earth's shape as a plane or disk.";
     let finding = crate::semantic::candidate_from_context(&serde_json::json!({"subject":"Flat Earth","relation":"is","object":"a true conception of the Earth as a plane or disk","evidence_text":passage})).unwrap();
-    let support = crate::semantic::assess_with("Is Earth flat?","Flat Earth",passage,&finding, |_|Ok(serde_json::json!({"verdict":"entailed","reason":"It mentions the conception.","evidence_text":passage}).to_string())).unwrap();
+    let mut review_pass = false;
+    let support = crate::semantic::assess_with("Is Earth flat?","Flat Earth",passage,&finding, |_| {
+        review_pass = !review_pass;
+        Ok(if review_pass {
+            serde_json::json!({"verdict":"entailed","reason":"It mentions the conception.","evidence_text":passage}).to_string()
+        } else {
+            serde_json::json!({"verdict":"contradicted","reason":"The source calls the conception scientifically disproven.","evidence_text":null}).to_string()
+        })
+    }).unwrap();
     assert_eq!(support.verdict(), "contradicted");
     store
         .finish_scholar_job(

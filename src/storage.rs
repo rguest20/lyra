@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 62;
+const SCHEMA_VERSION: i64 = 63;
+static SCHEMA_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug)]
 pub struct ScholarFeedbackTask {
@@ -709,6 +710,9 @@ impl LearningStore {
             fs::create_dir_all(parent)?;
         }
 
+        let _migration_guard = SCHEMA_MIGRATION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let connection = Connection::open(path).map_err(database_error)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -999,6 +1003,7 @@ fn is_time_sensitive(question: &str, relation: &str, object: &str) -> bool {
         "current",
         "currently",
         "latest",
+        "recent",
         "today",
         "now",
         "price",
@@ -1029,9 +1034,41 @@ fn is_time_sensitive(question: &str, relation: &str, object: &str) -> bool {
             text.split(|ch: char| !ch.is_alphanumeric())
                 .any(|word| word == *term)
         } else {
-            text.contains(term)
+            contains_policy_term(&text, term)
         }
     })
+}
+
+fn contains_policy_term(text: &str, term: &str) -> bool {
+    let words = text
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    let terms = term.split_whitespace().collect::<Vec<_>>();
+    words.windows(terms.len()).any(|window| {
+        window
+            .iter()
+            .zip(&terms)
+            .all(|(word, term)| policy_word_match(word, term))
+    })
+}
+
+fn policy_word_match(word: &str, term: &str) -> bool {
+    word == term
+        || word.strip_suffix('s') == Some(term)
+        || word.strip_suffix("es") == Some(term)
+        || term
+            .strip_suffix('y')
+            .is_some_and(|root| word == format!("{root}ies"))
+        || (term.chars().count() >= 5
+            && ["ed", "er", "ing", "is", "ly", "ment", "or"]
+                .iter()
+                .any(|suffix| {
+                    let inflected = format!("{term}{suffix}");
+                    word == inflected
+                        || word.strip_suffix('s') == Some(inflected.as_str())
+                        || word.strip_suffix("es") == Some(inflected.as_str())
+                }))
 }
 
 fn is_consequential(question: &str, subject: &str, relation: &str) -> bool {
@@ -1056,7 +1093,7 @@ fn is_consequential(question: &str, subject: &str, relation: &str) -> bool {
         "weapon",
     ]
     .iter()
-    .any(|term| text.contains(term))
+    .any(|term| contains_policy_term(&text, term))
 }
 
 pub(crate) fn valid_claim_period(valid_from: Option<&str>, valid_until: Option<&str>) -> bool {

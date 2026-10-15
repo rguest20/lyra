@@ -1265,6 +1265,25 @@ impl LearningStore {
             .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 63 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            // Different strings cannot establish different meanings. Reopen
+            // only links created by the old lexical decision, keeping reviewed
+            // relationships and every source claim intact.
+            tx.execute_batch(
+                "UPDATE scholar_finding_claim_links
+                 SET relation='unresolved',
+                     rationale='same established subject with different relation wording; semantic review must decide whether the propositions address the same property',
+                     assessment_method='relation_requires_semantic_review'
+                 WHERE relation='does_not_address'
+                   AND assessment_method='deterministic_distinct_relation';
+                 PRAGMA user_version=63;",
+            ).map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

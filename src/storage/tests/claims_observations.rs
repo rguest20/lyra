@@ -2,6 +2,78 @@
 use super::*;
 
 #[test]
+fn advisory_reply_review_preserves_text_and_uses_only_its_own_past_context() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .stage_observation("dialogue", 1, "How should I prepare?")
+        .unwrap();
+    store
+        .stage_assistant_reply("dialogue", 1, "Prepare examples of your experience.")
+        .unwrap();
+    store
+        .stage_observation("dialogue", 2, "Could you explain that?")
+        .unwrap();
+    let answer = "Choose situations where you solved a problem and explain your contribution.";
+    store.stage_assistant_reply("dialogue", 2, answer).unwrap();
+    store
+        .stage_observation("dialogue", 3, "This future turn must not affect the audit.")
+        .unwrap();
+    store
+        .stage_assistant_reply("dialogue", 3, "Future reply.")
+        .unwrap();
+    store
+        .stage_observation("another-dialogue", 1, "Unrelated private context.")
+        .unwrap();
+
+    let first = store.claim_assistant_reply().unwrap().unwrap();
+    store.finish_assistant_reply(&first.id, &[]).unwrap();
+    let job = store.claim_assistant_reply().unwrap().unwrap();
+    assert_eq!(job.reply_text, answer);
+    let context = store.assistant_reply_context(&job.id).unwrap();
+    assert_eq!(context["latest_user_message"], "Could you explain that?");
+    assert_eq!(context["recent_conversation"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        context["recent_conversation"][1]["content"],
+        "Prepare examples of your experience."
+    );
+    assert!(!context.to_string().contains("future"));
+    assert!(!context.to_string().contains("Unrelated"));
+
+    store
+        .record_conversation_review(
+            &job.id,
+            "uncertain",
+            "Cannot confidently judge the advice.",
+            "test-model",
+            &context,
+        )
+        .unwrap();
+    store.finish_assistant_reply(&job.id, &[]).unwrap();
+    drop(store);
+    let store = LearningStore::open(&path).unwrap();
+    let (text, payload, outcome): (String, String, String) = store
+        .connection
+        .query_row(
+            "SELECT r.reply_text,p.payload,d.outcome FROM assistant_replies r
+         JOIN role_proposals p ON p.source_id=r.id AND p.source_type='assistant_reply_quality'
+         JOIN policy_decisions d ON d.proposal_id=p.id WHERE r.id=?1",
+            [&job.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(text, answer);
+    assert_eq!(payload["verdict"], "uncertain");
+    assert_eq!(payload["model_id"], "test-model");
+    assert_eq!(payload["advisory_only"], true);
+    assert_eq!(outcome, "no_change");
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn assistant_challenge_is_durable_and_policy_reduces_usable_confidence() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();

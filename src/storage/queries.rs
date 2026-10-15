@@ -317,17 +317,6 @@ impl LearningStore {
         }))
     }
 
-    pub fn observation_text(&self, id: &str) -> io::Result<Option<String>> {
-        self.connection
-            .query_row(
-                "SELECT raw_text FROM observations WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)
-    }
-
     pub fn relevant_review_candidates(
         &self,
         conversation_id: &str,

@@ -2,6 +2,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 const MAX_RETAINED_SOURCE_CHARS: usize = 32_000;
+const RESEARCH_HARVEST_CHUNK_CHARS: usize = 1_000;
 
 fn evidence_byte_span(
     body: &str,
@@ -275,9 +276,16 @@ impl LearningStore {
         };
         let offset =
             usize::try_from(cursor).map_err(|_| invalid("invalid research source cursor"))?;
-        let mut passage = body.chars().skip(offset).take(2200).collect::<String>();
+        let mut passage = body
+            .chars()
+            .skip(offset)
+            .take(RESEARCH_HARVEST_CHUNK_CHARS)
+            .collect::<String>();
         if body.chars().count() > offset + passage.chars().count() {
-            if let Some(end) = passage.rfind('\n').filter(|end| *end > 1000) {
+            if let Some(end) = passage
+                .rfind('\n')
+                .filter(|end| *end > RESEARCH_HARVEST_CHUNK_CHARS / 2)
+            {
                 passage.truncate(end + 1);
             }
         }
@@ -979,7 +987,7 @@ mod tests {
     fn harvested_evidence_offsets_survive_a_source_chunk_boundary() {
         let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
         let fact = "The Amazon rainforest is in South America.";
-        let body = format!("{}\n{fact}\nMore source text.", "x".repeat(2_190));
+        let body = format!("{}\n{fact}\nMore source text.", "x".repeat(990));
         let source = source(&mut store, "https://example.org/chunked", &body);
         assert!(!source.passage.contains(fact));
         store
@@ -1060,7 +1068,7 @@ mod tests {
         let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
         let passage = "A sourced assertion.\n".repeat(200);
         let first = source(&mut store, "https://example.org/article", &passage);
-        assert!(first.passage.chars().count() <= 2200);
+        assert!(first.passage.chars().count() <= RESEARCH_HARVEST_CHUNK_CHARS);
         assert!(store.claim_research_source().unwrap().is_none());
         store
             .finish_research_baskets(&first, &ResearchBaskets::default())

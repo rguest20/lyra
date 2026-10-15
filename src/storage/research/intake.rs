@@ -618,7 +618,7 @@ fn ingest_source(
              ORDER BY c.id DESC LIMIT 20",
             )
             .map_err(database_error)?;
-        let unrelated_claims = statement
+        let unresolved_relations = statement
             .query_map(params![finding.subject, finding.relation], |row| {
                 row.get::<_, i64>(0)
             })
@@ -626,15 +626,15 @@ fn ingest_source(
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
         drop(statement);
-        for claim_id in unrelated_claims {
+        for claim_id in unresolved_relations {
             tx.execute(
                 "INSERT OR IGNORE INTO scholar_finding_claim_links
                     (finding_id,claim_id,relation,rationale,assessment_method)
-                 VALUES (?1,?2,'does_not_address',?3,'deterministic_distinct_relation')",
+                 VALUES (?1,?2,'unresolved',?3,'relation_requires_semantic_review')",
                 params![
                     finding_id,
                     claim_id,
-                    "same established subject but a different relation; this evidence does not address that proposition"
+                    "same established subject with different relation wording; semantic review must decide whether the propositions address the same property"
                 ],
             ).map_err(database_error)?;
         }

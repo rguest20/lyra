@@ -61,7 +61,7 @@ fn scope_mismatch_qualifies_an_overlapping_claim_without_challenging_it() {
         )
         .unwrap();
     assert_eq!(relation, "qualifies");
-    let unrelated_relation: String = store
+    let unresolved_relation: String = store
         .connection
         .query_row(
             "SELECT relation FROM scholar_finding_claim_links WHERE finding_id=?1 AND claim_id=?2",
@@ -69,7 +69,7 @@ fn scope_mismatch_qualifies_an_overlapping_claim_without_challenging_it() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(unrelated_relation, "does_not_address");
+    assert_eq!(unresolved_relation, "unresolved");
     let answer_candidate = store
         .scholar_evidence_candidates(false)
         .unwrap()

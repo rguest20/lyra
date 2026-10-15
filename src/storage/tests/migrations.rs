@@ -1,5 +1,115 @@
 //! Storage regressions for migrations.
 use super::*;
+use crate::storage::SCHEMA_VERSION;
+
+#[test]
+fn differing_relation_migration_reopens_only_unreviewed_lexical_decisions() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .connection
+        .execute_batch(
+            "INSERT INTO semantic_claims(subject,relation,object,source,created_at)
+         VALUES ('Example Organization','started operating in','1998','old source','2026-01-01');
+         INSERT INTO semantic_claims(subject,relation,object,source,created_at)
+         VALUES ('Example Organization','employs','120 staff','old source','2026-01-01');",
+        )
+        .unwrap();
+    store
+        .enqueue_research("relation-migration", 1, "When did it begin operating?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let passage = "Example Organization began operations in 2000.";
+    store
+        .finish_scholar_job(
+            &job.id,
+            "History",
+            "https://example.org/history",
+            passage,
+            Some(ScholarFinding {
+                semantic_support: None,
+                subject: "Example Organization".into(),
+                relation: "began operations in".into(),
+                object: "2000".into(),
+                evidence_text: passage.into(),
+                confidence: 0.99,
+                valid_from: None,
+                valid_until: None,
+                source_quality: "reference".into(),
+                source_updated_at: None,
+                proposition: Default::default(),
+            }),
+            None,
+        )
+        .unwrap();
+    let finding = store.scholar_findings(&job.id).unwrap().remove(0);
+    let links: i64 = store.connection.query_row(
+        "SELECT count(*) FROM scholar_finding_claim_links WHERE finding_id=?1 AND relation='unresolved'",
+        [finding.id], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        links, 2,
+        "paraphrases and different properties both need semantic assessment"
+    );
+    store
+        .connection
+        .execute_batch(
+            "UPDATE scholar_finding_claim_links SET relation='does_not_address',
+             assessment_method='deterministic_distinct_relation' WHERE claim_id=1;
+         UPDATE scholar_finding_claim_links SET relation='does_not_address',
+             assessment_method='ai_review' WHERE claim_id=2;
+         PRAGMA user_version=62;",
+        )
+        .unwrap();
+    drop(store);
+    let store = LearningStore::open(&path).unwrap();
+    let links: Vec<(i64, String, String)> = store.connection.prepare(
+        "SELECT claim_id,relation,assessment_method FROM scholar_finding_claim_links ORDER BY claim_id",
+    ).unwrap().query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+        .unwrap().collect::<Result<_, _>>().unwrap();
+    assert_eq!(
+        links,
+        vec![
+            (
+                1,
+                "unresolved".into(),
+                "relation_requires_semantic_review".into()
+            ),
+            (2, "does_not_address".into(), "ai_review".into()),
+        ]
+    );
+    assert_eq!(store.active_semantic_claims().unwrap().len(), 2);
+    assert_eq!(
+        store.scholar_findings(&job.id).unwrap()[0].status,
+        "needs_review"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn concurrent_first_open_runs_schema_migrations_once() {
+    let path = temp_path();
+    let workers = (0..8)
+        .map(|_| {
+            let path = path.clone();
+            std::thread::spawn(move || LearningStore::open(&path).map(drop))
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap().unwrap();
+    }
+    let store = LearningStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        SCHEMA_VERSION
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
 
 #[test]
 fn scholar_task_target_migration_backfills_existing_jobs() {
