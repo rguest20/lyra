@@ -44,9 +44,106 @@ The new checks use source structure, literal spans and general language
 relationships. They introduce no crisp-equivalence table. English phrasing and
 small-model intent extraction remain limitations.
 
+### Follow-up work (2026-10-14)
+
+The two-hour grounding pass exercised the fixed nine-case corpus and an
+unrelated 14-case synthetic sweep. The original corpus exposed the same slow
+wrong-property retrieval on the Walkers/Smith's case and a timeout on its nearby
+question case; the previous structured-property change then reduced the
+Walkers case to a 37-second, safe abstention with no unrelated evidence. The
+broader sweep completed with all source archives intact and no HTTP requests.
+It confirmed correct cross-entity rejection, source-lineage handling, a
+supported negative result, the island-scoped bird list, a researcher/date fact,
+and selection of the rural-health use over an unrelated founding fact.
+
+The sweep also reproduced ordinary-path weaknesses: a historical museum claim
+was extracted but rejected when matching a current collection; one conditional
+question and one title-list question abstained; a physical definition and a
+fictional scoped identity acquired redundant narration; and ambiguous title
+conjunctions required a safe fallback. These are retained as failures, not
+counted as a pass. One run's answer prompt caused the model to treat
+human-readable qualification strings inside evidence JSON as instructions,
+leading to a 300-second repair and fallback on the prompt-injection fixture.
+
+The answer path now encodes source, currentness, conflict, independence and
+scope qualifications as compact status codes, with their meanings in the
+system prompt. The answer repair no longer reinserts its failed draft, and the
+general reply-style check detects instruction-following commentary. New tests
+cover the qualification contract and a rewrite that must omit a bad draft. A
+fresh three-case replay returned concise answers for the prompt-injection and
+scoped-identity cases; the ambiguous-title case preserved the exact conjunctive
+source wording but still added unnecessary caveats about missing publication
+dates. The property fallback now removes entity metadata and obvious temporal
+modifiers from the matching target while preserving exact question-anchored
+terms. The museum recheck retains the 2012 instruments and states that current
+status is unknown; it completed in 28 seconds. This fixes the retrieval failure
+without calling the historical display current.
+
+Validation currently passes 412 Rust tests, `cargo fmt --check`, the Python
+evaluation test suite, and a development build. MLX build warnings remain
+for a task-target accessor and type used only by tests. The 14-case run is
+archived at `evals/results/grounding-two-hour-generalization-2026-10-14`; the
+three-case recheck is at
+`evals/results/grounding-two-hour-recheck-2026-10-14b`; museum rechecks are at
+`evals/results/grounding-two-hour-museum-recheck-2026-10-14b`; the original
+nine-case replay is at `evals/results/grounding-two-hour-v1-final-2026-10-14`;
+the revised conflict replay is at
+`evals/results/grounding-two-hour-conflict-recheck-2026-10-14b`; the updated
+injection replay is at
+`evals/results/grounding-two-hour-injection-recheck-2026-10-14`; and the
+thinking-disabled style-repair replay is at
+`evals/results/grounding-two-hour-cookie-recheck-2026-10-14`. The latest full
+14-case replay is at
+`evals/results/grounding-two-hour-generalization-final-2026-10-14`, with the
+negation and duplicate-evidence narration rechecks at
+`evals/results/grounding-two-hour-final-fixes-2026-10-14`. All use synthetic
+source transport, not live search or production database reads. Independent
+semantic adjudication remains undone and the grounding benchmark is not passing.
+
+The original nine-case replay selected the right flavour source rather than the
+renewable-energy distractor, abstained on the Walkers/Smith's entity mismatch,
+found the penicillin fact, and recovered the malformed-source flavour list.
+It still produced irrelevant currency caveats, repeated copied-source claims,
+and selected only the 2000 account in a two-date conflict. A conflict-aware
+selection instruction now requires retaining relevant differing values for the
+same property. Its fresh 67-second replay selected both sources and answered
+with both dates in parallel, explicitly saying the evidence did not resolve
+which date was correct. This is one controlled conflict case, not broad conflict
+acceptance.
+
+Presentation repairs now leave the initial answer's thinking enabled for
+debugging but generate a detected style rewrite with thinking disabled; any
+captured initial thoughts are retained for inspection. In the fresh cookie
+replay, the 2B model first emitted a self-check, then the filter triggered a
+rewrite that returned only the supported fact; total time fell from 196 to 162
+seconds. The fresh injection case also returned a concise answer without
+instruction leakage. The nine-case run predates the latest conflict-selection
+and thinking-disabled-rewrite prompts, so its findings are a baseline for those
+changes rather than their validation.
+
+The final 14-case replay is complete. It answers the title-list, researcher,
+physical-definition, geography, rural-health, historical-display and scoped
+identity questions without unrelated evidence. The historical display keeps
+the 2012 date and withholds current status. The negative superconductivity case
+still abstained because selection treated a negated answer as irrelevant; the
+property prompt now explicitly treats polarity as separate from relevance, and
+the fresh 29-second replay returns the exact qualified negative passage. A
+style guard also removes an extra sentence that merely said an answer was
+supported by its source; the list-use recheck returns one sentence. The list
+conjunction ambiguity is surfaced as unresolved rather than split into invented
+titles, though that case still takes 168 seconds.
+
+The initial freshness/sensitive-topic audit found substring collisions: `tax`
+inside “syntax” or `law` inside unrelated longer words could classify a claim
+as consequential. Topic terms now match token boundaries with bounded common
+inflections, while short acronyms such as GPU still require a whole token.
+Regressions cover both the false positives and positive terms such as symptoms,
+laws, taxes and investments. This is a first audit, not a complete taxonomy or
+a substitute for the remaining high-stakes review tests.
+
 ## Validation and limits
 
-**388 Rust tests and 15 Python tests pass.** New regressions were observed failing
+**412 Rust tests and 12 Python tests pass.** New regressions were observed failing
 before their fixes, including dropped proposition fields, stale approval binding,
 scope removal, list restructuring, invented locations/causes/attribution and
 typographic quotation rejection. Formatting and whitespace checks also pass.
@@ -335,3 +432,477 @@ successful extraction. No probe output was inserted into the actual baskets.
 `model probe-baskets TITLE PASSAGE` exposes this same extraction path for future
 diagnosis. The earlier failing source-34 replay is under
 `evals/results/basket-json-diagnosis-2026-10-13`.
+
+### Two-hour grounding and dialogue pass — 14 October
+
+The follow-up pass made generic changes across retrieval, answer construction,
+fixture handling and freshness policy. Property extraction now has a conservative
+question-anchored lexical fallback when the model omits usable terms; this let
+the museum fixture retrieve the dated display fact without treating it as current.
+Selection retains differing values for the same property and treats polarity as
+part of the answer rather than a reason to discard a yes/no response. Fixture
+scope metadata no longer contaminates the question sent to retrieval. Freshness
+and sensitive-topic matching now uses token boundaries and bounded inflections,
+with false-positive regressions for incidental substrings.
+
+The answer path uses compact qualification codes, omits failed drafts from repair
+prompts, and catches several forms of process leakage and redundant source
+commentary. A no-thinking style rewrite can clean a detected bad first draft
+while retaining the initial thinking trace for debugging. Short conversational
+statements now have a bounded acknowledgment rewrite and last-resort short
+fallback. Tests cover the generic categories rather than crisp-specific wording.
+
+The final synthetic 14-case replay and targeted rechecks now retain the useful
+historical display, negative experimental result, conflicting dates, and concise
+answers for several previously noisy cases. All 412 Rust tests and 12 Python
+evaluation tests pass; formatting and diff whitespace checks pass. Archived runs
+are listed above. These are local synthetic-source tests, not live search.
+
+Two isolated web API checks preserved conversation continuity and a corrected
+telescope name, but exposed response-style and routing failures: one correction
+produced an overlong answer with an unsupported example, and a later simple
+personal statement was misread as a request about Lyra's physical capabilities.
+The short-statement style guard was added after those runs; it has unit coverage
+but has not yet passed a fresh live dialogue recheck. The curator also held the
+personal fact rather than promoting it. These checks used isolated evaluation
+databases; the production database was not touched. The local test server is
+stopped.
+
+Part 1 remains open. Next work should independently adjudicate the retained
+cross-topic cases, rerun the isolated correction dialogue against the latest
+style guard, and investigate why personal conversational facts are not becoming
+useful context. Keep the benchmark's unsupported-answer and unnecessary-refusal
+counts visible; unit tests alone do not meet grounding acceptance.
+
+### Further Part 1 review — 14 October
+
+A fresh isolated three-turn web dialogue now preserves continuity through a
+personal statement, correction and pronoun follow-up. It stores the first fact
+as “the user's telescope is named Marigold,” records the correction on the same
+subject, marks Marigold superseded, and answers “The telescope is named Juniper.”
+The correction does not queue Scholar; the question-shaped follow-up is rejected
+by curation as a claim. The live artifact is under
+`evals/results/grounding-part1-output-cap-replay-2026-10-14`.
+
+An earlier replay exposed the wrong-subject extraction (“the user is named
+Marigold”) and an unnecessary promise in the correction reply. The generic
+possessive-subject gate now blocks that mapping at candidate validation and at
+AI review; tests cover named objects and preserve “my name is Ryan.” A short
+statement with an unrelated answer now falls back to “Understood.” The corrected
+reply is brief and states the updated value.
+
+The first chat request against a newly initialized isolated database also raced
+the maintenance worker: both opened the database while migrations were pending,
+and the request hit `table observations already exists`. Storage opens now
+serialize connection setup and migrations within the process. An eight-thread
+first-open regression reproduces and checks this initialization path.
+
+Freshness and consequence screening remain deterministic lexical backstops.
+The audit caught that generic short-prefix matching made historical “mayoral
+service” look like an undated current office claim, so arbitrary prefixes were
+replaced with bounded inflection forms and the one-off office-title expansion
+was removed. Existing freshness and high-consequence checks retain token
+boundaries. Semantic risk and time-scope classification remains open; expanding
+keyword lists would not solve the generalization problem.
+
+Source-check and acknowledgment routing no longer use action/source vocabularies
+or opening-phrase allowlists. The request is classified in its conversation
+context; short-statement replies receive a separate relevance and safety review,
+with rejected or malformed reviews falling back to a brief acknowledgment.
+Regression examples remain in tests rather than serving as runtime phrase
+gates. This adds a small-model classification call on conversational turns, so
+latency and live intent errors still need measurement. Other deterministic style
+checks remain and need an inventory before claiming all phrase gates are gone.
+
+An earlier live run on the same personal statement reached
+`finish_reason: max_tokens` after a thinking budget expansion. Lyra recovered
+through the style fallback, but the inference layer had accepted the truncated
+attempt. Generation now treats that finish
+reason as incomplete, retries without thinking with a doubled output budget,
+then doubles once more before failing. The thinking trace is retained and a
+truncated draft is never returned as the answer. Mock-worker tests cover both a
+successful retry and abandonment after both increases. The latest live dialogue
+did not hit the cap, so the retry branch has not yet been observed live.
+
+Independent adjudication of the museum and cross-topic benchmark has not been
+performed. These remain acceptance blockers; no passing benchmark is claimed.
+The latest verification passed 422 Rust tests, 12 Python tests, build, format
+and diff checks. One earlier full-suite run had a transient inference lock test
+failure; the isolated test and subsequent full run passed.
+
+### Part 1 continuation — semantic fallbacks — 14 October
+
+Currentness is now classified by request meaning on every invocation, rather
+than bypassing the model for a fixed set of temporal words or physical-quantity
+phrases. The structured result distinguishes time-sensitive, not time-sensitive
+and uncertain, with a brief reason. Invalid or uncertain output gets one bounded
+reconsideration; unresolved output stays unresolved. A source-limited historical
+reply no longer infers currentness from question words. When currentness is
+unresolved and the evidence is time-scoped, that literal-answer shortcut yields
+to the reviewed answer path so its time limitation remains available.
+
+Property spans from the model remain intact after validation. The lexical
+property-span fallback and post-extraction removal of temporal words are gone;
+if semantic extraction fails, evidence selection uses the original request.
+Personal-fact follow-up routing now asks a contextual classifier whether the
+user seeks a previously reported personal fact, with one retry for invalid or
+uncertain output. The phrase list that rewrote selected “I don't know” answers
+has been removed; the ordinary contextual answer review and user-evidence prompt
+now handle that meaning.
+
+Scholar no longer reconstructs list claims through question-cue, topic and
+predicate word lists. Lists go through model extraction, source-entailment
+review and the existing bounded extraction repair. A focused regression shows
+repair can correct a mistaken member-to-member claim into a source-supported
+containing list, while an unrelated entity remains ungrounded. This may reduce
+list recall when the model repeatedly fails; those cases now remain visible as
+extraction failures rather than silently converting markup to a claim.
+
+Focused validation passed: 73 agent tests, 13 extraction repair tests, 70
+Scholar tests and the request-classification test; formatting and diff checks
+passed. These tests use model doubles and do not measure live model accuracy or
+latency. Consequential-topic policy, semantic stance guards, date/scope conflict
+replays, independent benchmark adjudication and a fresh live dialogue replay
+remain open. The broader acceptance benchmark is still not claimed as passing.
+
+### Semantic word-list sweep — 14 October
+
+Ordinary generated answers now receive a contextual structured style verdict
+(`accept`, `revise` or `uncertain`). The reviewer judges relevance, requested
+format, useful detail and conversational fit by meaning rather than forbidden
+phrases. A rejected draft gets one rewrite and a second review; malformed,
+uncertain or rejected outcomes fail closed and are logged. Research answers
+also require an explicit structured reviewer verdict. Phrase-based gates for
+stock refusals, echoing, apology counts and “best flavour” source dumps were
+removed. Regression fixtures vary the wording while keeping the semantic
+judgment constant.
+
+The full Rust suite passes (417 tests), as do formatting and `git diff --check`.
+These unit tests use review-model doubles, so they establish verdict handling
+and plumbing rather than the 2B model's semantic accuracy. A varied adversarial
+evaluation, including generator/reviewer shared misunderstandings, remains a
+prerequisite before claiming that model-only review is reliable.
+
+The source sweep found additional runtime language lists that still carry
+semantic risk: personal-question and personal-knowledge routing in `agent.rs`;
+time-sensitive and consequential-topic classification in `storage.rs`; and
+currentness hints in research selection and source limits. The stance checks in
+`semantic/guards.rs` have now been removed. Every valid semantic verdict
+receives a second adjudication against the original source and claim, with the
+first assessment exposed as something to challenge rather than as proof. The
+review can correct false approvals and false rejections; it omits the research
+question to avoid turning a historical property into a present-day claim.
+Uncertainty,
+polarity, attribution, scope, entity transfer, list-member roles and unsupported
+generalization are reviewed as semantic examples, not phrase triggers. A
+malformed audit fails closed and the decision plus raw review output is logged.
+The former serialized `stance_override` field remains readable as an alias while
+new review decisions use a general field name. A literal-token-sequence escape
+that could reinstate an exact claim after semantic rejection has also been
+removed; parseable claims reach semantic review, while the complete structural
+schema, exact-evidence, safe-field and date checks still run before acceptance.
+Focused and full model-double
+regressions pass (412 tests); live accuracy and the risk of shared
+misunderstanding by the same model remain unmeasured. This adds one model call
+for every valid initial assessment, so review latency still needs measurement.
+The word lists that
+currently protect medical, legal and financial review still require special care
+before replacing them with a model classifier: classification uncertainty must
+not silently become approval.
+
+Two direct 2B probes exercised the semantic path. The model rejected a
+conversation-style personal preference as evidence for what Walkers sells. A
+straightforward Earth-orbits-the-Sun claim passed both the initial assessment
+and adversarial review; the two inferences took 1.58 s and 1.38 s after model
+startup. These are smoke checks, not a representative accuracy or latency
+benchmark. The crisp probe was rejected on the initial pass, so it did not test
+whether the second pass catches a false-positive first verdict.
+
+Other lists found in the sweep define machine contracts or bounded data
+handling: verdict/status enums and JSON field names, URL schemes and sensitive
+query parameters, stop words used for lexical ranking, HTML consent/footer
+markers, CLI arguments, and Scout's deliberate cross-domain seed mix. They are
+not direct phrase-based judgments of user meaning. Keep deterministic checks
+for these system rules and test their boundaries. The current next steps track
+the remaining semantic candidates and an adversarial evaluation separately.
+
+### Part 1 continuation — historical partial answers — 14 October
+
+The repeated live museum fixture exposed two linked gaps. First, the 2B model
+sometimes returned a semantically useful historical-context assessment with a
+missing final JSON delimiter; asking it to repair the syntax led it to repeat
+the same truncated output. The relevance parser now closes only missing JSON
+delimiters when every value is complete, without creating or changing any field.
+If a value itself is malformed, one bounded model repair remains available and
+all semantic anchors and limitations are still validated.
+
+Second, Scholar selected the 2012 museum display as a historical-context result,
+but a separate currentness classifier labeled the same request
+not-time-sensitive. That disagreement made Lyra ignore the partial evidence
+and abstain. A validated historical-context relevance decision now carries its
+own date limitation into the source-limited answer, regardless of the separate
+currentness result. The live replay now answers with the two instruments, cites
+the fixture source and states that the 2012 display does not establish the
+present collection.
+
+The currentness classifier's miss remains a recorded model error; the answer
+path is robust to it because the property reviewer separately established the
+historical relationship. Regression coverage verifies both syntax-only recovery
+and currentness-classifier disagreement. The full Rust suite passes (416 tests),
+with formatting and diff checks clean. This synthetic fixture verifies the
+production answer path and exact source handling, not the factual quality of a
+real museum source. Independent adjudication and cross-topic partial-answer
+replays remain open.
+
+Three cross-domain live fixture replays after this change retained the bounded
+answer behavior: the negative experiment was quoted with its measured result
+and no invented cause; the island list stayed scoped to Alder Island; and the
+Clark Kent/Superman relation stayed scoped to Earth-One. The runs completed in
+34 s, 190 s and 73 s respectively. These are positive smoke checks for
+grounding and answer form, not independent semantic adjudication or a
+representative latency benchmark.
+
+### Part 1 continuation — dated comparisons and reviewer false rejections — 14 October
+
+Two additional production-path fixtures exercise differing dates. For a
+conflicting start year, the final live answer attributes 2000 and 1998 to their
+respective passages and says the evidence does not resolve which account is
+correct. A second case asks for Willow Bay's population in 2010 and 2020; after
+bounded extraction and property reconsideration, both census figures are
+selected and reported with their dates.
+
+The conflict answer exposed a reviewer false rejection: the model's first
+critique said the draft failed to state that the dates were unresolved when the
+draft did say so. The answer-review prompt now separates passage support from
+agreement between sources, and a rejected first assessment receives one
+fresh-context semantic reconsideration. A model-double regression verifies
+that the reconsideration can correct a false rejection. The live conflict
+replay passed review after the clarified support definition; the second-review
+recovery itself has not yet been observed in a live run.
+
+The changed-date comparison still receives an unnecessary currentness caveat.
+The currentness classifier and its second semantic review both confuse
+researching historical figures with needing information about the present.
+Repeated prompt clarification did not fix the 2B model's judgment, so this is
+recorded as a live semantic failure for further work rather than hidden by a
+phrase rule. Separately, relation/object normalization differs between the
+two live conflict claims, so storage leaves both awaiting corroboration rather
+than linking them as a conflict. The answer path handles the disagreement, but
+claim-level conflict metadata still needs repair.
+
+The fixture set now includes both date cases. Relevant replays are archived at
+evals/results/grounding-date-scope-replays-v5-2026-10-14 and
+evals/results/grounding-date-scope-replays-v6-2026-10-14. Unit coverage now
+includes year-only validity normalization, partial components of multi-part
+questions, confident currentness reconsideration, and answer-review
+reconsideration. Independent adjudication and broad dialogue review remain
+open. At the start of the follow-up, the full `cargo test` run had 407 passing
+tests and 14 failures. Most failing reply tests assume a previous model-call sequence and
+need their model doubles updated for the added bounded reconsideration; the
+follow-up below records their repair and subsequent validation.
+
+
+### Follow-up hour — review contracts and concrete temporal needs — 14 October
+
+The failing tests were repaired without removing their rejection assertions.
+Their model doubles now include the bounded reconsideration steps. The audit
+also found real orchestration defects: initial review fields were not fully
+validated before reconsideration, and the second reviewer lacked some of the
+first reviewer's policy. Both passes now enforce the same grounding contract.
+A disagreement requires a fresh answer and final review instead of publishing
+the rejected draft. Both critiques remain in diagnostics; the rewriter gets
+neutral reconstruction guidance, because a live run copied a false scope
+explanation from the first critique. The second reviewer receives original evidence without the
+prior rationale. Review feedback is serialized as untrusted JSON data for the
+answer repair, keeping discarded drafts out of that input. Regression coverage
+checks malformed reviews, uncertainty, disagreement and feedback instructions.
+The review code is extracted into a cohesive module, and answer instructions
+are shorter without a fixed sentence count that compresses multi-part answers.
+
+Direct probes showed that the model could correctly identify past dates while
+still applying the broad `time_sensitive` label incorrectly. Temporal intent
+now uses two concrete model decisions: whether present-state facts are needed,
+and whether the newest available knowledge is requested. Code combines these
+boolean outcomes; it does not interpret dates, topics or wording itself. A
+fresh second assessment must agree, otherwise the result stays unresolved.
+Malformed assessment excerpts and all resolved decisions are observable.
+Existing syntax-only JSON delimiter completion is shared with relevance review;
+it cannot invent missing fields, boolean values or unfinished strings.
+
+Eight direct-worker probes are retained in
+`evals/results/currentness-semantic-probes-2026-10-14` and
+`evals/results/currentness-concrete-probes-2026-10-14`. The original broad labels
+misread the historical population, current museum, implicit office holder and
+latest historical scholarship requests. Concrete flags improved the first
+three, but one office-holder response omitted a closing delimiter, and the
+latest-scholarship request remained misread. Some reasons also included
+irrelevant or ungrounded assertions. These diagnostics use a zero adapter and
+are not acceptance evidence or facts eligible for learning. One thinking probe
+exhausted 1,400 reasoning tokens in 46 seconds without a final answer; the rest
+of that diagnostic mode was stopped. This does not establish that thinking
+should be disabled for ordinary answers.
+
+Production-path replays are retained in
+`evals/results/grounding-review-contract-2026-10-14` and
+`evals/results/grounding-temporal-needs-2026-10-14`. The museum now gets correct
+currentness routing and retains its 2012 instruments with a present-status
+limit. The dated electrical measurement stays historical. The population
+comparison retains both figures without the incorrect currentness caveat, but
+adds irrelevant provenance narration and calls different periods a conflict;
+its model reviewer accepted that mistake. The conflicting-date replay remains
+unstable, including overlong drafts and unnecessary abstention. These results
+are retained as failures of semantic interpretation, not hidden by phrase rules.
+
+The live conflict replay also exposed a false rejection by the attribution
+speech-word guard: it treated an ordinary source reference as an invented named
+speaker. That guard and its runtime speech list are removed. Attribution is
+explicitly assessed by the structured semantic reviewer, with model-double
+coverage for false attributions, evidenced speakers and ordinary source
+references. This increases reliance on model review; it does not establish that
+the shared model will catch every attribution error. Other lexical answer guards
+remain inventoried in the working plan.
+
+The storage audit found that differing relation strings were automatically
+recorded as `does_not_address`. They now remain `unresolved` pending semantic
+review. Schema 63 reopens only links created by the old lexical rule; reviewed
+relationships, source claims and promotion states are preserved. Fresh-store
+and upgrade regressions cover paraphrased properties alongside truly different
+properties without inferring their meaning from string inequality. Actual
+semantic conflict linking between unverified findings remains unfinished.
+
+
+A further source-level run is retained in
+`evals/results/grounding-semantic-attribution-2026-10-14`. Its unrelated
+observatory answer correctly gives the founder and 1974 with its source. The
+conflicting-date answer now gets through the source-reference issue, but the
+shared reviewer accepts invented scope and unhelpful provenance commentary.
+The population reply again retains both dated figures without the currentness
+caveat, but repeats those same facts under a redundant "Material limits" list.
+These remain answer-quality failures. The latest full Rust suite passes
+429 tests; the Python fixture adapter's three tests also pass. Formatting and
+diff checks are clean. Unit agreement and successful execution do not imply
+a passing semantic benchmark.
+
+
+The final neutral-guidance conflict replay is retained at
+`evals/results/grounding-neutral-review-repair-2026-10-14`. It withheld the
+answer after 195 seconds instead of publishing the invented explanation. This
+is a remaining unnecessary-abstention failure, not a successful resolution.
+The disagreement repair instruction now asks the writer to recheck each
+statement independently, preserve every useful source-supported account with
+its attribution even when accounts conflict, and remove only unsupported or
+irrelevant additions. The follow-up live replay showed this instruction alone
+did not fix the unnecessary abstention: the repaired answer retained only one
+date and the final review rejected it. Disagreement cases now get one additional
+evidence-checked repair after that failure, while ordinary answer repairs
+retain their existing bound. A regression exercises this retry sequence; it
+passes. The first production replay after the retry change still abstained; its
+rewrite chose one date, then reviewers again disagreed about the corrected
+answer. A second replay after hiding unrelated source-origin metadata retained
+both attributed dates, but still abstained after the reviewers disagreed about
+whether the answer addressed the request and whether the date was unresolved.
+The metadata change removed the unsupported independence claim from the review
+evidence, but answer review remains inconsistent. A thinking-enabled replay
+timed out at 360 seconds while composing the initial answer; thinking stays
+enabled for the initial answer, while review and repair remain no-thinking to
+avoid multiplying that latency. The earlier population replay still contains
+duplicated facts and an unnecessary source-independence note; its global
+reviewer accepted both, reinforcing the need for assertion-level review.
+A new replay after making source-relationship metadata and corroboration
+instructions request-specific returned both dated population figures with
+their sources and no repeated limitation list or independence note. The first
+conflicting-date replay under the request-scoped prompts still abstained: the
+reviewer alternately called an attributed, unresolved answer insufficient and
+treated “the evidence does not settle the conflict” as an unsupported
+definitive claim. The review policy was then revised to require attributed
+accounts and an unresolved conclusion, and to explain scope only when the
+passages establish it. The follow-up replay at
+`evals/results/grounding-conflict-policy-replay-2026-10-14` answered with both
+dates, matched each to its source, and said the evidence does not settle the
+disagreement. The answer review accepted it on the first attempt. The newer
+population answer is also shorter and omits independence commentary, but
+repeats the figures once in a summary and again in its source bullets.
+Assertion-level concision review remains necessary.
+Temporal-intent uncertainty also still sometimes reflects missing factual
+knowledge rather than ambiguity about the requested time; uncertain initial
+assessments are now recorded explicitly for diagnosis. A missing-checkpoint
+unit test's request lock is isolated from live inference after a concurrent
+run delayed the suite; production locking behavior is unchanged. Review
+contract tests now have their own module, and Python bytecode caches are ignored.
+
+### Chat quiet-window repair — 14 October
+
+The initial two-minute quiet window exempted only the Interaction agent role.
+That was incorrect: browser replies also use Curmudgeon for intent, source-check
+and answer-review passes, and may use Scholar for foreground research. Those
+calls could pause the response they were meant to help. Foreground access now
+belongs to the chat turn's runtime handle, independently of agent role. Its
+models share the same warm pool as upkeep; the background handle still yields.
+Startup also establishes a two-minute quiet window before upkeep can take over.
+
+A scheduling regression verifies that foreground Curmudgeon and Scholar handles
+reach backend access while a background Curmudgeon handle remains paused, without
+loading a real model. The full suite passes 433 tests and the release rebuild
+succeeds. This is orchestration validation, not a live response-quality result.
+The sampled running server still had chat's source-check pass waiting for the
+pool while Scholar harvested a source. An already-running inference cannot be
+interrupted by this gate; the rebuilt server needs a restart to use the fix.
+Moving ordinary conversation audits to quiet time is separately proposed in
+the runtime roadmap, with knowledge-promotion review retained.
+
+### Conversational delivery and context repair — 14 October
+
+The pasted clarification failure exposed three separate problems. A synchronous
+style gate replaced the generated reply with a literal validation-failure
+message. Automatic topic detection archived and cleared the session on a
+clarification request, leaving an empty conversation in the answer prompt. A
+separate acknowledgment route could also send ordinary requests to Curmudgeon
+for generation using an acknowledgment-only prompt.
+
+Ordinary dialogue now uses Lyra's Interaction backend and the actual session
+history. Session resets are controlled by the browser's explicit new-chat action;
+topic interpretation cannot clear the transcript. The acknowledgment route and
+literal repeated-answer retry are removed. Conversation-quality audits use the
+existing background reply queue, store structured advisory verdicts and historical
+context in the proposal ledger, and cannot rewrite delivered text or approve
+factual claims. Invalid audit output remains uncertain. Source-backed answer
+review and knowledge-promotion gates remain enforced. No database migration is
+needed for this audit record.
+
+Live HTTP replays are retained in `state/runtime-chat-replay-2026-10-14.json`
+and `state/runtime-chat-final-replay-2026-10-14.json`, with logs alongside them.
+The first replay confirmed delivery without the style gate but exposed the
+acknowledgment misrouting. The second kept context and generated through Lyra,
+but a greeting still took 39 seconds and a clarification took 148 seconds with
+an overly generic answer. General interview advice was misclassified as a
+factual lookup and returned a source-verification abstention after 170 seconds.
+These are retained model failures, not a passing grounding benchmark.
+
+That long response also outlasted the original quiet deadline. Foreground runtime
+handles now hold upkeep paused for the entire turn, including cloned model
+handles, then start a fresh two-minute idle window. A regression exercises that
+lifetime without loading a model. The intent prompt now requires a deliverable
+rationale before choosing direct performance or external factual lookup, and
+records the assessment for diagnosis. It preserves explicit verification and
+consequential-guidance evidence requirements. The full suite passes 431 tests;
+latest intent validation also rejects missing or empty rationales.
+
+The deliverable-first assessment then routed interview advice to direct
+performance and produced useful advice in 44 seconds. Its clarification still
+focused on source verification, exposing source instructions and empty source
+fields in a prompt with no evidence. Those instructions and fields are now
+included only when relevant source data exists; user-report guidance is similarly
+scoped to supplied reports. The final live replay in
+`state/runtime-chat-context-scoped-replay-2026-10-14.json` gives concise interview
+preparation advice in 43.03 seconds and, on a clarification request, restates
+the same four points in 43.48 seconds. Both turns retain session history and
+avoid research, style rejection and provenance narration. The actual generation
+uses Interaction; background upkeep remains paused. This is a successful small
+conversation replay, not independent benchmark acceptance. Reasoning latency and
+broader semantic reliability remain open.
+
+The patched development server is running on loopback port 8080. Restarting a
+test server also exposed a shutdown wait while upkeep was paused; interruptible
+shutdown is recorded in the runtime roadmap. Prior failed replay logs and session
+archives remain intact. Stale resident locks from stopped test processes were
+removed without touching the live runtime's locks.

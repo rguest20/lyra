@@ -31,7 +31,10 @@ Then run `cargo run --release -- chat` or `cargo run --release -- serve`.
 User-facing answers enable thinking; structured extraction disables it. The debug
 setting controls whether the reasoning trace is displayed. Only text inputs are supported.
 The MLX backend requires Apple Silicon Metal; `COMMUNITY_DEVICE=cpu` is available
-for the legacy Candle Qwen3 backend. Quantized Qwen3.5 checkpoints are rejected.
+for the legacy Candle Qwen3 backend. MLX can load BF16 or quantized Qwen3.5
+checkpoints. The current configuration remains BF16. Quantized models keep their
+output adapter separate; the runtime will not merge an adapter into quantized
+weights.
 
 The switch checklist in [docs/qwen35-2b-switch.md](docs/qwen35-2b-switch.md)
 records conversation migration and measured results. The knowledge map and
@@ -39,31 +42,35 @@ SQLite research database remain shared. Context exhaustion returns an error;
 it does not silently discard conversation history.
 
 `model.loaded` logs backend, precision, shard count, context cap, template,
-device, and adapter selection. Agents now use lazy per-agent model handles and
-share matching model/adapter instances within a process. Inference is serialized
-with a shared request lock derived from `COMMUNITY_MODEL_LOCK` (default
-`state/model-inference.lock`) with `.requests` appended; background network work
-does not hold this lock. A waiting process emits `model.waiting_for_lease`.
+device, and adapter selection. Agents use lazy model handles. Background upkeep
+and foreground chat have separate warm model caches and request locks, so an
+upkeep generation already in progress cannot block a chat turn. Each lane is
+serialized internally; the background lock is derived from `COMMUNITY_MODEL_LOCK`
+(default `state/model-inference.lock`) with `.requests` appended, while chat uses
+`.chat.requests`. A waiting process emits `model.waiting_for_lease`, and
+`model.request_wait` records quiet-window, local-pool, and process-lock waiting.
 `agent.inference` records agent/model identity, duration, and visible token usage
 where available, without prompt contents. Models remain cached up to
-`COMMUNITY_MODEL_CACHE_SIZE` (default 1). The browser server and its background
-curator share one long-lived runtime, so cached models stay loaded between turns
-and maintenance passes. Agents with matching checkpoint, adapter, and device
-assignments share one backend. Restart running processes to pick up adapter
-changes.
+`COMMUNITY_MODEL_CACHE_SIZE` (default 1) per lane. The browser server and its
+background curator keep separate long-lived runtimes, so the same checkpoint
+may be resident twice. Agents with matching checkpoint, adapter, and device
+assignments share a backend within a lane. Restart running processes to pick up
+adapter changes.
 
 For per-agent configuration, the 0.6B/2B MacBook profile, measured memory
 constraints, and cache limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
 
-The MLX backend supports a fresh output adapter, teacher-forced adapter training,
-and merging that adapter into an unquantized BF16 output head. Adapter files are
+The MLX backend supports a fresh output adapter and teacher-forced adapter
+training. That adapter can be merged into an unquantized BF16 output head, while
+it remains separate when the base is quantized. Adapter files are
 specific to this model's hidden and vocabulary sizes. Consolidation and rebuild
 preserve original checkpoint tensors and create an untied output head;
 they require additional memory and disk. Lineage hashing covers every source
 shard. Do not reuse an adapter from a different model.
 
 Fresh MLX adapters are saved automatically when the model first loads. They
-start with a zero output delta, so the base model is unchanged. `model.loaded`
+start with a zero output delta, so the base model is unchanged. Keep a distinct
+adapter path when changing the base precision. `model.loaded`
 reports `adapter_state` (`initialized_untrained`, `loaded_untrained`, or
 `loaded_trained`), whether the file exists, and its training-step count. Untrained
 adapters skip their unused output computation during generation.
@@ -131,28 +138,24 @@ maintenance runs in a thread using that same runtime and cache. Each browser tab
 gets a separate conversation
 history under `state/web-sessions/`. Reloading a tab keeps its session; a new
 tab or **Start a new conversation** begins a fresh history. Learned knowledge
-is shared across sessions. The agent also starts a fresh history when you
-explicitly ask it to ignore the conversation, or when the local model judges
-that a new message starts a distinct conversational thread. This semantic
-continuity check starts after the first two exchanges and uses recent dialogue
-with Curmudgeon's model assignment. It first checks whether the message could
-reasonably continue that dialogue, including corrections and acknowledgments.
-A plausible continuation or an unclear judgment keeps the current conversation;
-only an independent request or explicit reset starts a new one. The check adds a short local model pass to prompts that need
-it. Set `COMMUNITY_WEB_ADDR` to another loopback address if port 8080 is in
+is shared across sessions. Topic changes do not clear the session history;
+Lyra keeps earlier turns available for later clarifications and corrections.
+Set `COMMUNITY_WEB_ADDR` to another loopback address if port 8080 is in
 use; non-loopback addresses are rejected.
 
-When Lyra starts a new thread automatically, the completed transcript is
-archived under `state/web-sessions/<session>.history/` before the active state
-file is replaced. The diagnostic log records `conversation.history_archived`
-with the archive path and message count. Starting a new browser conversation
-keeps the previous session file in place.
+Starting a new browser conversation keeps the previous session file in place.
+Archives created by older automatic topic resets also remain intact.
+Background inference yields throughout each browser reply and for two idle
+minutes afterward; startup provides the same grace period. An inference already
+in progress must finish before chat can use the shared backend.
 
 Reply diagnostics include `conversation.context_selected` with the retrieved
-claim and finding IDs. Unsuitable replies receive one automated style rewrite;
-answers relying solely on unpromoted research also receive an AI grounding
-review. See [context and reply quality fixes](docs/context-and-reply-quality.md)
-for the events, retry limits and validation.
+claim and finding IDs. Ordinary replies are generated by Lyra; conversational
+quality audits run afterward during upkeep and record advisory verdicts in the
+proposal ledger. They cannot rewrite delivered text or verify factual claims.
+Source-backed answers retain their AI grounding review, and factual
+knowledge-promotion gates remain enforced. Retained failures and current
+validation limits are in [the progress report](docs/grounding-generalization-progress.md).
 
 ## Scholar research queue
 
@@ -260,14 +263,25 @@ cargo run --release -- knowledge
 30 days. Lyra does not use web results to establish personal facts about the
 user. Research questions are sent to configured search providers; conversation
 history stays local. Internet access and `curl` are required for the worker.
+When local SearXNG is configured, Scholar tries it before quota-based providers
+and only falls back to those providers if SearXNG returns no candidates. The
+bundled local setup is available with `scripts/start-searxng.sh`; it creates a
+local secret and starts the container bound only to `127.0.0.1:8888`, enables
+JSON, and caps Google and Brave
+connection pools. Lyra also enforces a persisted ten-second minimum between
+requests to the SearXNG host. The SearXNG limiter is disabled because this
+instance is private and local; it protects the instance from incoming clients,
+not the upstream search engines. To configure Lyra, copy
+`config.example.toml` to the ignored `config.toml` and set
+`[search.searxng].url = "http://localhost:8888/search"`, or set `SEARXNG_URL`.
 Scholar can use directly supported findings as tentative evidence before they
 reach the semantic map. Lyra should attribute them and qualify the answer
 naturally, for example, “I'm not completely sure, but these sources say…”.
 Scholar uses SerpAPI after weak Wikipedia evidence when its persisted
 30-minute interval has elapsed, and Tavily after its persisted one-hour
-interval. When Wikipedia yields a direct finding, it searches SerpAPI only
-after an hour and Tavily only after two hours since each provider's last
-search. Set `SCHOLAR_SERP_INTERVAL_SECONDS` or
+interval when those providers are needed. When Wikipedia yields a direct
+finding, it searches SerpAPI only after an hour and Tavily only after two hours
+since each provider's last search. Set `SCHOLAR_SERP_INTERVAL_SECONDS` or
 `SCHOLAR_TAVILY_INTERVAL_SECONDS` to change the base intervals; the
 strong-Wikipedia interval remains twice the configured value.
 Direct, well-grounded public findings that still need an independent source
