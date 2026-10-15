@@ -54,7 +54,8 @@ pub fn serve(
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
-    models.warm(AgentRole::Interaction)?;
+    // Leave the first model turn available for a user opening the browser.
+    models.for_chat().warm(AgentRole::Interaction)?;
     println!("Community web UI: http://{address}");
     let session_state_directory = Path::new(database_path)
         .parent()
@@ -247,13 +248,14 @@ fn handle_request(
         )?;
         return Ok(false);
     };
+    let chat_models = models.for_chat();
     let state_path = session_state_directory.join(format!("{}.json", parsed.session_id));
     let result = browser_reply(
         &parsed,
         &state_path,
         database_path,
         knowledge_path,
-        models,
+        &chat_models,
         curator,
     );
     match result {

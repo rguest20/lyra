@@ -15,6 +15,9 @@ pub(super) fn unsupported_entity_name(answer: &str, evidence: &[Value]) -> Optio
     crate::entities::literal_name_phrases(answer)
         .into_iter()
         .find(|name| {
+            if is_bracketed_url_citation_label(answer, name) {
+                return false;
+            }
             let words = normalized_words(name);
             !words.is_empty()
                 && ((words.len() >= 2
@@ -24,6 +27,25 @@ pub(super) fn unsupported_entity_name(answer: &str, evidence: &[Value]) -> Optio
                     .iter()
                     .any(|passage| passage.windows(words.len()).any(|window| window == words))
         })
+}
+
+fn is_bracketed_url_citation_label(answer: &str, label: &str) -> bool {
+    answer.match_indices(label).any(|(start, _)| {
+        let Some(open) = answer[..start].rfind('[') else {
+            return false;
+        };
+        if !answer[open + 1..start].trim().is_empty() {
+            return false;
+        }
+        let Some(after_label) = answer[start + label.len()..].strip_prefix(':') else {
+            return false;
+        };
+        let target = after_label.trim_start();
+        (target.starts_with("https://") || target.starts_with("http://"))
+            && answer[start + label.len()..]
+                .find(']')
+                .is_some_and(|close| close > 1)
+    })
 }
 
 fn phrase_is_mid_sentence(answer: &str, name: &str) -> bool {
@@ -118,87 +140,6 @@ pub(super) fn unsupported_causal_join(answer: &str, evidence: &[Value]) -> Optio
     None
 }
 
-// Naming an actor in a passage does not make that actor its reporting source.
-// Permit named attribution only when the quoted words identify that speaker.
-pub(super) fn unsupported_named_attribution(answer: &str, evidence: &[Value]) -> Option<String> {
-    let answer_words = word_spans(answer);
-    let speech = [
-        "said",
-        "says",
-        "reported",
-        "reports",
-        "stated",
-        "states",
-        "wrote",
-        "writes",
-        "explained",
-        "suggested",
-        "claimed",
-    ];
-    for name in crate::entities::literal_name_phrases(answer) {
-        let name_words = normalized_words(&name);
-        if name_words.is_empty() {
-            continue;
-        }
-        let is_attribution =
-            answer_words
-                .windows(name_words.len())
-                .enumerate()
-                .any(|(index, window)| {
-                    if !window
-                        .iter()
-                        .zip(&name_words)
-                        .all(|(word, name)| word.0 == *name)
-                    {
-                        return false;
-                    }
-                    let before = &answer_words[..index];
-                    let prefix = before.last().is_some_and(|word| {
-                        !answer[word.2..window[0].1].contains([',', '.', ';', ':', '\n'])
-                            && (word.0 == "source"
-                                || (word.0 == "to"
-                                    && before.len() >= 2
-                                    && matches!(
-                                        before[before.len() - 2].0.as_str(),
-                                        "according" | "attributed"
-                                    )))
-                    });
-                    let speech_after = answer_words
-                        .get(index + name_words.len())
-                        .is_some_and(|word| speech.contains(&word.0.as_str()));
-                    prefix || speech_after
-                });
-        if !is_attribution {
-            continue;
-        }
-        let named_in_source = evidence
-            .iter()
-            .filter_map(|entry| entry["passage"].as_str())
-            .any(|passage| {
-                let words = normalized_words(passage);
-                words
-                    .windows(name_words.len())
-                    .enumerate()
-                    .any(|(index, window)| {
-                        if window != name_words {
-                            return false;
-                        }
-                        let prefix = &words[..index];
-                        prefix.ends_with(&["according".into(), "to".into()])
-                            || prefix.ends_with(&["report".into(), "by".into()])
-                            || prefix.ends_with(&["statement".into(), "by".into()])
-                            || words
-                                .get(index + name_words.len())
-                                .is_some_and(|word| speech.contains(&word.as_str()))
-                    })
-            });
-        if !named_in_source {
-            return Some(name);
-        }
-    }
-    None
-}
-
 fn word_spans(text: &str) -> Vec<(String, usize, usize)> {
     let mut words = Vec::new();
     let mut start = None;
@@ -252,32 +193,14 @@ mod tests {
     }
 
     #[test]
-    fn named_attribution_requires_a_speaker_not_just_a_mentioned_actor() {
-        let evidence = vec![json!({"passage":"Ada Voss founded Meridian Observatory."})];
-        assert_eq!(
-            unsupported_named_attribution(
-                "According to Ada Voss, Meridian Observatory opened.",
-                &evidence
-            )
-            .as_deref(),
-            Some("Ada Voss")
-        );
-        assert!(
-            unsupported_named_attribution(
-                "According to the source, Ada Voss founded Meridian Observatory.",
-                &evidence
-            )
-            .is_none()
-        );
-        let evidence =
-            vec![json!({"passage":"Ada Voss said Meridian Observatory opened in 1974."})];
-        assert!(
-            unsupported_named_attribution(
-                "According to Ada Voss, Meridian Observatory opened in 1974.",
-                &evidence
-            )
-            .is_none()
-        );
+    fn bracketed_url_citation_labels_are_not_treated_as_claim_entities() {
+        let evidence = vec![json!({"passage":"Alexander Fleming discovered penicillin in 1928."})];
+        for citation in [
+            "Alexander Fleming discovered penicillin in 1928. [Source: https://example.org/page]",
+            "Alexander Fleming discovered penicillin in 1928. [Reference: https://example.org/page]",
+        ] {
+            assert_eq!(unsupported_entity_name(citation, &evidence), None);
+        }
     }
 
     #[test]

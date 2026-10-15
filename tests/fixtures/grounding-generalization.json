@@ -248,6 +248,48 @@
         }
       ],
       "inject_malformed": false
+    },
+    {
+      "id": "conflicting_start_dates",
+      "question": "When did Example Organization begin operating?",
+      "entities": [
+        "Example Organization"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "organization-history-a",
+          "origin": "history-reference.example",
+          "passage": "Example Organization began operating in 1998."
+        },
+        {
+          "id": "organization-history-b",
+          "origin": "archive-reference.example",
+          "passage": "Example Organization began operating in 2000."
+        }
+      ],
+      "inject_malformed": false
+    },
+    {
+      "id": "changed_population_by_year",
+      "question": "What population did Willow Bay have in 2010 and in 2020?",
+      "entities": [
+        "Willow Bay"
+      ],
+      "scope_constraints": [],
+      "evidence": [
+        {
+          "id": "willow-bay-census-2010",
+          "origin": "census-2010.example",
+          "passage": "The 2010 census recorded Willow Bay's population as 1,200."
+        },
+        {
+          "id": "willow-bay-census-2020",
+          "origin": "census-2020.example",
+          "passage": "The 2020 census recorded Willow Bay's population as 1,800."
+        }
+      ],
+      "inject_malformed": false
     }
   ]
 }

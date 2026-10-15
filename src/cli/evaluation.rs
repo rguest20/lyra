@@ -51,16 +51,16 @@ impl Fixture {
     }
 
     fn request(&self) -> String {
-        if self.entities.is_empty() && self.scope_constraints.is_empty() {
+        if self.entities.is_empty() {
             return self.question.clone();
         }
         // Plain lowercase delimiters cannot become invented proper names in
-        // the production literal-name fallback. Keep supplied names intact.
+        // the production literal-name fallback. Keep entity hints as context,
+        // while scope constraints remain in their dedicated stored field.
         format!(
-            "{}\ncontext entities: {}\nscope constraints: {}",
+            "{}\ncontext entities: {}",
             self.question,
-            self.entities.join(", "),
-            self.scope_constraints.join(", ")
+            self.entities.join(", ")
         )
     }
 }
@@ -345,5 +345,22 @@ mod tests {
                 .unwrap();
             assert_eq!(names, expected);
         }
+    }
+
+    #[test]
+    fn fixture_scope_constraints_do_not_become_question_text() {
+        let fixture = Fixture {
+            question: "What does Riverton Museum currently exhibit?".into(),
+            entities: vec!["Riverton Museum".into()],
+            scope_constraints: vec!["current collection, if established".into()],
+            evidence: vec![],
+            inject_malformed: false,
+        };
+        assert!(fixture.request().contains(&fixture.question));
+        assert!(!fixture.request().contains("scope constraints:"));
+        assert_eq!(
+            fixture.scope_constraints,
+            ["current collection, if established"]
+        );
     }
 }

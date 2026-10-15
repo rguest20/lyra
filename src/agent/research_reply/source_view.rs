@@ -6,28 +6,30 @@ pub(super) fn model_answer_evidence(
     evidence: &[Value],
     currentness: Option<bool>,
 ) -> Vec<Value> {
+    let include_source_relationships = crate::research::source_independence_request(question);
     evidence
         .iter()
         .enumerate()
         .map(|(index, entry)| {
             let state = &entry["evidence_state"];
-            let mut limits = Vec::new();
+            let mut qualifications = Vec::new();
             if state["finding_status"] != "promoted" || state["gate_status"] != "eligible" {
-                limits.push("Attribute this assertion to its source.".to_owned());
+                qualifications.push("source_attribution_required");
             }
-            if currentness != Some(false) && (state["research_relevance"] == "historical_context"
-                || state["gate_status"] == "unverified_temporal"
-                || state["freshness"] == "stale"
-                || (state["topic_class"] == "recent" && state["currency"] != "current"))
+            if currentness != Some(false)
+                && (state["research_relevance"] == "historical_context"
+                    || state["gate_status"] == "unverified_temporal"
+                    || state["freshness"] == "stale"
+                    || (state["topic_class"] == "recent" && state["currency"] != "current"))
             {
-                limits.push("The evidence does not establish current status. Preserve any date in the passage and qualify historical examples.".into());
+                qualifications.push("current_status_not_established");
             }
             let disagreements = state["conflicting_claims"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default();
             if state["gate_status"] == "conflict" || !disagreements.is_empty() {
-                limits.push("An unresolved disagreement may affect this assertion. Explain the different accounts and any scope uncertainty; do not choose one as settled.".into());
+                qualifications.push("reports_conflict");
             }
             let mut same_origin = Vec::new();
             let mut distinct_origins = Vec::new();
@@ -45,21 +47,27 @@ pub(super) fn model_answer_evidence(
                     }
                 }
             } else if crate::research::source_independence_request(question) {
-                limits.push("Independence from other passages has not been verified.".into());
+                qualifications.push("independence_unverified");
             }
-            for (field, description) in [
-                ("attribution", "Attribution stated in the source"),
-                ("geographic_scope", "Explicit geographic scope"),
-                ("context_scope", "Explicit contextual scope"),
+            for (field, qualification) in [
+                ("attribution", "source_attribution"),
+                ("geographic_scope", "geographic_scope"),
+                ("context_scope", "context_scope"),
             ] {
-                if let Some(value) = state[field].as_str().filter(|s|!s.trim().is_empty()) {
-                    limits.push(format!("{description}: {value}. Preserve this qualification."));
+                if state[field]
+                    .as_str()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    qualifications.push(qualification);
                 }
             }
             let mut view = json!({
                 "source": format!("source_{}", index + 1),
                 "passage": entry.get("passage"),
-                "limits": limits,
+                "required_qualifications": qualifications,
+                "attribution": state.get("attribution"),
+                "geographic_scope": state.get("geographic_scope"),
+                "context_scope": state.get("context_scope"),
                 "source_relationships": {
                     "same_origin_as": same_origin,
                     "distinct_verified_origins": distinct_origins,
@@ -68,9 +76,13 @@ pub(super) fn model_answer_evidence(
                 "possible_disagreements": disagreements,
             });
             if disagreements.is_empty() {
-                view.as_object_mut().unwrap().remove("possible_disagreements");
+                view.as_object_mut()
+                    .unwrap()
+                    .remove("possible_disagreements");
             }
-            if same_origin.is_empty() && distinct_origins.is_empty() {
+            if !include_source_relationships
+                || (same_origin.is_empty() && distinct_origins.is_empty())
+            {
                 view.as_object_mut().unwrap().remove("source_relationships");
             }
             if view["source_date"].is_null() {

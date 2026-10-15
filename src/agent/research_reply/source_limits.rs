@@ -24,27 +24,37 @@ pub(super) fn source_limited_answer_with_scope(
     {
         return None;
     }
-    let words = super::normalized_words(question);
     let provenance_request = crate::research::source_independence_request(question)
         || evidence
             .iter()
             .any(|entry| entry["evidence_state"]["research_relevance"] == "provenance");
-    // Unambiguous temporal cues or a reviewed, source-anchored historical use.
-    // The word "current" alone can denote a physical quantity, not currency.
-    let current_request = words
+    // Only a resolved contextual assessment can authorize a direct historical
+    // answer. If it is unresolved and the evidence is time-scoped, route through
+    // the reviewed answer path, which retains the currentness qualification.
+    let has_temporal_scope = evidence.iter().any(|entry| {
+        let state = &entry["evidence_state"];
+        state["research_relevance"] == "historical_context"
+            || state["gate_status"] == "unverified_temporal"
+            || state["freshness"] == "stale"
+            || (state["topic_class"] == "recent" && state["currency"] != "current")
+    });
+    if currentness.is_none() && has_temporal_scope && !provenance_request {
+        return None;
+    }
+    let current_request = currentness == Some(true);
+    // The relevance reviewer has already decided this source is useful only
+    // as historical context for this request. Preserve that more specific
+    // relationship even if the separate currentness classifier misses a cue.
+    let historical_context = evidence
         .iter()
-        .any(|word| matches!(word.as_str(), "currently" | "today" | "now" | "latest"))
-        || (words.iter().any(|word| word == "current")
-            && evidence.iter().any(|entry| {
-                entry["evidence_state"]["research_relevance"] == "historical_context"
-            }));
-    let current_request = currentness.unwrap_or(current_request);
-    let temporal = current_request
+        .all(|entry| entry["evidence_state"]["research_relevance"] == "historical_context");
+    let temporal = (current_request
         && evidence.iter().all(|entry| {
             let state = &entry["evidence_state"];
             state["research_relevance"] == "historical_context"
                 || state["gate_status"] == "unverified_temporal"
-        });
+        }))
+        || historical_context;
     let origin = evidence[0]["evidence_state"]["independence_key"]
         .as_str()
         .filter(|key| !key.trim().is_empty());
@@ -99,18 +109,13 @@ pub(super) fn source_limited_answer_with_scope(
     }
     let mut paragraphs = reports
         .iter()
-        .map(|(passage, sources)| {
-            format!(
-                "The source reports: “{passage}” (Sources: {})",
-                sources.join(", ")
-            )
-        })
+        .map(|(passage, sources)| format!("“{passage}” (Source: {})", sources.join(", ")))
         .collect::<Vec<_>>();
     if one_verified_origin {
         paragraphs.push("The supplied evidence represents one reporting source; it does not establish independent corroboration.".into());
     }
     if temporal {
-        paragraphs.push("I haven't established whether this is still current.".into());
+        paragraphs.push("The source does not establish whether this remains current.".into());
     }
     Some(LimitedAnswer {
         text: paragraphs.join("\n\n"),
@@ -140,6 +145,8 @@ mod tests {
             &evidence,
         )
         .unwrap();
+        assert!(answer.text.starts_with('“'));
+        assert!(!answer.text.starts_with("The source reports"));
         assert!(answer.text.contains(passage));
         assert!(!answer.text.contains("because"));
         assert!(!answer.text.contains("still current"));
@@ -172,6 +179,7 @@ mod tests {
         ];
         let answer =
             source_limited_answer("Is the claim independently corroborated?", &evidence).unwrap();
+        assert!(answer.text.starts_with('“'));
         assert_eq!(answer.text.matches(passage).count(), 1);
         assert!(answer.text.contains("https://one.example/report"));
         assert!(answer.text.contains("https://two.example/report"));

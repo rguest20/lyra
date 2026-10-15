@@ -1,30 +1,6 @@
 use super::*;
 
 #[test]
-fn answer_rewrites_and_structured_reviews_have_distinct_generation_modes() {
-    let passage = "Ada Voss founded Meridian Observatory in 1974.";
-    let evidence = vec![json!({"source":"https://example.org/history","passage":passage})];
-    let mut modes = Vec::new();
-    let answer = ground_research_reply_with_scope(
-        "Who founded Meridian Observatory?",
-        "The observatory was founded in 1986.",
-        &evidence,
-        None,
-        |_, is_answer| {
-            modes.push(is_answer);
-            Ok(match modes.len() {
-                1 => json!({"supported":false,"addresses_request":false,"reason":"Wrong date and missing founder."}).to_string(),
-                2 => passage.into(),
-                3 => json!({"supported":true,"addresses_request":true,"reason":"The rewritten answer follows the source."}).to_string(),
-                _ => panic!("answer repair must remain bounded"),
-            })
-        },
-    ).unwrap();
-    assert_eq!(modes, [false, true, false]);
-    assert!(answer.starts_with(passage));
-}
-
-#[test]
 fn a_claim_subject_cannot_be_relabelled_as_its_reporting_source() {
     let evidence = vec![
         json!({"source":"https://example.org/biography","passage":"Alexander Fleming discovered penicillin in 1928."}),
@@ -34,12 +10,53 @@ fn a_claim_subject_cannot_be_relabelled_as_its_reporting_source() {
         "Alexander Fleming discovered penicillin in 1928. This fact is attributed to the source Alexander Fleming as stated in the passage.",
         &evidence, |prompt| { calls += 1;
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(json!({"supported":true,"addresses_request":true,"reason":"The source names the discoverer."}).to_string())
+                Ok(if calls <= 2 {
+                    json!({"verdict":"revise","supported":false,"addresses_request":true,"reason":"The discoverer is not identified as the reporting source."}).to_string()
+                } else {
+                    json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The source names the discoverer without making him its publisher."}).to_string()
+                })
             } else { Ok("According to the source, Alexander Fleming discovered penicillin in 1928.".into()) }
         }).unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(!answer.contains("source Alexander Fleming"));
     assert!(answer.contains("discovered penicillin"));
+}
+
+#[test]
+fn source_references_and_evidenced_speakers_are_reviewed_without_phrase_guards() {
+    for (passage, draft) in [
+        (
+            "The laboratory measured two amperes.",
+            "Source 1 reports that the laboratory measured two amperes. source_1",
+        ),
+        (
+            "Ada Voss said the observatory opened in 1974.",
+            "According to Ada Voss, the observatory opened in 1974. source_1",
+        ),
+        (
+            "The archive records an opening date of 1974.",
+            "The archive's account gives 1974 as the opening date. source_1",
+        ),
+    ] {
+        let evidence = vec![json!({"source":"https://example.org/report","passage":passage})];
+        let mut calls = 0;
+        let result =
+            ground_research_reply("What does the source report?", draft, &evidence, |prompt| {
+                calls += 1;
+                assert!(prompt.contains("Check every named attribution"));
+                Ok(
+                    json!({"verdict":"accept","supported":true,"addresses_request":true,
+                "reason":"The source attribution is appropriate to the supplied passage."})
+                    .to_string(),
+                )
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            result,
+            resolve_source_labels(draft, &["https://example.org/report"])
+        );
+    }
 }
 
 #[test]
@@ -55,7 +72,7 @@ fn conditional_sources_cannot_become_an_outcome_or_a_denial() {
         "No evidence of an observation exists.",
     ] {
         let answer = ground_research_reply("Did the Orion detector observe a new particle?", draft, &evidence,
-            |_| Ok(json!({"supported":true,"addresses_request":true,"reason":"The source mentions detection."}).to_string())).unwrap();
+            |_| Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The source mentions detection."}).to_string())).unwrap();
         assert!(answer.contains(passage));
         assert!(!answer.contains("has not observed"));
         assert!(!answer.contains("No evidence"));
@@ -71,7 +88,7 @@ fn independent_source_clauses_cannot_become_a_causal_explanation() {
     let answer = ground_research_reply("Did Meridian Laboratory demonstrate superconductivity?", draft, &evidence,
         |prompt| { calls += 1;
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(json!({"supported":true,"addresses_request":true,"reason":"Both observations occur in the source."}).to_string())
+                Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"Both observations occur in the source."}).to_string())
             } else { Ok(passage.into()) }
         }).unwrap();
     assert_eq!(calls, 3);
@@ -89,7 +106,7 @@ fn an_unseen_location_cannot_be_added_despite_positive_review() {
         "Ada Voss founded Meridian Observatory in 1974. Meridian Observatory is located in California.", &evidence,
         |prompt| { calls += 1;
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(json!({"supported":true,"addresses_request":true,"reason":"The source names the founder."}).to_string())
+                Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The source names the founder."}).to_string())
             } else { Ok("According to the source, Ada Voss founded Meridian Observatory in 1974.".into()) }
         }).unwrap();
     assert_eq!(calls, 3);
@@ -104,7 +121,7 @@ fn source_labels_resolve_case_variants_without_leaking_internal_identifiers() {
     ];
     let answer = ground_research_reply("What does Solara do?",
         "According to Source_1, Solara keeps vaccines cold.", &evidence,
-        |_| Ok(json!({"supported":true,"addresses_request":true,"reason":"The passage states this function."}).to_string())).unwrap();
+        |_| Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The passage states this function."}).to_string())).unwrap();
     assert!(!answer.contains("Source_1"));
     assert!(answer.contains("https://example.org/report"));
 }
@@ -136,7 +153,7 @@ fn source_conjunctions_cannot_be_split_despite_positive_model_review() {
         let result = ground_research_reply(question, broken, &evidence, |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
                 reviews += 1;
-                Ok(json!({"supported":true,"addresses_request":true,"reason":"The source lists the items."}).to_string())
+                Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The source lists the items."}).to_string())
             } else {
                 Ok(repaired.into())
             }
@@ -153,7 +170,7 @@ fn provenance_limit_does_not_become_a_temporal_disclaimer() {
         "evidence_state":{"gate_status":"unverified_temporal","independence_key":"wire-report",
             "independence_verified":true}})];
     let answer = ground_research_reply("Is the claim independently corroborated?", "Draft", &evidence,
-        |_| Ok(r#"{"supported":true,"addresses_request":true,"reason":"Limited source assertion."}"#.into())).unwrap();
+        |_| Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Limited source assertion."}"#.into())).unwrap();
     assert!(answer.contains("does not establish independent corroboration"));
     assert!(!answer.contains("still current"));
 }
@@ -163,8 +180,8 @@ fn a_physics_current_is_not_a_currentness_request() {
     let evidence = vec![json!({"source":"https://example.org/reference",
         "passage":"Electric current is a flow of electric charge.",
         "evidence_state":{"gate_status":"unverified_temporal"}})];
-    let answer = ground_research_reply("What is electric current?", "The source defines electric current as a flow of electric charge.",
-        &evidence, |_| Ok(r#"{"supported":true,"addresses_request":true,"reason":"Source definition is attributed."}"#.into())).unwrap();
+    let answer = ground_research_reply_with_scope("What is electric current?", "The source defines electric current as a flow of electric charge.",
+        &evidence, Some(false), |_, _| Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Source definition is attributed."}"#.into())).unwrap();
     assert!(!answer.contains("still current"));
     assert!(answer.contains("flow of electric charge"));
 }
@@ -174,16 +191,17 @@ fn temporal_gate_is_enforced_even_when_semantic_use_is_incorrectly_direct() {
     let evidence = vec![json!({"source":"https://example.org/catalogue",
         "passage":"The archive lists War and Peace and Northanger Abbey.",
         "evidence_state":{"gate_status":"unverified_temporal","research_relevance":"direct"}})];
-    let answer = ground_research_reply(
+    let answer = ground_research_reply_with_scope(
         "What titles are currently available?",
         "The titles are no longer available.",
         &evidence,
-        |_| panic!("temporal policy must survive a positive but incorrect model verdict"),
+        Some(true),
+        |_, _| panic!("temporal policy must survive a positive but incorrect model verdict"),
     )
     .unwrap();
     assert!(answer.contains("War and Peace and Northanger Abbey"));
     assert!(!answer.contains("no longer"));
-    assert!(answer.contains("haven't established whether this is still current"));
+    assert!(answer.contains("does not establish whether this remains current"));
     let conflicting = vec![
         json!({"source":"https://example.org/other","passage":"A different list.",
         "evidence_state":{"gate_status":"unverified_temporal","conflicting_claims":["a conflicting current list"]}}),
@@ -198,15 +216,16 @@ fn historical_only_evidence_cannot_become_a_present_day_exclusion() {
         json!({"source":"https://example.org/archive","passage":passage,
         "evidence_state":{"research_relevance":"historical_context"}}),
     ];
-    let answer = ground_research_reply(
+    let answer = ground_research_reply_with_scope(
         "What does the museum currently exhibit?",
         "The current collection does not include an astrolabe or reflecting telescope.",
         &evidence,
-        |_| panic!("source-literal historical context requires no invented current assertion"),
+        Some(true),
+        |_, _| panic!("source-literal historical context requires no invented current assertion"),
     )
     .unwrap();
     assert!(answer.contains(passage));
-    assert!(answer.contains("haven't established whether this is still current"));
+    assert!(answer.contains("does not establish whether this remains current"));
     assert!(!answer.contains("does not include"));
     assert!(answer.contains("https://example.org/archive"));
     let mixed = vec![
@@ -250,9 +269,9 @@ fn historical_selection_limits_currentness_even_when_original_gate_is_eligible()
         None,
     );
     assert!(
-        view[0]["limits"]
+        view[0]["required_qualifications"]
             .to_string()
-            .contains("does not establish current status")
+            .contains("current_status_not_established")
     );
     assert!(view[0]["passage"].as_str().unwrap().contains("2012"));
 }
@@ -267,7 +286,7 @@ fn grounding_basics_rejects_invented_entity_extension_despite_positive_review() 
         &evidence, |prompt| {
             calls += 1;
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(r#"{"supported":true,"addresses_request":true,"reason":"Qualified provenance answer."}"#.into())
+                Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Qualified provenance answer."}"#.into())
             } else {
                 Ok("Sciencewire reports the Helios Laboratory flight test in 2020. Independent corroboration is not established. source_1".into())
             }
@@ -278,48 +297,41 @@ fn grounding_basics_rejects_invented_entity_extension_despite_positive_review() 
 }
 
 #[test]
-fn explicit_source_fallback_preserves_compound_names_across_domains() {
-    for (question, passage) in [
+fn partial_answer_requests_are_interpreted_from_the_question_not_phrase_gates() {
+    for (question, passage, partial_answer) in [
         (
-            "Which book is best? If you can't tell, list the titles.",
+            "Which book would you pick? If a ranking is unavailable, the titles would still help.",
             "The catalogue lists War and Peace, Sense and Sensibility, and Northanger Abbey.",
+            "I can't rank them from these sources, but the catalogue lists War and Peace, Sense and Sensibility, and Northanger Abbey.",
         ),
         (
-            "Which musical act is your favourite? If sources don't identify one, enumerate the alternatives.",
+            "What's your favourite musical act? At least tell me who appears on the programme.",
             "The programme lists Simon and Garfunkel, Earth, Wind & Fire, and Queen.",
+            "The programme names Simon and Garfunkel, Earth, Wind & Fire, and Queen; it doesn't establish a favourite.",
         ),
         (
-            "Which destination is best? If you cannot determine that, give the options.",
+            "Which destination is best? Even without deciding that, what places are named?",
             "The itinerary includes Trinidad and Tobago, Antigua and Barbuda, and Saint Lucia.",
+            "The itinerary includes Trinidad and Tobago, Antigua and Barbuda, and Saint Lucia, but doesn't rank them.",
         ),
     ] {
         let evidence = vec![json!({"source":"https://example.org/reference","passage":passage})];
+        let mut reviews = 0;
         let reply = ground_research_reply(question, "No supported ranking.", &evidence, |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(r#"{"supported":true,"addresses_request":false,"reason":"No ranking available."}"#.into())
+                reviews += 1;
+                Ok(if reviews == 1 {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":false,"reason":"The useful partial answer is missing."}"#.into()
+                } else {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"It gives the source-listed options and leaves the ranking unresolved."}"#.into()
+                })
             } else {
-                Ok("No supported ranking.".into())
+                assert!(prompt.contains(question));
+                Ok(partial_answer.to_owned())
             }
         }).unwrap();
-        assert!(reply.contains(passage), "compound wording changed: {reply}");
+        assert!(reply.contains(partial_answer), "{question}: {reply}");
         assert!(reply.contains("https://example.org/reference"));
-        assert!(reply.contains("I can't tell which is best"));
-    }
-}
-
-#[test]
-fn fallback_requires_an_explicit_list_request_not_a_topic_word_or_substring() {
-    let evidence = vec![json!({"source":"https://example.org/reference",
-        "passage":"The catalogue lists War and Peace and Northanger Abbey."})];
-    for question in [
-        "What are the asbestos alternatives? If you can't tell, list them.",
-        "Which flavour is best? If you can't tell, say so.",
-        "Which book is best? If you can't tell, say so.",
-    ] {
-        assert!(
-            explicit_best_question_fallback(question, &evidence).is_none(),
-            "{question}"
-        );
     }
 }
 
@@ -330,12 +342,18 @@ fn grounding_rewrites_metadata_even_when_fact_reviewer_accepts_the_draft() {
         "evidence_state":{"finding_status":"needs_review","gate_status":"awaiting_corroboration",
             "extraction_confidence":0.99}})];
     let mut calls = 0;
+    let mut reviews = 0;
     let answer = ground_research_reply("When did Aurora Observatory open?",
         "Aurora Observatory opened in 2001, with extraction confidence of 0.99.", &evidence,
         |prompt| {
             calls += 1;
             if prompt.contains("Check the ANSWER's factual assertions") {
-                Ok(r#"{"supported":true,"addresses_request":true,"reason":"The opening date is in the passage."}"#.into())
+                reviews += 1;
+                Ok(if reviews <= 2 {
+                    r#"{"verdict":"revise","supported":false,"addresses_request":true,"reason":"Remove internal review metadata."}"#.into()
+                } else {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The opening date is in the passage."}"#.into()
+                })
             } else {
                 // The repair generator must not receive raw scores or review enums either.
                 let data = prompt.split("Data: ").last().unwrap();
@@ -344,28 +362,13 @@ fn grounding_rewrites_metadata_even_when_fact_reviewer_accepts_the_draft() {
                 Ok("The source dates Aurora Observatory's opening to 2001. source_1".into())
             }
         }).unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(answer.contains("2001"));
     assert!(!answer.contains("confidence"));
 }
 
 #[test]
-fn factual_questions_do_not_acquire_unrequested_rankings() {
-    let draft =
-        "The source dates the opening to 2001. I can't tell which is best from these sources.";
-    assert!(reply_style_failure("When did Aurora Observatory open?", draft).is_some());
-    assert!(reply_style_failure("Which observatory is best?", draft).is_none());
-    assert!(
-        reply_style_failure(
-            "What does the extraction_confidence field measure?",
-            "extraction_confidence measures the extractor's confidence."
-        )
-        .is_none()
-    );
-}
-
-#[test]
-fn answer_generator_gets_source_limits_and_shared_lineage_without_internal_scores() {
+fn answer_generator_gets_qualification_codes_and_shared_lineage_without_internal_scores() {
     let evidence = vec![
         json!({"source":"https://one.example/story","passage":"Aurora Observatory opened in 2001.",
             "evidence_state":{"finding_status":"needs_review","gate_status":"unverified_temporal",
@@ -379,7 +382,17 @@ fn answer_generator_gets_source_limits_and_shared_lineage_without_internal_score
                 "independence_key":"separate-wire","independence_verified":true,
                 "conflicting_claims":["Aurora Observatory opened in 2001."]}}),
     ];
-    let public = model_answer_evidence("When did Aurora Observatory open?", &evidence, None);
+    let answer_view = model_answer_evidence("When did Aurora Observatory open?", &evidence, None);
+    assert!(
+        answer_view
+            .iter()
+            .all(|source| source.get("source_relationships").is_none())
+    );
+    let public = model_answer_evidence(
+        "Are these independent sources for when Aurora Observatory opened?",
+        &evidence,
+        None,
+    );
     let text = serde_json::to_string(&public).unwrap();
     for internal in [
         "extraction_confidence",
@@ -412,8 +425,17 @@ fn answer_generator_gets_source_limits_and_shared_lineage_without_internal_score
     );
     assert!(!text.contains("publication_"));
     assert!(public[0].get("source_date").is_none());
-    assert!(public[0]["limits"].to_string().contains("current"));
-    assert!(public[2]["limits"].to_string().contains("disagreement"));
+    assert!(
+        public[0]["required_qualifications"]
+            .to_string()
+            .contains("current_status_not_established")
+    );
+    assert!(
+        public[2]["required_qualifications"]
+            .to_string()
+            .contains("reports_conflict")
+    );
+    assert!(!text.contains("Attribute this assertion to its source."));
     assert!(text.contains("Aurora Observatory opened in 2001."));
 }
 
@@ -432,7 +454,7 @@ fn lack_of_corroboration_is_a_supported_limitation_not_an_independence_claim() {
         let mut calls = 0;
         let answer = ground_research_reply("What does Cofresh make?", &draft, &evidence, |_| {
             calls += 1;
-            Ok(r#"{"supported":true,"addresses_request":true,"reason":"Source-attributed products and an explicit limitation."}"#.into())
+            Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Source-attributed products and an explicit limitation."}"#.into())
         }).unwrap();
         assert_eq!(calls, 1, "{limitation}");
         assert!(answer.contains("Cofresh makes Indian snack foods"));
@@ -440,12 +462,18 @@ fn lack_of_corroboration_is_a_supported_limitation_not_an_independence_claim() {
 }
 
 #[test]
-fn an_independence_denial_cannot_hide_a_positive_claim_in_another_clause() {
-    for answer in [
-        "One report is not independent. These reports independently corroborate the claim.",
-        "These sources are not independent, but the claim is independently corroborated.",
+fn a_rejected_independence_claim_is_not_published_due_to_wording_variants() {
+    let evidence = vec![json!({"source":"https://example.org/report",
+        "passage":"The report describes the finding.",
+        "evidence_state":{"independence_verified":false}})];
+    for draft in [
+        "The sources aren't independent; still, they independently corroborate the finding.",
+        "There is only one origin, but this finding has independent corroboration.",
     ] {
-        assert!(asserts_unverified_independence(answer, &[]), "{answer}");
+        let answer = ground_research_reply("Is this independently corroborated?", draft, &evidence, |_| {
+            Ok(r#"{"verdict":"revise","supported":false,"addresses_request":true,"reason":"The evidence does not establish independent sources."}"#.into())
+        }).unwrap();
+        assert_eq!(answer, missing_research_answer());
     }
 }
 
@@ -454,11 +482,10 @@ fn factual_support_alone_cannot_approve_an_answer_to_another_question() {
     let mut calls = 0;
     let result = ground_research_reply("Which crisps suit this use?", "Firm tofu is a soup ingredient.", &[], |_| {
         calls += 1;
-        Ok(if calls == 2 { "Still discussing soup.".into() } else { r#"{"supported":true,"addresses_request":false,"reason":"Soup facts do not answer the crisp question"}"#.into() })
+        Ok(if calls == 2 { "Still discussing soup.".into() } else { r#"{"verdict":"accept","supported":true,"addresses_request":false,"reason":"Soup facts do not answer the crisp question"}"#.into() })
     }).unwrap();
     assert_eq!(result, missing_research_answer());
     assert_eq!(calls, 3);
-    assert!(reply_style_failure("What are the best flavour of crisps to drop an egg into?", "I can't verify the best flavour of crisps to drop an egg into. Do you mean a cooked dish or a raw egg?").is_none());
 }
 
 #[test]
@@ -476,12 +503,12 @@ fn explicit_fallback_and_uncertain_preference_can_answer_a_best_question() {
         |prompt| {
             calls += 1;
             match calls {
-                1 => Ok(r#"{"supported":true,"addresses_request":false,"reason":"The source does not rank a best flavour."}"#.into()),
+                1 => Ok(r#"{"verdict":"accept","supported":true,"addresses_request":false,"reason":"The source does not rank a best flavour."}"#.into()),
                 2 => {
                     assert!(prompt.contains("What\'s the best crisp flavour?"));
                     Ok("The source does not rank the flavours. I'm not sure which is best, but my guess is Cheese and Onion. It lists Cheese and Onion, Salt and Vinegar, and Ready Salted. source_1".into())
                 }
-                3 => Ok(r#"{"supported":true,"addresses_request":true,"reason":"Follows the requested fallback and marks the guess uncertain."}"#.into()),
+                3 => Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Follows the requested fallback and marks the guess uncertain."}"#.into()),
                 _ => panic!("grounding review must stay bounded"),
             }
         },
@@ -496,7 +523,7 @@ fn explicit_fallback_and_uncertain_preference_can_answer_a_best_question() {
 }
 
 #[test]
-fn explicit_fallback_returns_the_literal_list_if_model_review_still_fails() {
+fn rejected_partial_answer_is_not_replaced_by_an_unreviewed_literal_dump() {
     let evidence = vec![json!({
         "source":"https://en.wikipedia.org/wiki/Walkers_(snack_foods)",
         "passage":"Walkers sells crisps in a variety of flavours; the main are Cheese and Onion, Salt and Vinegar, and Ready Salted.",
@@ -506,13 +533,93 @@ fn explicit_fallback_returns_the_literal_list_if_model_review_still_fails() {
         "What is the best Walkers crisp flavour? If you can't tell from the sources, list the flavours. I'm happy with a guess if you're unsure; say so.",
         "I can't tell which is best. The source names Cheese and Onion and Salt and Vinegar.",
         &evidence,
-        |_| Ok(r#"{"supported":false,"addresses_request":false,"reason":"Does not determine a best flavour"}"#.into()),
+        |_| Ok(r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Does not determine a best flavour"}"#.into()),
     )
     .unwrap();
 
-    assert!(answer.contains("I can't tell which is best"));
-    assert!(answer.contains("Cheese and Onion, Salt and Vinegar, and Ready Salted"));
-    assert!(answer.contains("https://en.wikipedia.org/wiki/Walkers_(snack_foods)"));
+    assert_eq!(answer, missing_research_answer());
+    assert!(!answer.contains("Cheese and Onion"));
+}
+
+#[test]
+fn exhausted_conclusion_reviews_get_one_grounded_partial_answer_recovery() {
+    let evidence = vec![json!({
+        "source":"https://example.org/catalogue",
+        "passage":"The 2024 catalogue lists the Orion, Vega, and Lyra models.",
+        "evidence_state":{
+            "finding_status":"needs_review",
+            "gate_status":"unverified_temporal",
+            "freshness":"stale",
+            "research_relevance":"direct",
+            "conflicting_claims":["A later catalogue may list a different range."]
+        }
+    })];
+    let mut reviews = 0;
+    let mut rewrites = 0;
+    let answer = ground_research_reply_with_scope(
+        "Which models are currently available?",
+        "The Orion, Vega, and Lyra models are currently available.",
+        &evidence,
+        Some(true),
+        |prompt, _| {
+            if prompt.contains("You are a second semantic reviewer") {
+                return Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The answer may be useful with a date qualification."}"#.into());
+            }
+            if prompt.contains("Check the ANSWER's factual assertions") {
+                reviews += 1;
+                if reviews == 3 {
+                    assert!(prompt.contains("The 2024 catalogue lists"));
+                    assert!(prompt.contains("does not establish"));
+                    return Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"It gives the dated source information and limits the currentness claim."}"#.into());
+                }
+                return Ok(if reviews == 2 {
+                    r#"{"verdict":"revise","supported":true,"addresses_request":false,"reason":"The source cannot establish present availability, but its dated list is supported."}"#.into()
+                } else {
+                    r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"The source cannot establish present availability."}"#.into()
+                });
+            }
+            rewrites += 1;
+            Ok(if rewrites < 2 {
+                "I can't confirm which models are currently available."
+            } else {
+                "I can't confirm the current range, but the 2024 catalogue lists the Orion, Vega, and Lyra models; it doesn't establish whether they remain available. source_1"
+            }.into())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(reviews, 3);
+    assert_eq!(rewrites, 2);
+    assert!(answer.contains("2024 catalogue lists the Orion, Vega, and Lyra models"));
+    assert!(answer.contains("doesn't establish whether they remain available"));
+    assert!(answer.contains("https://example.org/catalogue"));
+}
+
+#[test]
+fn evidence_based_best_guess_can_pass_when_uncertainty_names_its_gap() {
+    let evidence = vec![json!({
+        "source":"https://example.org/catalogue",
+        "passage":"The 2024 catalogue lists the Orion, Vega, and Lyra models.",
+        "evidence_state":{"gate_status":"unverified_temporal","freshness":"stale"}
+    })];
+    let draft = "I can't verify today's range, but my tentative guess is that Orion, Vega, and Lyra remain available because they appear in the 2024 catalogue. I don't have a current catalogue to confirm that.";
+    let answer = ground_research_reply(
+        "Which models are currently available?",
+        draft,
+        &evidence,
+        |prompt| {
+            assert!(prompt.contains("tentative guess"));
+            assert!(prompt.contains("specific claim"));
+            assert!(prompt.contains("gap that prevents verification"));
+            Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The possible current availability is explicitly identified as a guess based on the dated catalogue, and the lack of current evidence is stated."}"#.into())
+        },
+    )
+    .unwrap();
+
+    assert!(answer.starts_with("I can't verify today's range"));
+    assert!(answer.contains("tentative guess"));
+    assert!(answer.contains("2024 catalogue"));
+    assert!(answer.contains("https://example.org/catalogue"));
 }
 
 #[test]
@@ -546,22 +653,22 @@ fn partial_flavour_evidence_cannot_be_presented_as_a_complete_current_catalogue(
                 let data = prompt.split("Data: ").last().unwrap();
                 assert!(!data.contains("extraction_confidence"));
                 assert!(!data.contains("awaiting_corroboration"));
-                assert!(data.contains("does not establish current status"));
+                assert!(data.contains("current_status_not_established"));
             }
             assert!(prompt.contains("Walkers range includes paprika"));
             match calls {
-                1 => {
-                    Ok(r#"{"supported":false,"addresses_request":false,"reason":"Historical examples do not establish the complete current range."}"#.into())
+                1 | 2 => {
+                    Ok(r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Historical examples do not establish the complete current range."}"#.into())
                 }
-                2 => Ok("The source mentions cheese and onion and salt and vinegar as historical examples, but it does not establish Walkers' complete current flavour range. An active claim also lists paprika, though its time scope is unclear. source_1".into()),
-                3 => Ok(r#"{"supported":true,"addresses_request":true,"reason":"Gives historical examples, flags the unresolved scope, and avoids completeness."}"#.into()),
+                3 => Ok("The source mentions cheese and onion and salt and vinegar as historical examples, but it does not establish Walkers' complete current flavour range. An active claim also lists paprika, though its time scope is unclear. source_1".into()),
+                4 => Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Gives historical examples, flags the unresolved scope, and avoids completeness."}"#.into()),
                 _ => panic!("grounding review must stay bounded"),
             }
         },
     )
     .unwrap();
 
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(answer.contains("historical examples"));
     assert!(answer.contains("does not establish"));
     assert!(answer.contains("time scope is unclear"));
@@ -590,16 +697,20 @@ fn duplicate_unverified_origin_cannot_be_called_independent_corroboration() {
         |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
                 reviews += 1;
-                Ok(r#"{"supported":true,"addresses_request":true,"reason":"Both passages state the same claim."}"#.into())
+                Ok(if reviews <= 2 {
+                    r#"{"verdict":"revise","supported":false,"addresses_request":true,"reason":"The two pages share one underlying report and are not independent."}"#.into()
+                } else {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The answer clearly explains the shared origin."}"#.into()
+                })
             } else {
-                assert!(prompt.contains("Independent corroboration requires"));
+                assert!(prompt.contains("previous answer failed review"));
                 Ok("Both pages repeat the same Newswire report, so this is not independent corroboration.".into())
             }
         },
     )
     .unwrap();
 
-    assert_eq!(reviews, 2);
+    assert_eq!(reviews, 3);
     assert!(answer.contains("not independent corroboration"));
     assert!(!answer.contains("The claim is independently corroborated"));
 }
@@ -632,18 +743,60 @@ fn known_conflict_cannot_be_silently_resolved_to_one_date() {
         |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
                 reviews += 1;
-                Ok(r#"{"supported":true,"addresses_request":true,"reason":"The date is in a passage."}"#.into())
+                Ok(if reviews <= 2 {
+                    r#"{"verdict":"revise","supported":false,"addresses_request":true,"reason":"Two supplied accounts give different dates; retain both."}"#.into()
+                } else {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Both dates are attributed and the disagreement remains unresolved."}"#.into()
+                })
             } else {
-                assert!(prompt.contains("supplied evidence marks this claim as conflicted"));
+                assert!(prompt.contains("previous answer failed review"));
                 Ok("The sources conflict: one gives 1998 and the other gives 2000, so the date is unresolved.".into())
             }
         },
     ).unwrap();
 
-    assert_eq!(reviews, 2);
+    assert_eq!(reviews, 3);
     assert!(answer.contains("sources conflict"));
     assert!(answer.contains("1998"));
     assert!(answer.contains("2000"));
+}
+
+#[test]
+fn attributed_accounts_can_remain_supported_when_sources_disagree() {
+    let evidence = vec![
+        json!({
+            "source":"https://a.example/history",
+            "passage":"Example Organization began operating in 1998.",
+            "evidence_state":{"gate_status":"conflict"}
+        }),
+        json!({
+            "source":"https://b.example/history",
+            "passage":"Example Organization began operating in 2000.",
+            "evidence_state":{"gate_status":"conflict"}
+        }),
+    ];
+    let draft = "Example Organization began operating in 1998 (https://a.example/history), while another source gives 2000 (https://b.example/history); the evidence does not resolve the date.";
+    let mut reviews = 0;
+    let answer = ground_research_reply(
+        "When did Example Organization begin operating?",
+        draft,
+        &evidence,
+        |prompt| {
+            if prompt.contains("Check the ANSWER's factual assertions") {
+                reviews += 1;
+                assert!(prompt.contains(
+                    "supported, assess whether each factual assertion follows from its cited passage, not whether all sources agree"
+                ));
+                Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Each date is attributed to a passage that states it, and the answer leaves the disagreement unresolved."}"#.into())
+            } else {
+                panic!("a supported, relevant account of unresolved disagreement needs no rewrite");
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(reviews, 1);
+    assert_eq!(answer, draft);
 }
 
 #[test]
@@ -660,21 +813,21 @@ fn answer_preserves_compound_names_as_single_list_items() {
         |prompt| {
             calls += 1;
             match calls {
-                1 => {
-                    Ok(r#"{"supported":false,"addresses_request":true,"reason":"The passage names Cheese and Onion as one flavour, not two."}"#.into())
+                1 | 2 => {
+                    Ok(r#"{"verdict":"revise","supported":false,"addresses_request":true,"reason":"The passage names Cheese and Onion as one flavour, not two."}"#.into())
                 }
-                2 => {
+                3 => {
                     assert!(prompt.contains("Cheese and Onion, Salt and Vinegar and Ready Salted"));
                     Ok("The passage lists Cheese and Onion, Salt and Vinegar, and Ready Salted as flavours. source_1".into())
                 }
-                3 => Ok(r#"{"supported":true,"addresses_request":true,"reason":"Preserves each compound name as listed."}"#.into()),
+                4 => Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Preserves each compound name as listed."}"#.into()),
                 _ => panic!("grounding review must stay bounded"),
             }
         },
     )
     .unwrap();
 
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(answer.contains("Cheese and Onion"));
     assert!(answer.contains("Salt and Vinegar"));
     assert!(!answer.contains("Cheese, Onion"));
@@ -693,15 +846,15 @@ fn failed_grounding_never_dumps_cookie_banner_and_crisp_quote() {
         &evidence,
         |_| {
             calls += 1;
-            Ok(if calls == 2 {
+            Ok(if calls == 3 {
                 "Still an unsupported answer".into()
             } else {
-                r#"{"supported":false,"addresses_request":false,"reason":"Does not address the intended use"}"#.into()
+                r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Does not address the intended use"}"#.into()
             })
         },
     )
     .unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert_eq!(answer, missing_research_answer());
     assert!(!answer.contains("I ACCEPT"));
     assert!(!answer.contains("Smith's"));
@@ -722,14 +875,14 @@ fn ungrounded_discoverer_is_rewritten_and_reviewed_again() {
             calls += 1;
             assert!(prompt.contains("Oganesson is a synthetic element."));
             Ok(match calls {
-                1 => {
-                    r#"{"supported":false,"addresses_request":false,"reason":"The passage does not name a discoverer."}"#
+                1 | 2 => {
+                    r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"The passage does not name a discoverer."}"#
                         .into()
                 }
-                2 => "This source does not name the discoverer: https://example.org/element"
+                3 => "This source does not name the discoverer: https://example.org/element"
                     .into(),
-                3 => {
-                    r#"{"supported":true,"addresses_request":true,"reason":"The answer acknowledges missing evidence."}"#
+                4 => {
+                    r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The answer acknowledges missing evidence."}"#
                         .into()
                 }
                 _ => panic!("review must be bounded"),
@@ -737,7 +890,7 @@ fn ungrounded_discoverer_is_rewritten_and_reviewed_again() {
         },
     )
     .unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(!result.contains("Eugene"));
     assert!(result.contains("does not name"));
 }
@@ -755,16 +908,16 @@ fn failed_summary_review_reports_limitation_without_dumping_evidence_or_using_ur
         |prompt| {
             calls += 1;
             assert!(!prompt.contains("https://example.org/unproven-product-name"));
-            Ok(if calls == 2 {
+            Ok(if calls == 3 {
                 "Still unsupported.".into()
             } else {
-                r#"{"supported":false,"addresses_request":false,"reason":"Unsupported option"}"#
+                r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Unsupported option"}"#
                     .into()
             })
         },
     )
     .unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert_eq!(result, missing_research_answer());
     assert!(!result.contains("Walkers"));
     assert!(!result.contains("https://"));
@@ -775,79 +928,22 @@ fn research_review_does_not_publish_failed_or_malformed_reviews() {
     let mut calls = 0;
     let result = ground_research_reply("Who?", "Unsupported name", &[], |_| {
         calls += 1;
-        Ok(if calls == 2 {
+        Ok(if calls == 3 {
             "Still unsupported".into()
         } else {
-            r#"{"supported":false,"addresses_request":false,"reason":"Missing evidence"}"#.into()
+            r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Missing evidence"}"#.into()
         })
     })
     .unwrap();
     assert_eq!(result, missing_research_answer());
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     for response in [
         "not JSON",
         r#"{"reason":"No verdict"}"#,
-        r#"{"supported":true}"#,
+        r#"{"verdict":"accept","supported":true}"#,
     ] {
         assert!(ground_research_reply("Who?", "Draft", &[], |_| Ok(response.into())).is_err());
     }
-}
-
-#[test]
-fn alternative_offer_of_help_triggers_a_rewrite() {
-    assert_eq!(
-        reply_style_failure(
-            "Thank you",
-            "You're welcome. I'm happy to clarify anything else you need."
-        ),
-        Some("reply appends a stock invitation")
-    );
-    assert_eq!(
-        strip_stock_invitation("You're welcome. I'm happy to clarify anything else you need."),
-        "You're welcome."
-    );
-}
-
-#[test]
-fn screenshot_reply_is_rewritten_as_a_brief_acknowledgement() {
-    let input = "Much better. Thank you for being honest about being unsure :)";
-    let draft = "You're welcome! I appreciate the honesty about the limitation. If you need more details on Oganesson or anything else, feel free to ask.";
-    let result = repair_reply_style(input, draft, |instruction| {
-        assert!(instruction.contains("Preserve factual uncertainty"));
-        assert!(instruction.contains("If the user thanks you"));
-        Ok("You're welcome.".into())
-    })
-    .unwrap();
-    assert_eq!(result, "You're welcome.");
-}
-
-#[test]
-fn source_assessment_narration_is_repaired_without_inventing_a_discoverer() {
-    let draft = "The user has requested the discoverer of the most recent element. The provided source indicates that Oganesson is a synthetic chemical element.";
-    let result = repair_reply_style("Who discovered the most recent element?", draft, |_| {
-        Ok("This source names the element but doesn't name its discoverer.".into())
-    })
-    .unwrap();
-    assert!(result.contains("doesn't name its discoverer"));
-    assert!(reply_style_failure("Who discovered it?", &result).is_none());
-}
-
-#[test]
-fn stock_closing_trimming_preserves_unicode_and_the_actual_answer() {
-    assert_eq!(
-        strip_stock_invitation(
-            "İstanbul is mentioned in this source. If you need more details, feel free to ask."
-        ),
-        "İstanbul is mentioned in this source."
-    );
-    let reply = "This source does not name the discoverer.";
-    assert_eq!(
-        repair_reply_style("Who discovered it?", reply, |_| panic!(
-            "good replies should not trigger rewriting"
-        ))
-        .unwrap(),
-        reply
-    );
 }
 
 #[test]

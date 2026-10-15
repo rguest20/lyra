@@ -122,7 +122,7 @@
       prompt.value = '';
       send.disabled = true;
       newChat.disabled = true;
-      status.textContent = 'Loading the local model…';
+      status.textContent = 'Waiting for Lyra…';
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
@@ -131,16 +131,10 @@
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || 'The reply failed.');
-        if (result.new_conversation) {
-          messages.replaceChildren();
-          addMessage('Started a fresh conversation because the topic changed.', 'system-note');
-          addMessage(message, 'user');
-          status.textContent = 'Started a fresh conversation after a topic change.';
-        }
         addMessage(result.reply, 'agent');
         addThinking(result.thinking);
         if (result.research_queued) addMessage('Scholar research was requested for this question.', 'system-note');
-        status.textContent = 'Updating knowledge and checking the reply…';
+        status.textContent = 'Reply received.';
         prompt.focus();
         const ready = await fetch(`/api/ready?session_id=${sessionId}`);
         if (!ready.ok) throw new Error('Could not check whether curation finished.');
