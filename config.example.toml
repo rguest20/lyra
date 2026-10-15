@@ -5,4 +5,5 @@
 
 [search.searxng]
 # Local endpoints only. Example: "http://searxng.local:8080/search"
-# url = ""
+# For the bundled local service: "http://localhost:8888/search"
+# url = "http://localhost:8888/search"

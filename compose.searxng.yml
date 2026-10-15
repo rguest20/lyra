@@ -1,0 +1,15 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: lyra-searxng
+    restart: unless-stopped
+    env_file:
+      - ./state/searxng.env
+    environment:
+      SEARXNG_BASE_URL: http://localhost:8888/
+      SEARXNG_BIND_ADDRESS: 0.0.0.0
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+

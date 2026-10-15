@@ -28,10 +28,7 @@ use wikipedia::{
     wikipedia_json_request,
 };
 
-use claims::{
-    calibrate_research_relevance, claim_grounding_failure, explicit_list_finding, select_finding,
-    structured_list_finding,
-};
+use claims::{calibrate_research_relevance, claim_grounding_failure, select_finding};
 use config::ProviderConfig;
 
 use extraction::extract_scholar_claim_guided;
@@ -305,18 +302,18 @@ pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<
         if let Some(task) = corroboration {
             return process_corroboration_task(&mut store, &task, model);
         }
-        if let Some(source) = store.claim_research_source()? {
-            return retention::harvest(&mut store, source, model);
-        }
     }
     let job = match user_job {
         Some(job) => Some(job),
         None => store.claim_scholar_job()?,
     };
-    let Some(job) = job else {
-        return store.automatically_review_pending_scholar_evidence();
-    };
-    process_job(&mut store, job, model, false)
+    if let Some(job) = job {
+        return process_job(&mut store, job, model, false);
+    }
+    if let Some(source) = store.claim_research_source()? {
+        return retention::harvest(&mut store, source, model);
+    }
+    store.automatically_review_pending_scholar_evidence()
 }
 
 pub fn process_conversation(
@@ -438,28 +435,30 @@ fn process_job(
     .map_err(|_| io::Error::other("search timestamp too large"))?;
     let mut sources = Vec::new();
     if !foreground || wikipedia_weak {
-        if let Some(trigger) = discovery_trigger(
-            wikipedia_weak,
-            store.last_scholar_provider_search_ms("serpapi")?,
-            now_ms,
-            serp_interval_seconds(),
-        ) {
-            discover_serpapi(store, &job.id, &logged_query, trigger);
-        }
-        if let Some(trigger) = discovery_trigger(
-            wikipedia_weak,
-            store.last_scholar_provider_search_ms("tavily")?,
-            now_ms,
-            tavily_interval_seconds(),
-        ) {
-            discover_tavily(store, &job.id, &logged_query, trigger);
-        }
-        discover_searxng_fallback(
+        discover_configured_searxng(
             store,
             &job.id,
             &logged_query,
             provider_config.searxng_url.as_deref(),
         )?;
+        if store.scholar_search_candidates(&job.id)?.is_empty() {
+            if let Some(trigger) = discovery_trigger(
+                wikipedia_weak,
+                store.last_scholar_provider_search_ms("serpapi")?,
+                now_ms,
+                serp_interval_seconds(),
+            ) {
+                discover_serpapi(store, &job.id, &logged_query, trigger);
+            }
+            if let Some(trigger) = discovery_trigger(
+                wikipedia_weak,
+                store.last_scholar_provider_search_ms("tavily")?,
+                now_ms,
+                tavily_interval_seconds(),
+            ) {
+                discover_tavily(store, &job.id, &logged_query, trigger);
+            }
+        }
         sources = process_discovered_candidates(
             store,
             &job.id,
@@ -584,7 +583,7 @@ fn process_feedback_task_with(
     Ok(1)
 }
 
-fn discover_searxng_fallback(
+fn discover_configured_searxng(
     store: &mut LearningStore,
     job_id: &str,
     query: &str,
@@ -594,7 +593,7 @@ fn discover_searxng_fallback(
         return Ok(false);
     }
     Ok(endpoint.is_some_and(|endpoint| {
-        discover_searxng(store, job_id, query, "provider_fallback", endpoint)
+        discover_searxng(store, job_id, query, "configured_primary", endpoint)
     }))
 }
 
@@ -898,42 +897,6 @@ fn process_discovered_candidates(
                             break;
                         }
                     }
-                    if accepted.is_none() {
-                        for passage in &review.passages {
-                            let Some(finding) = structured_list_finding(question, passage) else {
-                                continue;
-                            };
-                            if !crate::entities::matches_claim(
-                                &names,
-                                &finding.subject,
-                                &finding.object,
-                                &aliases,
-                            ) || target
-                                .is_some_and(|target| !finding_matches_target(&finding, target))
-                            {
-                                continue;
-                            }
-                            store.record_scholar_extraction_attempt(
-                                candidate.id,
-                                3,
-                                passage,
-                                "structured_list",
-                                "explicit heading and consecutive bullets formed a source-specific list; held for review",
-                                None,
-                            )?;
-                            let research_relevance =
-                                calibrate_research_relevance(question, &finding, "related");
-                            accepted = Some(ScholarEvidence {
-                                source_title: candidate.title.clone(),
-                                source_url: source_url.clone(),
-                                source_excerpt: passage.clone(),
-                                finding: Some(finding),
-                                profile: ScholarSourceProfile::default(),
-                                research_relevance,
-                            });
-                            break;
-                        }
-                    }
                     let grounded = accepted.is_some();
                     evidence.push(accepted.unwrap_or_else(|| ScholarEvidence {
                         source_title: candidate.title,
@@ -1224,9 +1187,7 @@ fn research(
         guidance,
         model,
     );
-    let mut extracted = attempt.finding.take().or_else(|| {
-        explicit_list_finding(question, &page.title, &excerpt, source_updated_at.clone())
-    });
+    let mut extracted = attempt.finding.take();
     if extracted.is_none() && !section_passages.is_empty() {
         let mut intro_attempt = extract_scholar_claim_guided(
             question,
@@ -1237,9 +1198,7 @@ fn research(
             guidance,
             model,
         );
-        let intro_finding = intro_attempt.finding.take().or_else(|| {
-            explicit_list_finding(question, &page.title, &lead_excerpt, source_updated_at)
-        });
+        let intro_finding = intro_attempt.finding.take();
         if intro_finding.is_some() {
             excerpt = lead_excerpt;
             attempt = intro_attempt;
@@ -1267,14 +1226,7 @@ fn research(
                 guidance,
                 model,
             );
-            let alternative_extracted = alternative_attempt.finding.take().or_else(|| {
-                explicit_list_finding(
-                    question,
-                    &alternative_page.title,
-                    &alternative_excerpt,
-                    alternative_updated_at,
-                )
-            });
+            let alternative_extracted = alternative_attempt.finding.take();
             if let Some(alternative_finding) = select_finding(alternative_extracted, expansion) {
                 research_relevance = calibrate_research_relevance(
                     question,

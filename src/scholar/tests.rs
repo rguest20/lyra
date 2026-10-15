@@ -3,9 +3,8 @@ use super::claims::claim_is_grounded;
 use super::discovery::{SerpApiResponse, linked_serpapi_results};
 use super::{
     ExtractionAttempt, ScholarFindingJson, SearchPage, calibrate_research_relevance,
-    discover_searxng_fallback, discovery_trigger, evaluate_extraction, explicit_list_finding,
-    finding_matches_target, html_to_text, parse_extraction, relevant_page, retry_after_delay_ms,
-    should_retry_grounding, structured_list_finding,
+    discover_configured_searxng, discovery_trigger, evaluate_extraction, finding_matches_target,
+    html_to_text, parse_extraction, relevant_page, retry_after_delay_ms, should_retry_grounding,
 };
 use crate::storage::{CorroborationTask, ScholarFinding};
 
@@ -242,7 +241,7 @@ fn guided_repair_preserves_passage_and_stages_corrected_claim_for_ai_review() {
 }
 
 #[test]
-fn configured_searxng_is_dispatched_only_when_no_provider_candidates_exist() {
+fn configured_searxng_is_dispatched_only_when_no_candidates_exist() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -263,7 +262,7 @@ fn configured_searxng_is_dispatched_only_when_no_provider_candidates_exist() {
     });
 
     let path = std::env::temp_dir().join(format!(
-        "community-searxng-fallback-{}-{}.db",
+        "community-searxng-primary-{}-{}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -276,7 +275,7 @@ fn configured_searxng_is_dispatched_only_when_no_provider_candidates_exist() {
         .unwrap();
     let job = store.claim_scholar_job().unwrap().unwrap();
     assert!(
-        discover_searxng_fallback(
+        discover_configured_searxng(
             &mut store,
             &job.id,
             "chicken soup ingredients",
@@ -291,7 +290,7 @@ fn configured_searxng_is_dispatched_only_when_no_provider_candidates_exist() {
     assert_eq!(candidates[0].title, "Chicken soup");
 
     assert!(
-        !discover_searxng_fallback(
+        !discover_configured_searxng(
             &mut store,
             &job.id,
             "chicken soup ingredients",
@@ -661,36 +660,6 @@ fn malformed_and_ungrounded_outputs_receive_one_bounded_ai_repair() {
 }
 
 #[test]
-fn heading_and_bullets_can_stage_a_source_specific_list_without_a_model_claim() {
-    let passage = "## Simple Chicken Soup Ingredients\n* **Chicken breasts:** Diced and cooked\n* **Alliums:** Onion and garlic\n* **Vegetables:** Carrots and celery\n\n## Method\nSimmer the soup.";
-    let finding =
-        structured_list_finding("What are common ingredients in chicken soup?", passage).unwrap();
-    assert_eq!(finding.subject, "Simple Chicken Soup");
-    assert_eq!(finding.relation, "lists ingredients");
-    assert_eq!(finding.object, "Chicken breasts; Alliums; Vegetables");
-    assert!(
-        finding
-            .evidence_text
-            .ends_with("* **Vegetables:** Carrots and celery")
-    );
-    assert!(crate::storage::evidence_supports_claim(&finding));
-    assert!(
-        structured_list_finding(
-            "chicken soup ingredients",
-            "## Related Recipes\n* Soup\n* Stew"
-        )
-        .is_none()
-    );
-    let historical = structured_list_finding(
-        "Who were the Byzantine emperors?",
-        "## Byzantine Emperors\n* Basil II\n* Constantine VIII",
-    )
-    .unwrap();
-    assert_eq!(historical.subject, "Byzantine");
-    assert_eq!(historical.relation, "lists emperors");
-}
-
-#[test]
 fn serpapi_rich_result_groups_preserve_type_and_structured_context() {
     let response: SerpApiResponse = serde_json::from_str(
         r#"{
@@ -834,20 +803,6 @@ fn headings_and_generic_claims_are_not_treated_as_evidence() {
 }
 
 #[test]
-fn inline_lists_keep_the_containing_category_and_match_the_requested_entity() {
-    let passage = "Birds recorded on Alder Island include puffins and Arctic terns.";
-    let finding =
-        structured_list_finding("Which birds are recorded on Alder Island?", passage).unwrap();
-    assert_eq!(finding.subject, "Birds recorded on Alder Island");
-    assert_eq!(finding.relation, "include");
-    assert_eq!(finding.object, "puffins and Arctic terns");
-    assert!(crate::storage::evidence_supports_claim(&finding));
-    assert!(
-        structured_list_finding("Which birds are recorded on Birch Island?", passage).is_none()
-    );
-}
-
-#[test]
 fn claim_evidence_must_be_an_exact_passage() {
     let excerpt = "Chicken soup commonly includes noodles and carrots.";
     assert!(!claim_is_grounded(
@@ -878,25 +833,4 @@ fn wikipedia_html_keeps_headings_and_lists_but_drops_citation_clutter() {
     assert!(!text.contains("[1]"));
     assert!(!text.contains("cite_note"));
     assert!(!text.contains("External citation"));
-}
-
-#[test]
-fn explicit_answer_list_can_become_a_grounded_finding_when_model_extraction_fails() {
-    let excerpt = "Section: Canned chicken soup\n\n#### Canned chicken soup\n\nUsually, the main ingredients of this canned soup are:\n* Chicken broth\n* Chicken\n* Noodles\n* Carrots\n* Salt\n* Celery, lettuce, or mushrooms, depending on the brand";
-    let finding = explicit_list_finding(
-        "What ingredients are commonly used in chicken soup?",
-        "Chicken soup",
-        excerpt,
-        None,
-    )
-    .unwrap();
-    assert_eq!(finding.subject, "Canned chicken soup");
-    assert_eq!(finding.relation, "lists ingredients");
-    assert!(finding.object.contains("Chicken broth"));
-    assert!(finding.object.contains("Carrots"));
-    assert!(excerpt.contains(&finding.evidence_text));
-    assert!(
-        !explicit_list_finding("Tell me about chicken soup", "Chicken soup", excerpt, None,)
-            .is_some()
-    );
 }

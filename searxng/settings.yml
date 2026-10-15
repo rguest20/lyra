@@ -1,0 +1,24 @@
+# Keep SearXNG private to this machine. Lyra applies its own persistent
+# per-host request interval before querying this endpoint.
+use_default_settings: true
+
+server:
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json
+
+# Keep a single pooled connection to each engine and fail slowly. This is a
+# concurrency cap, not a requests-per-second limiter; Lyra's host scheduler
+# controls the interval between SearXNG searches.
+engines:
+  - name: google
+    disabled: true
+    timeout: 3.0
+    max_connections: 1
+  - name: brave
+    timeout: 3.0
+    max_connections: 1
+
