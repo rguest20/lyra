@@ -40,9 +40,10 @@ struct SearxngSection {
 
 impl ProviderConfig {
     pub fn load() -> io::Result<Self> {
-        let path = std::env::var_os("COMMUNITY_CONFIG")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("config.toml"));
+        let path = std::env::var_os("COMMUNITY_CONFIG").map_or_else(
+            || std::path::PathBuf::from("config.toml"),
+            std::path::PathBuf::from,
+        );
         let (file, config_error) = match std::fs::read_to_string(&path) {
             Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
                 Ok(file) => (file, None),

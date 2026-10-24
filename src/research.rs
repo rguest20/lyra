@@ -1,12 +1,18 @@
 //! Model-assisted lookup intent and evidence selection, independent of wording.
+use crate::errors::invalid_data as invalid;
 use crate::{agent::Message, storage::ScholarEvidenceForAnswer};
 use serde::{Deserialize, Serialize};
 use std::io;
 
 mod json;
-pub(crate) use json::{close_json_delimiters, json_object};
+pub(crate) use json::{
+    DecisionRationale, deserialize_json_object, json_object, json_object_as, json_object_slice,
+    json_object_with_delimiter_recovery,
+};
 mod request;
-pub(crate) use request::{external_fact_request_with, property_request_with};
+pub(crate) use request::{
+    RequestIntent, property_request_with, request_context, request_intent_with,
+};
 mod currentness;
 pub(crate) use currentness::currentness_request_with;
 mod selection;
@@ -42,10 +48,6 @@ pub(crate) fn source_independence_request(question: &str) -> bool {
                         | "verification"
                 )
             }))
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 /// Private-fact guard, separate from semantic intent: asking one's own favourite
@@ -130,7 +132,7 @@ pub fn plan_with(
             serde_json::json!({
                 "request":question,
                 "attempt":attempt+1,
-                "model_output":raw.chars().take(1200).collect::<String>(),
+                "model_output":crate::diagnostics::text_excerpt(&raw, 1200),
             }),
         );
         let parsed = parse_plan(&raw).and_then(|plan| {
@@ -198,28 +200,26 @@ pub fn parse_plan(raw: &str) -> io::Result<Option<ResearchPlan>> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct RetrievalQueryExpansion {
+    queries: Vec<String>,
+}
+
 pub fn retrieval_queries_with(
     question: &str,
     mut ask: impl FnMut(&[Message]) -> io::Result<String>,
 ) -> io::Result<Vec<String>> {
     let messages = [Message {role:"system".into(),content:"/no_think\nGenerate up to three short phrases to retrieve existing evidence for the request, including alternate names, regional terms or spelling variants. Preserve named entities and constraints. These are retrieval leads, not asserted facts. Do not include private information. Return only JSON {\"queries\":[\"entity and requested property\",\"synonym and property\"]}.".into()}, Message {role:"user".into(),content:question.into()}];
-    let raw = ask(&messages)?;
-    let value = json_object(&raw)?;
-    let queries = value["queries"]
-        .as_array()
-        .ok_or_else(|| invalid("retrieval expansion omitted queries"))?;
-    if queries.len() > 3
-        || queries.iter().any(|q| {
-            q.as_str()
-                .is_none_or(|q| q.trim().is_empty() || q.chars().count() > 120)
-        })
+    let expansion: RetrievalQueryExpansion = json_object_as(&ask(&messages)?)?;
+    if expansion.queries.len() > 3
+        || expansion
+            .queries
+            .iter()
+            .any(|query| query.trim().is_empty() || query.chars().count() > 120)
     {
         return Err(invalid("invalid retrieval expansion"));
     }
-    Ok(queries
-        .iter()
-        .map(|q| q.as_str().unwrap().to_owned())
-        .collect())
+    Ok(expansion.queries)
 }
 
 #[cfg(test)]
@@ -356,7 +356,7 @@ mod tests {
         let passage = "Meridian Laboratory did not demonstrate superconductivity.";
         let mut candidate = finding(103, passage);
         candidate.subject = "Meridian Laboratory".into();
-        candidate.polarity = "negated".into();
+        candidate.proposition.polarity = crate::storage::ClaimPolarity::Negated;
         let mut calls = 0;
         let mut relevance_prompt = String::new();
         let selected = select_test_evidence_with_context(
@@ -392,7 +392,7 @@ mod tests {
         second.id = 96;
         let mut unrelated = first.clone();
         unrelated.id = 97;
-        unrelated.evidence_text = "Helios Laboratory appointed a new director.".into();
+        unrelated.source_span.evidence_text = "Helios Laboratory appointed a new director.".into();
         let mut unknown_origin = second.clone();
         unknown_origin.id = 98;
         unknown_origin.independence_verified = false;
@@ -401,7 +401,7 @@ mod tests {
         different_subject.subject = "Another Laboratory".into();
         let mut different_scope = second.clone();
         different_scope.id = 100;
-        different_scope.context_scope = Some("a different continuity".into());
+        different_scope.proposition.context_scope = Some("a different continuity".into());
         let mut calls = 0;
         let selected = select_test_evidence_with_context("Is the claim independently corroborated?",
             vec![first, second, unrelated, unknown_origin, different_subject, different_scope], &["Helios Laboratory".into()],
@@ -709,36 +709,14 @@ mod tests {
     }
 
     fn finding(id: i64, passage: &str) -> ScholarEvidenceForAnswer {
-        ScholarEvidenceForAnswer {
+        crate::test_support::answer_evidence_fixture(
             id,
-            source_archive_id: None,
-            evidence_byte_start: None,
-            evidence_byte_end: None,
-            source_url: "https://example.org/source".into(),
-            subject: "snacks".into(),
-            relation: "include".into(),
-            object: "flavours".into(),
-            attribution: None,
-            polarity: "unknown".into(),
-            modality: "unknown".into(),
-            geographic_scope: None,
-            context_scope: None,
-            evidence_text: passage.into(),
-            confidence: 0.99,
-            finding_status: "needs_review".into(),
-            gate_status: "pending_review".into(),
-            reason: "test".into(),
-            research_relevance: "direct".into(),
-            topic_class: "stable".into(),
-            source_kind: "reference".into(),
-            freshness: "fresh".into(),
-            currency: "current".into(),
-            direct_support: true,
-            independence_key: Some("source-a".into()),
-            independence_verified: true,
-            published_at: None,
-            conflicting_claims: vec![],
-        }
+            "snacks",
+            "include",
+            "flavours",
+            "https://example.org/source",
+            passage,
+        )
     }
 
     #[test]
@@ -933,6 +911,19 @@ mod tests {
             ))
             .is_err()
         );
+        assert_eq!(
+            select_sections_with("What flavors exist?", &sections, |_| Ok(
+                r#"{"indices":["3","3"]}"#.into()
+            ))
+            .unwrap(),
+            vec!["3"]
+        );
+        assert!(
+            select_sections_with("What flavors exist?", &sections, |_| Ok(
+                r#"{"indices":[3]}"#.into()
+            ))
+            .is_err()
+        );
     }
     #[test]
     fn subjective_request_keeps_a_factual_prerequisite_and_alternate_query() {
@@ -958,5 +949,28 @@ mod tests {
         );
         assert!(parse_plan(r#"{"needs_research":true,"question":"Reference?","queries":["docs?version=current"]}"#).is_err());
         assert!(parse_plan("NO_RESEARCH").is_err());
+    }
+
+    #[test]
+    fn retrieval_expansion_keeps_its_bounded_string_contract() {
+        let queries = retrieval_queries_with("Where is Meridian Bay?", |_| {
+            Ok(r#"{"queries":[" Meridian Bay ","regional name"]}"#.into())
+        })
+        .unwrap();
+        assert_eq!(queries, [" Meridian Bay ", "regional name"]);
+
+        assert!(
+            retrieval_queries_with("anything", |_| Ok(r#"{"queries":[]}"#.into()))
+                .unwrap()
+                .is_empty()
+        );
+        for response in [
+            r#"{"queries":["one","two","three","four"]}"#.to_owned(),
+            r#"{"queries":[""]}"#.to_owned(),
+            r#"{"queries":[42]}"#.to_owned(),
+            format!(r#"{{"queries":["{}"]}}"#, "x".repeat(121)),
+        ] {
+            assert!(retrieval_queries_with("anything", |_| Ok(response.clone())).is_err());
+        }
     }
 }

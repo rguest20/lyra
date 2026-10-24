@@ -2,13 +2,14 @@
 
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
+pub(super) use crate::storage::ScholarCandidateReview as CandidateReview;
 use crate::storage::{LearningStore, ScholarSearchCandidate};
 
 use super::{html_to_text, passages::coherent_passages, provenance::extract_page_provenance};
+use crate::errors::invalid_data as invalid;
 
-const USER_AGENT: &str = "CommunityLabScholar/0.1 (local Rust chatbot; educational use)";
 const PRODUCT_TOKEN: &str = "CommunityLabScholar";
 const MAX_POLICY_BYTES: usize = 512 * 1024;
 const MAX_PAGE_BYTES: usize = 1_000_000;
@@ -16,17 +17,6 @@ const STATUS_MARKER: &str = "\nCOMMUNITY_SITE_STATUS:";
 const POLICY_CACHE_TTL_MS: i64 = 6 * 60 * 60 * 1_000;
 type RobotsRule = (bool, String);
 type RobotsGroup = (Vec<String>, Vec<RobotsRule>);
-
-pub(super) struct CandidateReview {
-    pub status: &'static str,
-    pub policy_status: &'static str,
-    pub policy_reason: String,
-    pub fetch_status: &'static str,
-    pub fetched_url: Option<String>,
-    pub excerpt: Option<String>,
-    pub passages: Vec<String>,
-    pub provenance_json: Option<String>,
-}
 
 struct FetchTarget {
     host: String,
@@ -39,54 +29,12 @@ struct HttpResponse {
     body: String,
 }
 
+#[derive(Default)]
 struct SiteManifest {
     disallow_agents: Vec<String>,
     requests_per_minute: Option<u32>,
     require_auth: bool,
     llms_txt: Option<String>,
-}
-
-impl CandidateReview {
-    fn skipped(policy_status: &'static str, reason: impl Into<String>) -> Self {
-        Self {
-            status: "skipped",
-            policy_status,
-            policy_reason: reason.into(),
-            fetch_status: "skipped",
-            fetched_url: None,
-            excerpt: None,
-            passages: Vec::new(),
-            provenance_json: None,
-        }
-    }
-
-    fn failed(reason: impl Into<String>) -> Self {
-        Self {
-            status: "failed",
-            policy_status: "unavailable",
-            policy_reason: reason.into(),
-            fetch_status: "failed",
-            fetched_url: None,
-            excerpt: None,
-            passages: Vec::new(),
-            provenance_json: None,
-        }
-    }
-
-    fn fetch_failed(reason: impl Into<String>) -> Self {
-        let mut review = Self {
-            status: "failed",
-            policy_status: "allowed",
-            policy_reason: "site policy checks allowed the candidate fetch".into(),
-            fetch_status: "failed",
-            fetched_url: None,
-            excerpt: None,
-            passages: Vec::new(),
-            provenance_json: None,
-        };
-        review.policy_reason = format!("{}; {}", review.policy_reason, reason.into());
-        review
-    }
 }
 
 pub(super) fn inspect_and_fetch(
@@ -170,7 +118,7 @@ fn check_robots(
         401 | 403 => {
             store.remember_robots_block(
                 &target.host,
-                &candidate_path,
+                candidate_path,
                 candidate_url.path(),
                 "robots.txt is access denied",
                 true,
@@ -191,10 +139,10 @@ fn check_robots(
         Ok(None) => Vec::new(),
         Err(reason) => return stop(CandidateReview::skipped("policy_ambiguous", reason)),
     };
-    if !robots_allowed(&rules, &candidate_path) {
+    if !robots_allowed(&rules, candidate_path) {
         store.remember_robots_block(
             &target.host,
-            &candidate_path,
+            candidate_path,
             candidate_url.path(),
             "robots.txt disallows this source path",
             false,
@@ -219,8 +167,8 @@ fn inspect_site_guidance(
 ) -> io::Result<PolicyOutcome<(url::Url, i64)>> {
     let mut interval_ms = 10_000_i64;
     let mut llms_index = None;
-    let default_llms = origin_url(&origin, "/llms.txt")?;
-    if robots_allowed(&rules, default_llms.path()) {
+    let default_llms = origin_url(origin, "/llms.txt")?;
+    if robots_allowed(rules, default_llms.path()) {
         match fetch_site_policy(
             store,
             target,
@@ -247,14 +195,9 @@ fn inspect_site_guidance(
         }
     }
 
-    let manifest_url = origin_url(&origin, "/agent-manifest.txt")?;
-    let mut manifest = SiteManifest {
-        disallow_agents: Vec::new(),
-        requests_per_minute: None,
-        require_auth: false,
-        llms_txt: None,
-    };
-    if robots_allowed(&rules, manifest_url.path()) {
+    let manifest_url = origin_url(origin, "/agent-manifest.txt")?;
+    let mut manifest = SiteManifest::default();
+    if robots_allowed(rules, manifest_url.path()) {
         match fetch_url(
             store,
             target,
@@ -295,8 +238,8 @@ fn inspect_site_guidance(
     interval_ms = manifest_request_interval(interval_ms, manifest.requests_per_minute);
 
     if let Some(path) = manifest.llms_txt.as_deref() {
-        let custom_llms = origin_url(&origin, path)?;
-        if custom_llms != default_llms && robots_allowed(&rules, custom_llms.path()) {
+        let custom_llms = origin_url(origin, path)?;
+        if custom_llms != default_llms && robots_allowed(rules, custom_llms.path()) {
             match fetch_site_policy(
                 store,
                 target,
@@ -330,10 +273,10 @@ fn inspect_site_guidance(
         llms_index,
         rules,
     );
-    if !robots_allowed(&rules, &url_path_query(&page_url)) {
+    if !robots_allowed(rules, &url_path_query(&page_url)) {
         store.remember_robots_block(
             &target.host,
-            &candidate_path,
+            candidate_path,
             candidate_url.path(),
             "robots.txt disallows the selected source path",
             false,
@@ -411,27 +354,21 @@ fn fetch_source_page(
             )));
         }
     };
-    let provenance_json = if page
-        .content_type
-        .to_ascii_lowercase()
-        .starts_with("text/html")
-        || page
-            .content_type
-            .eq_ignore_ascii_case("application/xhtml+xml")
-    {
+    let content_type = page.content_type.to_ascii_lowercase();
+    let is_html = content_type.starts_with("text/html") || content_type == "application/xhtml+xml";
+    let provenance_json = if is_html {
         extract_page_provenance(&page.body, &page_url)
     } else {
         None
     };
-    let text = match page.content_type.to_ascii_lowercase().as_str() {
-        content_type if content_type.starts_with("text/html") => html_to_text(&page.body)?,
-        "application/xhtml+xml" => html_to_text(&page.body)?,
-        content_type if content_type.starts_with("text/") || content_type.is_empty() => page.body,
-        _ => {
-            return Ok(CandidateReview::fetch_failed(
-                "source page is not HTML or text",
-            ));
-        }
+    let text = if is_html {
+        html_to_text(&page.body)?
+    } else if content_type.starts_with("text/") || content_type.is_empty() {
+        page.body
+    } else {
+        return Ok(CandidateReview::fetch_failed(
+            "source page is not HTML or text",
+        ));
     };
     store.retain_fetched_candidate_source(
         candidate.id,
@@ -456,7 +393,7 @@ fn fetch_source_page(
     Ok(CandidateReview {
         status: "fetched",
         policy_status: "allowed",
-        policy_reason: "robots.txt and available site manifest checks allowed this fetch; no MCP endpoint was invoked".into(),
+        policy_reason: Some("robots.txt and available site manifest checks allowed this fetch; no MCP endpoint was invoked".into()),
         fetch_status: "fetched",
         fetched_url: Some(page_url.to_string()),
         excerpt: Some(excerpt),
@@ -473,20 +410,19 @@ fn fetch_url(
     interval_ms: i64,
     max_bytes: usize,
 ) -> io::Result<HttpResponse> {
-    if request_kind == "external_page_content" {
-        if let Some((content_type, body)) = store.cached_source_page(url.as_str())? {
-            if body.len() <= max_bytes {
-                crate::diagnostics::event(
-                    "internet.cache_hit",
-                    serde_json::json!({"provider":"web","request_kind":request_kind}),
-                );
-                return Ok(HttpResponse {
-                    status: 200,
-                    content_type,
-                    body,
-                });
-            }
-        }
+    if request_kind == "external_page_content"
+        && let Some(cached) = store.cached_source_page(url.as_str())?
+        && cached.body.len() <= max_bytes
+    {
+        crate::diagnostics::event(
+            "internet.cache_hit",
+            serde_json::json!({"provider":"web","request_kind":request_kind}),
+        );
+        return Ok(HttpResponse {
+            status: 200,
+            content_type: cached.content_type,
+            body: cached.body,
+        });
     }
     let reservation = store.reserve_host_request_wait(
         &target.host,
@@ -494,58 +430,40 @@ fn fetch_url(
         interval_ms.max(10_000),
         std::time::Duration::from_secs(30),
     )?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| io::Error::other(error.to_string()))?
-        .as_millis();
-    if reservation.scheduled_at_ms > now_ms {
-        std::thread::sleep(std::time::Duration::from_millis(
-            u64::try_from(reservation.scheduled_at_ms - now_ms).unwrap_or(u64::MAX),
-        ));
-    }
+    super::wait_for_host_request(reservation.scheduled_at_ms)?;
     let port = url.port_or_known_default().unwrap_or(443);
     let pinned_ip = match target.ip {
         IpAddr::V4(ip) => ip.to_string(),
         IpAddr::V6(ip) => format!("[{ip}]"),
     };
-    let output = Command::new("curl")
+    let mut command = super::limited_curl(15, max_bytes);
+    command
         .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            "15",
-            "--max-filesize",
+            "--proto",
+            "=https",
+            "--user-agent",
+            super::USER_AGENT,
+            "--resolve",
         ])
-        .arg(max_bytes.to_string())
-        .args(["--proto", "=https", "--user-agent", USER_AGENT, "--resolve"])
         .arg(format!("{}:{port}:{pinned_ip}", target.host))
         .arg("--write-out")
-        .arg(format!(
-            "{STATUS_MARKER}%{{http_code}}\t%{{content_type}}\t%header{{retry-after}}"
-        ))
+        .arg(super::http_response_write_out(STATUS_MARKER))
         .arg(url.as_str())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            store.complete_host_request(reservation.id, None, Some("curl could not run"))?;
-            return Err(error);
-        }
-    };
-    let combined = String::from_utf8_lossy(&output.stdout);
-    let Some((body, metadata)) = combined.rsplit_once(STATUS_MARKER) else {
-        store.complete_host_request(
-            reservation.id,
-            None,
-            Some("source response omitted HTTP metadata"),
-        )?;
-        return Err(io::Error::other("source response omitted HTTP metadata"));
-    };
-    let mut metadata_parts = metadata.trim_end_matches(['\r', '\n']).split('\t');
-    let (Some(status), Some(content_type)) = (metadata_parts.next(), metadata_parts.next()) else {
+        .stderr(Stdio::null());
+    let (output, metadata) = super::run_reserved_http_response(
+        store,
+        reservation.id,
+        &mut command,
+        STATUS_MARKER,
+        "source response omitted HTTP metadata",
+        "source response omitted HTTP metadata",
+    )?;
+    let body = String::from_utf8_lossy(&output.stdout);
+    let (Some(_status_text), Some(content_type)) = (
+        metadata.status_text.as_deref(),
+        metadata.content_type.as_deref(),
+    ) else {
         store.complete_host_request(
             reservation.id,
             None,
@@ -553,31 +471,15 @@ fn fetch_url(
         )?;
         return Err(io::Error::other("source response omitted HTTP status"));
     };
-    let status = match status.parse::<u16>() {
-        Ok(status) => status,
-        Err(_) => {
-            store.complete_host_request(
-                reservation.id,
-                None,
-                Some("source returned invalid HTTP status"),
-            )?;
-            return Err(io::Error::other("source returned an invalid HTTP status"));
-        }
-    };
-    let retry_after = metadata_parts.next().and_then(|value| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis();
-        super::retry_after_delay_ms(value, i64::try_from(now).ok()?)
-    });
-    let request_error = (!output.status.success()).then_some("curl reported a source fetch error");
-    store.complete_host_request_with_retry_after(
+    let status = super::require_http_status(
+        store,
         reservation.id,
-        Some(status),
-        retry_after,
-        request_error,
+        &metadata,
+        "source returned invalid HTTP status",
+        "source returned an invalid HTTP status",
     )?;
+    let request_error = (!output.status.success()).then_some("curl reported a source fetch error");
+    super::complete_reserved_http_request(store, reservation.id, &metadata, request_error)?;
     if !output.status.success() && status == 200 {
         return Err(io::Error::other(
             "source transfer failed or exceeded the response-size limit",
@@ -590,12 +492,12 @@ fn fetch_url(
         ));
     }
     if status == 200 && output.status.success() && request_kind == "external_page_content" {
-        store.cache_source_page(url.as_str(), content_type, body)?;
+        store.cache_source_page(url.as_str(), content_type, body.as_ref())?;
     }
     Ok(HttpResponse {
         status,
         content_type: content_type.to_owned(),
-        body: body.to_owned(),
+        body: body.into_owned(),
     })
 }
 
@@ -607,11 +509,11 @@ fn fetch_site_policy(
     interval_ms: i64,
 ) -> io::Result<HttpResponse> {
     let origin = url.origin().ascii_serialization();
-    if let Some((status, content_type, body)) = store.cached_site_policy(&origin, request_kind)? {
+    if let Some(cached) = store.cached_site_policy(&origin, request_kind)? {
         return Ok(HttpResponse {
-            status,
-            content_type,
-            body,
+            status: cached.status,
+            content_type: cached.content_type,
+            body: cached.body,
         });
     }
     let response = fetch_url(
@@ -843,12 +745,7 @@ fn parse_manifest_json(value: &serde_json::Value) -> Result<SiteManifest, String
     {
         return Err("manifest requires a non-empty string version".into());
     }
-    let mut manifest = SiteManifest {
-        disallow_agents: Vec::new(),
-        requests_per_minute: None,
-        require_auth: false,
-        llms_txt: None,
-    };
+    let mut manifest = SiteManifest::default();
     if let Some(policies) = object.get("governance_policies") {
         let policies = policies
             .as_object()
@@ -906,12 +803,7 @@ fn parse_manifest_json(value: &serde_json::Value) -> Result<SiteManifest, String
 }
 
 fn parse_manifest_yaml_subset(text: &str) -> Result<SiteManifest, String> {
-    let mut manifest = SiteManifest {
-        disallow_agents: Vec::new(),
-        requests_per_minute: None,
-        require_auth: false,
-        llms_txt: None,
-    };
+    let mut manifest = SiteManifest::default();
     let mut section = "";
     let mut list_property = false;
     let mut has_version = false;
@@ -1087,10 +979,6 @@ fn select_llms_markdown(
     best.map(|(_, url)| url)
 }
 
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1101,14 +989,7 @@ mod tests {
 
     #[test]
     fn cached_site_policy_is_used_without_a_network_request() {
-        let path = std::env::temp_dir().join(format!(
-            "community-policy-cache-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-policy-cache", "db");
         let mut store = crate::storage::LearningStore::open(&path).unwrap();
         store
             .cache_site_policy(
@@ -1135,14 +1016,7 @@ mod tests {
 
     #[test]
     fn cached_robots_denial_skips_a_candidate_before_dns() {
-        let path = std::env::temp_dir().join(format!(
-            "community-robots-skip-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-robots-skip", "db");
         let mut store = crate::storage::LearningStore::open(&path).unwrap();
         store
             .remember_robots_block(
@@ -1173,7 +1047,12 @@ mod tests {
         };
         let review = inspect_and_fetch(&mut store, &candidate);
         assert_eq!(review.policy_status, "disallowed");
-        assert!(review.policy_reason.contains("cached"));
+        assert!(
+            review
+                .policy_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("cached"))
+        );
         drop(store);
         let _ = std::fs::remove_file(path);
     }

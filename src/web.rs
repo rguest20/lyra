@@ -11,9 +11,9 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agent::{Agent, ReplyServices};
-use crate::curator::CuratorHandle;
 use crate::inference::assignments::{AgentRole, ModelRuntime};
 use crate::knowledge::KnowledgeMap;
+use crate::maintenance::MaintenanceHandle;
 use crate::storage::LearningStore;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -62,7 +62,7 @@ pub fn serve(
         .unwrap_or_else(|| Path::new("state"))
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
-    let curator = CuratorHandle::spawn_for_web(
+    let maintenance = MaintenanceHandle::spawn_for_web(
         database_path.to_owned(),
         knowledge_path.to_owned(),
         models.clone(),
@@ -87,16 +87,16 @@ pub fn serve(
             &session_state_directory,
             Path::new(database_path),
             Path::new(knowledge_path),
-            Some((&models, &curator)),
+            Some((&models, &maintenance)),
         ) {
             Ok(should_curate) if should_curate => {
-                curator.wake();
+                maintenance.wake();
             }
             Ok(_) => {}
             Err(error) => eprintln!("could not handle web request: {error}"),
         }
     }
-    curator.stop();
+    maintenance.stop();
     Ok(())
 }
 
@@ -107,7 +107,7 @@ fn handle_request(
     session_state_directory: &Path,
     database_path: &Path,
     knowledge_path: &Path,
-    chat_runtime: Option<(&ModelRuntime, &CuratorHandle)>,
+    chat_runtime: Option<(&ModelRuntime, &MaintenanceHandle)>,
 ) -> io::Result<bool> {
     let request = read_request(stream)?;
     let mut lines = request.split(|byte| *byte == b'\n');
@@ -161,8 +161,7 @@ fn handle_request(
             stream,
             "200 OK",
             "application/json; charset=utf-8",
-            &serde_json::to_vec(&status)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            &serde_json::to_vec(&status).map_err(crate::errors::invalid_json)?,
         )?;
         return Ok(false);
     }
@@ -182,7 +181,7 @@ fn handle_request(
             let state_path = session_state_directory.join(format!("{session_id}.json"));
             if state_path.exists() {
                 let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path)?)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    .map_err(crate::errors::invalid_json)?;
                 let conversation_id = state["conversation_id"]
                     .as_str()
                     .unwrap_or_else(|| state_path.to_str().unwrap_or_default());
@@ -239,7 +238,7 @@ fn handle_request(
             return Ok(false);
         }
     };
-    let Some((models, curator)) = chat_runtime else {
+    let Some((models, maintenance)) = chat_runtime else {
         respond(
             stream,
             "500 Internal Server Error",
@@ -256,7 +255,7 @@ fn handle_request(
         database_path,
         knowledge_path,
         &chat_models,
-        curator,
+        maintenance,
     );
     match result {
         Ok(result) => {
@@ -267,7 +266,7 @@ fn handle_request(
                 &json!({
                     "reply": result.text,
                     "thinking": result.thinking,
-                    "new_conversation": result.new_conversation,
+                    "new_conversation": false,
                     "research_queued": result.research_queued
                 })
                 .to_string()
@@ -294,27 +293,25 @@ fn browser_reply(
     database_path: &Path,
     knowledge_path: &Path,
     models: &ModelRuntime,
-    curator: &CuratorHandle,
+    maintenance: &MaintenanceHandle,
 ) -> io::Result<crate::agent::AgentReply> {
     let model_id = models.model_id(AgentRole::Interaction)?;
     let mut agent = Agent::load_for_model_change(state_path, &model_id)?;
     let map = KnowledgeMap::load(knowledge_path)?;
     let store = LearningStore::open(database_path)?;
-    let mut backend = models.model(AgentRole::Interaction);
-    let mut research_model = models.model(AgentRole::Curmudgeon);
-    let mut scholar_model = models.model(AgentRole::Scholar);
+    let mut reply_models = models.reply_models();
+    let (interaction, services) = ReplyServices::split_models(
+        &mut reply_models,
+        &store,
+        database_path,
+        Some(maintenance),
+        state_path,
+    );
     agent.reply(
         &request.message,
-        &mut backend,
+        interaction,
         &map,
-        ReplyServices {
-            store: &store,
-            database_path,
-            research_model: &mut research_model,
-            scholar_model: &mut scholar_model,
-            curator: Some(curator),
-            state_path,
-        },
+        services,
         request.show_thinking,
     )
 }
@@ -449,14 +446,7 @@ mod tests {
 
     #[test]
     fn status_endpoint_distinguishes_no_pass_from_completed_idle_pass() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-web-status-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-web-status", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database_path = directory.join("learning.db");
         let mut store = LearningStore::open(&database_path).unwrap();
@@ -504,15 +494,7 @@ mod tests {
 
     #[test]
     fn ready_endpoint_reports_latest_challenge_for_browser_session() {
-        let unique = format!(
-            "community-web-audit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let directory = std::env::temp_dir().join(unique);
+        let directory = crate::test_support::unique_temp_path("community-web-audit", "");
         std::fs::create_dir_all(&directory).unwrap();
         let session_id = "0123456789abcdef0123456789abcdef";
         let state_path = directory.join(format!("{session_id}.json"));

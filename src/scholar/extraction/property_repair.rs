@@ -1,15 +1,18 @@
 use super::*;
 
 pub(super) fn repair_property_mismatch(
-    question: &str,
-    source_title: &str,
-    excerpt: &str,
-    source_quality: &str,
-    source_updated_at: Option<String>,
-    guidance: Option<&str>,
+    context: &ExtractionContext<'_>,
     original: ExtractionAttempt,
     ask: &mut impl FnMut(&[Message]) -> io::Result<String>,
 ) -> ExtractionAttempt {
+    let ExtractionContext {
+        question,
+        source_title,
+        excerpt,
+        source_quality,
+        source_updated_at,
+        guidance,
+    } = *context;
     let Some(finding) = original.finding.clone() else {
         return original;
     };
@@ -70,7 +73,7 @@ pub(super) fn repair_property_mismatch(
             source_title,
             excerpt,
             source_quality,
-            source_updated_at,
+            source_updated_at.map(str::to_owned),
             &mut *ask,
         ),
         Err(error) => {
@@ -132,12 +135,12 @@ pub(super) fn rank_property_spans(question: &str, subject: &str, excerpt: &str) 
     let mut spans = Vec::new();
     let mut index = 0;
     for sentence in excerpt
-        .split_inclusive(|ch| matches!(ch, '.' | '?' | '!' | '\n'))
+        .split_inclusive(['.', '?', '!', '\n'])
         .map(str::trim)
         .filter(|span| !span.is_empty())
     {
         for clause in sentence
-            .split_inclusive(|ch| matches!(ch, ',' | ';' | ':'))
+            .split_inclusive([',', ';', ':'])
             .map(str::trim)
             .filter(|span| !span.is_empty())
         {
@@ -264,10 +267,8 @@ Independently reconsider a prior finding that this claim does not match the requ
         }
         reason = review_reason;
     }
-    if matches {
-        if let Some(reason) = epistemic_property_mismatch(question, finding) {
-            return Ok((false, reason));
-        }
+    if matches && let Some(reason) = epistemic_property_mismatch(question, finding) {
+        return Ok((false, reason));
     }
     Ok((matches, reason))
 }

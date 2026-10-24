@@ -1,16 +1,52 @@
 use super::*;
 
 #[test]
-fn source_reference_is_not_preserved_as_an_extra_claim_object() {
+fn parsing_preserves_claim_meaning_for_semantic_review() {
     for reference in ["by the source", "according to this article", "by a passage"] {
         let extraction = parse_extraction(
             &serde_json::json!({"claim":{"subject":"Exact dates","relation":"cannot be accurately determined","object":reference,"evidence_text":"Exact dates cannot be accurately determined.","confidence":0.98,"question_relevance":"direct"}}).to_string(),
         )
         .unwrap();
         let finding = extraction.claim.unwrap();
-        assert_eq!(finding.relation, "cannot be", "{reference}");
-        assert_eq!(finding.object, "accurately determined", "{reference}");
+        assert_eq!(
+            finding.relation, "cannot be accurately determined",
+            "{reference}"
+        );
+        assert_eq!(finding.object, reference, "{reference}");
     }
+}
+
+#[test]
+fn unsupported_source_reference_requires_a_reviewed_repair() {
+    let passage = "Exact dates cannot be accurately determined.";
+    let mut calls = 0;
+    let attempt = extract_scholar_claim_with(
+        "Can the dates be determined?",
+        "Dating report",
+        passage,
+        "reference",
+        None,
+        None,
+        |messages| {
+            calls += 1;
+            Ok(match calls {
+                1 => serde_json::json!({"claim":{"subject":"Exact dates","relation":"cannot be accurately determined","object":"by the source","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string(),
+                2 | 3 => serde_json::json!({"verdict":"insufficient","reason":"The claimed actor is absent from the passage.","evidence_text":null}).to_string(),
+                4 => {
+                    assert!(messages[0].content.contains("bounded repair attempt"));
+                    serde_json::json!({"claim":{"subject":"Exact dates","relation":"cannot be","object":"accurately determined","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
+                }
+                5 | 6 => serde_json::json!({"verdict":"entailed","reason":"The source states this uncertainty directly.","evidence_text":passage}).to_string(),
+                _ => panic!("repair must remain bounded"),
+            })
+        },
+    );
+    assert_eq!(attempt.status, "accepted", "{}", attempt.reason);
+    assert_eq!(calls, 6);
+    let finding = attempt.finding.unwrap();
+    assert_eq!(finding.relation, "cannot be");
+    assert_eq!(finding.object, "accurately determined");
+    assert!(finding.semantic_support.is_some());
 }
 
 #[test]

@@ -6,7 +6,177 @@ use super::{
     discover_configured_searxng, discovery_trigger, evaluate_extraction, finding_matches_target,
     html_to_text, parse_extraction, relevant_page, retry_after_delay_ms, should_retry_grounding,
 };
-use crate::storage::{CorroborationTask, ScholarFinding};
+use crate::storage::CorroborationTask;
+use crate::test_support::ScholarJobTestHelpers;
+
+#[test]
+fn http_response_envelope_splits_at_the_last_exact_marker_without_loss() {
+    let output = b"body\nMARKER in payload\0tail\nMARKER:200\tapplication/json";
+    let (body, metadata) = super::split_http_response(output, "\nMARKER:").unwrap();
+    assert_eq!(body, b"body\nMARKER in payload\0tail");
+    assert_eq!(metadata, b"200\tapplication/json");
+    assert!(super::split_http_response(output, "missing").is_none());
+    assert!(super::split_http_response(output, "").is_none());
+
+    let (body, metadata) = super::parse_http_response(output, "\nMARKER:").unwrap();
+    assert_eq!(body, b"body\nMARKER in payload\0tail");
+    assert_eq!(metadata.status, Some(200));
+    assert_eq!(metadata.content_type.as_deref(), Some("application/json"));
+    assert!(super::parse_http_response(output, "missing").is_none());
+}
+
+#[test]
+fn shared_http_metadata_parser_reads_status_type_and_retry_after() {
+    let metadata = super::parse_http_response_metadata(b"200\tapplication/json\t45\r\n");
+    assert_eq!(metadata.status_text.as_deref(), Some("200"));
+    assert_eq!(metadata.status, Some(200));
+    assert_eq!(metadata.content_type.as_deref(), Some("application/json"));
+    assert_eq!(metadata.retry_after_ms, Some(45_000));
+
+    let malformed = super::parse_http_response_metadata(b"bad\ttext/html\t");
+    assert_eq!(malformed.status_text.as_deref(), Some("bad"));
+    assert_eq!(malformed.status, None);
+    assert_eq!(malformed.content_type.as_deref(), Some("text/html"));
+    assert_eq!(malformed.retry_after_ms, None);
+}
+
+#[test]
+fn shared_http_write_out_keeps_the_marker_and_metadata_fields_ordered() {
+    assert_eq!(
+        super::http_response_write_out("\nCUSTOM:"),
+        "\nCUSTOM:%{http_code}\t%{content_type}\t%header{retry-after}"
+    );
+}
+
+#[test]
+fn missing_http_status_completes_the_reserved_request_once() {
+    let mut store = crate::test_support::in_memory_learning_store();
+    let reservation = store
+        .reserve_host_request_with_interval("example.test", "external_page_content", 10_000)
+        .unwrap();
+
+    let error = super::require_http_status(
+        &mut store,
+        reservation.id,
+        &super::HttpResponseMetadata::default(),
+        "missing status reason",
+        "missing status error",
+    )
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "missing status error");
+    assert!(
+        store
+            .complete_host_request(reservation.id, None, Some("unexpected second completion"))
+            .is_err()
+    );
+}
+
+#[test]
+fn research_outcome_preserves_search_attempt_status_count_and_error() {
+    let found = super::ResearchOutcome::Found(super::ResearchResult {
+        page: SearchPage {
+            index: 0,
+            pageid: 1,
+            title: "Example".into(),
+            extract: None,
+            fullurl: None,
+            revisions: None,
+        },
+        excerpt: "passage".into(),
+        finding: None,
+        research_relevance: "direct".into(),
+        candidate_count: 3,
+    });
+    assert_eq!(found.search_record(), ("results", 3, None));
+    assert_eq!(
+        super::ResearchOutcome::NoResult.search_record(),
+        ("no_result", 0, None)
+    );
+    assert_eq!(
+        super::ResearchOutcome::Failed(std::io::Error::other("network unavailable"))
+            .search_record(),
+        ("error", 0, Some("network unavailable".to_owned()))
+    );
+    assert_eq!(
+        super::ResearchOutcome::Deferred(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "network temporarily unavailable",
+        ))
+        .search_record(),
+        (
+            "error",
+            0,
+            Some("network temporarily unavailable".to_owned())
+        )
+    );
+}
+
+#[test]
+fn curl_spawn_failure_completes_the_reserved_host_request() {
+    let mut store = crate::test_support::in_memory_learning_store();
+    let reservation = store
+        .reserve_host_request_with_interval("example.test", "external_page_content", 10_000)
+        .unwrap();
+    let mut command = std::process::Command::new("/__lyra_missing_curl_for_test__");
+
+    let error = super::run_reserved_curl(&mut store, reservation.id, &mut command).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        store
+            .complete_host_request(reservation.id, None, Some("unexpected second completion"))
+            .is_err()
+    );
+}
+
+#[test]
+fn missing_http_metadata_completes_the_reserved_host_request() {
+    let mut store = crate::test_support::in_memory_learning_store();
+    let reservation = store
+        .reserve_host_request_with_interval("example.test", "external_page_content", 10_000)
+        .unwrap();
+    let mut command = std::process::Command::new("true");
+
+    let error = super::run_reserved_http_response(
+        &mut store,
+        reservation.id,
+        &mut command,
+        "MISSING_MARKER:",
+        "response omitted HTTP metadata",
+        "response omitted HTTP metadata",
+    )
+    .err()
+    .unwrap();
+
+    assert_eq!(error.to_string(), "response omitted HTTP metadata");
+    assert!(
+        store
+            .complete_host_request(reservation.id, None, Some("unexpected second completion"))
+            .is_err()
+    );
+}
+
+#[test]
+fn limited_curl_keeps_common_transport_flags_and_explicit_limits() {
+    let command = super::limited_curl(20, 1_048_576);
+    let args = command
+        .get_args()
+        .map(|value| value.to_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        args,
+        [
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            "1048576",
+        ]
+    );
+}
 
 #[test]
 fn flattened_extraction_preserves_attribution_and_proposition_scope() {
@@ -42,7 +212,7 @@ fn flattened_extraction_preserves_attribution_and_proposition_scope() {
 #[test]
 fn proposition_scope_is_explicit_and_unknown_fields_stay_unknown() {
     let parsed: ScholarFindingJson = serde_json::from_str(
-        r#"{"subject":"Mars","relation":"is","object":"a planet","evidence_text":"The astronomer said Mars is not a planet in Europe.","attribution":"The astronomer said","geographic_scope":"Europe","context_scope":"outer space","polarity":"negated","modality":"possible"}"#,
+        r#"{"subject":"Mars","relation":"is","object":"a planet","evidence_text":"The astronomer said Mars is not a planet in Europe.","attribution":"The astronomer said","geographic_scope":"Europe","context_scope":"outer space","polarity":" NEGATED ","modality":" POSSIBLE "}"#,
     )
     .unwrap();
     let metadata = parsed.proposition(&parsed.evidence_text);
@@ -64,14 +234,7 @@ fn proposition_scope_is_explicit_and_unknown_fields_stay_unknown() {
 
 #[test]
 fn vacci_box_feedback_replaces_company_fact_with_relevant_healthcare_fact() {
-    let path = std::env::temp_dir().join(format!(
-        "community-vaccibox-repair-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::test_support::unique_temp_path("community-vaccibox-repair", "db");
     let mut store = crate::storage::LearningStore::open(&path).unwrap();
     let question =
         "How can renewable energy technologies support healthcare access in remote communities?";
@@ -91,19 +254,15 @@ fn vacci_box_feedback_replaces_company_fact_with_relevant_healthcare_fact() {
             "Norah Magero",
             "https://en.wikipedia.org/wiki/Norah_Magero",
             &passage,
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Norah Magero".into(),
-                relation: "co-founded".into(),
-                object: "Drop Access".into(),
-                evidence_text: company_fact.into(),
-                confidence: 0.98,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "unknown".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(crate::test_support::scholar_finding(
+                "Norah Magero",
+                "co-founded",
+                "Drop Access",
+                company_fact,
+                0.98,
+                "unknown",
+                None,
+            )),
             None,
         )
         .unwrap();
@@ -176,14 +335,7 @@ fn feedback_exclusions_only_block_the_rejected_page() {
 
 #[test]
 fn guided_repair_preserves_passage_and_stages_corrected_claim_for_ai_review() {
-    let path = std::env::temp_dir().join(format!(
-        "community-guided-repair-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::test_support::unique_temp_path("community-guided-repair", "db");
     let mut store = crate::storage::LearningStore::open(&path).unwrap();
     store
         .enqueue_research("guided-repair", 1, "What is Mars?")
@@ -195,19 +347,15 @@ fn guided_repair_preserves_passage_and_stages_corrected_claim_for_ai_review() {
             "Mars",
             "https://reference.example/mars",
             "Mars is a planet.",
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Mars".into(),
-                relation: "is a".into(),
-                object: "planet".into(),
-                evidence_text: "Mars is a planet.".into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "unknown".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(crate::test_support::scholar_finding(
+                "Mars",
+                "is a",
+                "planet",
+                "Mars is a planet.",
+                0.99,
+                "unknown",
+                None,
+            )),
             None,
         )
         .unwrap();
@@ -261,14 +409,7 @@ fn configured_searxng_is_dispatched_only_when_no_candidates_exist() {
         .unwrap();
     });
 
-    let path = std::env::temp_dir().join(format!(
-        "community-searxng-primary-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::test_support::unique_temp_path("community-searxng-primary", "db");
     let mut store = crate::storage::LearningStore::open(&path).unwrap();
     store
         .enqueue_research("fallback-test", 1, "What is in chicken soup?")
@@ -315,19 +456,15 @@ fn corroboration_requires_the_same_claim_and_validity_period() {
         valid_from: None,
         valid_until: None,
     };
-    let mut finding = ScholarFinding {
-        semantic_support: None,
-        subject: "mars".into(),
-        relation: "is a".into(),
-        object: "planet".into(),
-        evidence_text: "Mars is a planet.".into(),
-        confidence: 0.99,
-        valid_from: None,
-        valid_until: None,
-        source_quality: "unknown".into(),
-        source_updated_at: None,
-        proposition: Default::default(),
-    };
+    let mut finding = crate::test_support::scholar_finding(
+        "mars",
+        "is a",
+        "planet",
+        "Mars is a planet.",
+        0.99,
+        "unknown",
+        None,
+    );
     assert!(finding_matches_target(&finding, &task));
     finding.object = "star".into();
     assert!(!finding_matches_target(&finding, &task));
@@ -760,19 +897,15 @@ fn specific_direct_claim_is_grounded_by_an_exact_passage() {
 #[test]
 fn related_claim_can_be_grounded_without_being_direct() {
     let excerpt = "Chicken soup is often served as a comfort food during cold weather.";
-    let finding = ScholarFinding {
-        semantic_support: None,
-        subject: "Chicken soup".into(),
-        relation: "is served as".into(),
-        object: "comfort food during cold weather".into(),
-        evidence_text: excerpt.into(),
-        confidence: 0.98,
-        valid_from: None,
-        valid_until: None,
-        source_quality: "reference".into(),
-        source_updated_at: None,
-        proposition: Default::default(),
-    };
+    let finding = crate::test_support::scholar_finding(
+        "Chicken soup",
+        "is served as",
+        "comfort food during cold weather",
+        excerpt,
+        0.98,
+        "reference",
+        None,
+    );
     assert!(claim_is_grounded(
         &finding.subject,
         &finding.relation,

@@ -10,6 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static RESEARCH_LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+pub(crate) fn text_excerpt(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 pub(crate) fn event(name: &str, fields: serde_json::Value) {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -85,15 +89,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_excerpt_limits_unicode_characters_without_splitting_utf8() {
+        assert_eq!(text_excerpt("a🌱é", 2), "a🌱");
+        assert_eq!(text_excerpt("short", 10), "short");
+    }
+
+    #[test]
     fn appends_structured_research_decisions_as_json_lines() {
-        let path = std::env::temp_dir().join(format!(
-            "lyra-research-decisions-{}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("lyra-research-decisions", "jsonl");
         let first = serde_json::json!({"event":"intent","details":{"lookup":true}});
         let second = serde_json::json!({"event":"plan","details":{"queued":false}});
         append_jsonl(&path, &first).unwrap();

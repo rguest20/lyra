@@ -2,7 +2,13 @@
 
 use super::*;
 use sha2::{Digest, Sha256};
-use std::process::Command;
+
+fn is_non_content_section(heading: &str) -> bool {
+    matches!(
+        heading,
+        "references" | "notes" | "external links" | "see also" | "further reading" | "bibliography"
+    )
+}
 
 pub(super) fn wikipedia_json_request(
     store: &mut LearningStore,
@@ -31,115 +37,71 @@ pub(super) fn wikipedia_json_request(
         crate::storage::wikipedia_interval_ms(),
         std::time::Duration::from_secs(30),
     )?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| io::Error::other(error.to_string()))?
-        .as_millis();
-    if reservation.scheduled_at_ms > now_ms {
-        std::thread::sleep(std::time::Duration::from_millis(
-            u64::try_from(reservation.scheduled_at_ms - now_ms).unwrap_or(u64::MAX),
-        ));
-    }
-    let mut command = Command::new("curl");
-    command
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            "15",
-            "--max-filesize",
-        ])
-        .arg(max_bytes.to_string())
-        .args(["--user-agent", USER_AGENT, "--get", SEARCH_API]);
+    super::wait_for_host_request(reservation.scheduled_at_ms)?;
+    let mut command = super::limited_curl(15, max_bytes);
+    command.args(["--user-agent", USER_AGENT, "--get", SEARCH_API]);
     for (name, value) in parameters {
         command
             .arg("--data-urlencode")
             .arg(format!("{name}={value}"));
     }
     command.args(["--data-urlencode", "maxlag=5"]);
-    let output = command
+    command
         .arg("--write-out")
-        .arg(format!(
-            "{HTTP_STATUS_MARKER}%{{http_code}}\t%header{{retry-after}}"
-        ))
-        .output();
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            store.complete_host_request(reservation.id, None, Some("curl could not run"))?;
-            return Err(error);
-        }
-    };
-    let combined = String::from_utf8_lossy(&output.stdout);
-    let Some((body, metadata)) = combined.rsplit_once(HTTP_STATUS_MARKER) else {
-        store.complete_host_request(
-            reservation.id,
-            None,
-            Some("Wikipedia response omitted HTTP status"),
-        )?;
-        return Err(io::Error::other(
-            "Wikipedia response omitted its HTTP status",
-        ));
-    };
-    let mut metadata = metadata.trim_end_matches(['\r', '\n']).split('\t');
-    let Some(response_status) = metadata
-        .next()
-        .and_then(|status| status.parse::<u16>().ok())
-    else {
-        store.complete_host_request(
-            reservation.id,
-            None,
-            Some("Wikipedia response omitted HTTP status"),
-        )?;
-        return Err(io::Error::other(
-            "Wikipedia response omitted its HTTP status",
-        ));
-    };
-    let retry_after = metadata.next().and_then(|value| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis();
-        retry_after_delay_ms(value, i64::try_from(now).ok()?)
-    });
+        .arg(super::http_response_write_out(HTTP_STATUS_MARKER));
+    let (output, metadata) = super::run_reserved_http_response(
+        store,
+        reservation.id,
+        &mut command,
+        HTTP_STATUS_MARKER,
+        "Wikipedia response omitted HTTP status",
+        "Wikipedia response omitted its HTTP status",
+    )?;
+    let body = String::from_utf8_lossy(&output.stdout);
+    let response_status = super::require_http_status(
+        store,
+        reservation.id,
+        &metadata,
+        "Wikipedia response omitted HTTP status",
+        "Wikipedia response omitted its HTTP status",
+    )?;
     let parsed = serde_json::from_slice::<serde_json::Value>(body.as_bytes());
-    if let Ok(json) = &parsed {
-        if let Some(code) = json["error"]["code"].as_str() {
-            let transient = mediawiki_transient_error(code);
-            store.complete_host_request_with_retry_after(
-                reservation.id,
-                Some(response_status),
-                retry_after,
-                Some(if transient {
-                    crate::storage::MEDIAWIKI_TRANSIENT_ERROR
-                } else {
-                    "MediaWiki API returned an error"
-                }),
-            )?;
-            crate::diagnostics::event(
-                "internet.request_failed",
-                serde_json::json!({"provider":"wikipedia","request_kind":request_kind,"http_status":response_status,"api_error_code":code.chars().take(100).collect::<String>(),"retryable":transient}),
-            );
-            return Err(io::Error::new(
-                if transient {
-                    io::ErrorKind::WouldBlock
-                } else {
-                    io::ErrorKind::Other
-                },
-                format!(
-                    "Wikipedia API error: {}",
-                    code.chars().take(100).collect::<String>()
-                ),
-            ));
-        }
+    if let Ok(json) = &parsed
+        && let Some(code) = json["error"]["code"].as_str()
+    {
+        let transient = mediawiki_transient_error(code);
+        super::complete_reserved_http_request(
+            store,
+            reservation.id,
+            &metadata,
+            Some(if transient {
+                crate::storage::MEDIAWIKI_TRANSIENT_ERROR
+            } else {
+                "MediaWiki API returned an error"
+            }),
+        )?;
+        crate::diagnostics::event(
+            "internet.request_failed",
+            serde_json::json!({"provider":"wikipedia","request_kind":request_kind,"http_status":response_status,"api_error_code":code.chars().take(100).collect::<String>(),"retryable":transient}),
+        );
+        return Err(io::Error::new(
+            if transient {
+                io::ErrorKind::WouldBlock
+            } else {
+                io::ErrorKind::Other
+            },
+            format!(
+                "Wikipedia API error: {}",
+                code.chars().take(100).collect::<String>()
+            ),
+        ));
     }
     let request_error = (!output.status.success())
         .then(|| wikipedia_request_failure(output.status.code(), response_status, max_bytes));
-    store.complete_host_request_with_retry_after(
+    super::complete_reserved_http_request(
+        store,
         reservation.id,
-        Some(response_status),
-        retry_after,
+        &metadata,
         request_error.as_deref(),
     )?;
     if let Some(error) = request_error {
@@ -170,7 +132,7 @@ pub(super) fn wikipedia_json_request(
             "Wikipedia response exceeded the configured size limit",
         ));
     }
-    let parsed = parsed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let parsed = parsed.map_err(crate::errors::invalid_json)?;
     store.cache_wikipedia_response(&key, request_kind, &parsed)?;
     Ok(parsed)
 }
@@ -193,15 +155,14 @@ fn wikipedia_request_failure(exit_code: Option<i32>, http_status: u16, max_bytes
         Some(63) => format!("response exceeded the {max_bytes}-byte limit"),
         _ => "curl transport failed".to_owned(),
     };
-    let exit = exit_code
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "terminated".into());
+    let exit = exit_code.map_or_else(|| "terminated".into(), |code| code.to_string());
     format!("Wikipedia request failed: {reason} (curl exit {exit}; HTTP status {http_status})")
 }
 
 #[cfg(test)]
 mod tests {
     use super::wikipedia_request_failure;
+    use crate::scholar::ParsedSection;
 
     #[test]
     fn mediawiki_json_rate_limits_are_retryable_even_with_http_200() {
@@ -220,6 +181,28 @@ mod tests {
         let server_error = wikipedia_request_failure(Some(22), 503, 1200);
         assert!(server_error.contains("server returned an HTTP error"));
         assert!(server_error.contains("HTTP status 503"));
+    }
+
+    #[test]
+    fn relevant_passages_excludes_the_same_non_content_sections_as_ranking() {
+        let sections = [
+            ParsedSection {
+                index: serde_json::json!("1"),
+                line: "Ingredients".into(),
+            },
+            ParsedSection {
+                index: serde_json::json!("2"),
+                line: "References".into(),
+            },
+        ];
+        let ranked = super::ranked_sections("ingredients", &sections);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].title, "Ingredients");
+
+        let article = "# Ingredients\nChicken soup contains carrots.\n# References\nChicken soup contains unrelated source notes.";
+        let excerpt = super::relevant_passages("What ingredients are in chicken soup?", article);
+        assert!(excerpt.contains("Chicken soup contains carrots."));
+        assert!(!excerpt.contains("unrelated source notes"));
     }
 }
 
@@ -314,17 +297,7 @@ pub(super) fn ranked_sections(question: &str, sections: &[ParsedSection]) -> Vec
     let query_words = crate::storage::relevant_words(question);
     let mut ranked = sections
         .iter()
-        .filter(|section| {
-            !matches!(
-                section.line.trim().to_ascii_lowercase().as_str(),
-                "references"
-                    | "notes"
-                    | "external links"
-                    | "see also"
-                    | "further reading"
-                    | "bibliography"
-            )
-        })
+        .filter(|section| !is_non_content_section(&section.line.trim().to_ascii_lowercase()))
         .filter_map(|section| {
             let words = crate::storage::relevant_words(&section.line);
             let index = section
@@ -372,15 +345,7 @@ pub(super) fn relevant_passages(question: &str, article: &str) -> String {
         let trimmed = line.trim();
         if let Some(heading) = trimmed.strip_prefix('#') {
             let heading = heading.trim_matches('#').trim().to_ascii_lowercase();
-            skip_section = matches!(
-                heading.as_str(),
-                "references"
-                    | "notes"
-                    | "external links"
-                    | "see also"
-                    | "further reading"
-                    | "bibliography"
-            );
+            skip_section = is_non_content_section(&heading);
         }
         if !skip_section {
             article_without_reference_sections.push_str(line);

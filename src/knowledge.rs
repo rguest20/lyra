@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use crate::errors::{invalid_data as invalid, invalid_json};
 use serde::{Deserialize, Serialize};
 
 const VERSION: u64 = 1;
@@ -237,21 +238,13 @@ fn check_field(field: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn invalid_json(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::KnowledgeMap;
 
     #[test]
     fn revisions_and_retractions_change_retrieval_across_restarts() {
-        let path = std::env::temp_dir().join(format!("community-map-{}.json", std::process::id()));
+        let path = crate::test_support::unique_temp_path("community-map", "json");
         let mut map = KnowledgeMap::load(&path).unwrap();
         let id = map
             .add("Willow", "grows beside", "rivers", "field note A")

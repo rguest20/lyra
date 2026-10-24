@@ -2,6 +2,8 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::curator;
@@ -10,6 +12,155 @@ use crate::inference::assignments::{AgentRole, ModelRuntime};
 use crate::scholar;
 use crate::scout;
 use crate::storage::LearningStore;
+
+const MAX_WEB_FOLLOW_UP_PASSES: usize = 3;
+
+enum Command {
+    Wake,
+    Stop,
+}
+
+pub struct MaintenanceHandle {
+    sender: mpsc::SyncSender<Command>,
+    thread: Option<JoinHandle<()>>,
+    shutdown_runtime: ModelRuntime,
+}
+
+impl MaintenanceHandle {
+    pub fn spawn(database_path: String, knowledge_path: String, models: ModelRuntime) -> Self {
+        Self::spawn_with_mode(database_path, knowledge_path, models, "chat", false)
+    }
+
+    pub fn spawn_for_web(
+        database_path: String,
+        knowledge_path: String,
+        models: ModelRuntime,
+    ) -> Self {
+        Self::spawn_with_mode(database_path, knowledge_path, models, "serve", true)
+    }
+
+    fn spawn_with_mode(
+        database_path: String,
+        knowledge_path: String,
+        models: ModelRuntime,
+        mode: &'static str,
+        drain_productive_passes: bool,
+    ) -> Self {
+        let (sender, receiver) = wake_queue();
+        let shutdown_runtime = models.clone();
+        let thread = thread::Builder::new()
+            .name("semantic-curator".into())
+            .spawn(move || {
+                run_worker(
+                    database_path,
+                    knowledge_path,
+                    models,
+                    mode,
+                    drain_productive_passes,
+                    receiver,
+                )
+            });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                eprintln!("could not start semantic curator: {error}");
+                None
+            }
+        };
+        Self {
+            sender,
+            thread,
+            shutdown_runtime,
+        }
+    }
+
+    pub fn wake(&self) {
+        send_wake(&self.sender);
+    }
+
+    pub fn stop(mut self) {
+        self.shutdown_runtime.stop_background_waits();
+        let _ = self.sender.send(Command::Stop);
+        self.join();
+    }
+
+    fn join(&mut self) {
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            eprintln!("semantic curator stopped unexpectedly");
+        }
+    }
+}
+
+impl Drop for MaintenanceHandle {
+    fn drop(&mut self) {
+        self.shutdown_runtime.stop_background_waits();
+        let _ = self.sender.send(Command::Stop);
+        self.join();
+    }
+}
+
+fn run_worker(
+    database_path: String,
+    knowledge_path: String,
+    models: ModelRuntime,
+    mode: &'static str,
+    drain_productive_passes: bool,
+    receiver: mpsc::Receiver<Command>,
+) {
+    let mut productive_follow_ups = 0;
+    loop {
+        if drain_commands(&receiver) {
+            break;
+        }
+        let did_work = match run_pass(
+            Path::new(&database_path),
+            Path::new(&knowledge_path),
+            &models,
+            mode,
+        ) {
+            Ok(summary) => summary.did_work(),
+            Err(error) => {
+                eprintln!("semantic maintenance pass failed: {error}");
+                false
+            }
+        };
+        if drain_productive_passes && did_work && productive_follow_ups < MAX_WEB_FOLLOW_UP_PASSES {
+            productive_follow_ups += 1;
+            continue;
+        }
+        productive_follow_ups = 0;
+        if !wait_for_next_pass(&receiver, interval()) {
+            break;
+        }
+    }
+}
+
+fn wait_for_next_pass(receiver: &mpsc::Receiver<Command>, interval: Duration) -> bool {
+    matches!(
+        receiver.recv_timeout(interval),
+        Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+fn wake_queue() -> (mpsc::SyncSender<Command>, mpsc::Receiver<Command>) {
+    mpsc::sync_channel(1)
+}
+
+fn send_wake(sender: &mpsc::SyncSender<Command>) {
+    let _ = sender.try_send(Command::Wake);
+}
+
+fn drain_commands(receiver: &mpsc::Receiver<Command>) -> bool {
+    loop {
+        match receiver.try_recv() {
+            Ok(Command::Wake) => {}
+            Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return true,
+            Err(mpsc::TryRecvError::Empty) => return false,
+        }
+    }
+}
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct PassSummary {
@@ -308,7 +459,24 @@ fn run_pass_with_roles(
 mod tests {
     use super::*;
     use crate::knowledge::KnowledgeMap;
-    use crate::storage::ScholarFinding;
+    use crate::test_support::ScholarJobTestHelpers;
+
+    #[test]
+    fn terminal_maintenance_wakes_on_an_idle_interval() {
+        let (sender, receiver) = mpsc::channel();
+        assert!(wait_for_next_pass(&receiver, Duration::from_millis(1)));
+        sender.send(Command::Stop).unwrap();
+        assert!(!wait_for_next_pass(&receiver, Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn duplicate_wake_requests_coalesce_in_a_bounded_queue() {
+        let (sender, receiver) = wake_queue();
+        send_wake(&sender);
+        send_wake(&sender);
+        assert!(matches!(receiver.try_recv(), Ok(Command::Wake)));
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn frontend_lookup_gets_the_first_pass_slot_even_with_autonomy_disabled() {
@@ -332,14 +500,7 @@ mod tests {
                 Ok(1)
             }
         }
-        let path = std::env::temp_dir().join(format!(
-            "lyra-user-priority-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("lyra-user-priority", "db");
         let store = LearningStore::open(&path).unwrap();
         store
             .enqueue_research("frontend", 1, "What crisp flavours exist?")
@@ -423,19 +584,15 @@ mod tests {
                 "Mars",
                 "https://en.wikipedia.org/wiki/Mars",
                 "Mars is a planet.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Mars".into(),
-                    relation: "is a".into(),
-                    object: "planet".into(),
-                    evidence_text: "Mars is a planet.".into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(crate::test_support::scholar_finding(
+                    "Mars",
+                    "is a",
+                    "planet",
+                    "Mars is a planet.",
+                    0.99,
+                    "reference",
+                    None,
+                )),
                 None,
             )?;
             Ok(1)
@@ -444,14 +601,7 @@ mod tests {
 
     #[test]
     fn idle_tick_finds_a_gap_and_scholar_evidence_reaches_the_map() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-maintenance-loop-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-maintenance-loop", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database_path = directory.join("learning.db");
         let knowledge_path = directory.join("knowledge.json");
@@ -538,14 +688,7 @@ mod tests {
 
     #[test]
     fn failed_model_load_is_visible_as_a_failed_pass() {
-        let path = std::env::temp_dir().join(format!(
-            "community-maintenance-startup-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-maintenance-startup", "db");
         record_startup_failure(&path, "serve", "model unavailable").unwrap();
         let store = LearningStore::open(&path).unwrap();
         let pass = store.maintenance_status().unwrap().last_pass.unwrap();
@@ -557,14 +700,7 @@ mod tests {
 
     #[test]
     fn disabled_research_and_inference_budget_skip_their_roles() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-maintenance-budget-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-maintenance-budget", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database_path = directory.join("learning.db");
         let knowledge_path = directory.join("knowledge.json");

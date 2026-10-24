@@ -14,6 +14,16 @@ Return one JSON object only: {"claim":{"subject":"...","relation":"...","object"
 #[path = "extraction/property_repair.rs"]
 mod property_repair;
 
+#[derive(Clone, Copy)]
+pub(super) struct ExtractionContext<'a> {
+    pub question: &'a str,
+    pub source_title: &'a str,
+    pub excerpt: &'a str,
+    pub source_quality: &'a str,
+    pub source_updated_at: Option<&'a str>,
+    pub guidance: Option<&'a str>,
+}
+
 pub(crate) fn probe_extraction(
     question: &str,
     title: &str,
@@ -92,18 +102,21 @@ pub(crate) fn extract_scholar_claim_with(
             model_output: None,
         },
     };
-    let attempt = property_repair::repair_property_mismatch(
+    let context = ExtractionContext {
         question,
         source_title,
         excerpt,
         source_quality,
-        source_updated_at.clone(),
+        source_updated_at: source_updated_at.as_deref(),
         guidance,
-        attempt,
-        &mut generate,
-    );
+    };
+    let attempt = property_repair::repair_property_mismatch(&context, attempt, &mut generate);
     let initial_status = attempt.status;
     let initial_reason = attempt.reason.clone();
+    let selected_passage_chars = excerpt.chars().count();
+    let selected_passage_excerpt =
+        crate::diagnostics::text_excerpt(excerpt, MAX_SELECTED_PASSAGE_CHARS);
+    let selected_passage_truncated = selected_passage_chars > MAX_SELECTED_PASSAGE_CHARS;
     let attempt = if should_retry_grounding(&attempt) {
         // A failure to settle currentness is not a failure to extract a dated
         // property. Use literal request spans only; the original question still
@@ -164,15 +177,15 @@ pub(crate) fn extract_scholar_claim_with(
                         "question": question,
                         "review_guidance": guidance,
                         "source_title": source_title,
-                        "selected_passage_excerpt": excerpt.chars().take(MAX_SELECTED_PASSAGE_CHARS).collect::<String>(),
-                        "selected_passage_chars": excerpt.chars().count(),
-                        "selected_passage_truncated": excerpt.chars().count() > MAX_SELECTED_PASSAGE_CHARS,
+                        "selected_passage_excerpt": selected_passage_excerpt,
+                        "selected_passage_chars": selected_passage_chars,
+                        "selected_passage_truncated": selected_passage_truncated,
                         "initial_reason": attempt.reason,
                         "evidence_match": extraction_evidence_diagnostics(repaired.model_output.as_deref(), excerpt),
                         "semantic_support": repaired.finding.as_ref().and_then(|finding| finding.semantic_support.as_ref()),
                         "status": repaired.status,
                         "reason": repaired.reason,
-                        "model_output_excerpt": repaired.model_output.as_ref().map(|output| output.chars().take(1_000).collect::<String>()),
+                        "model_output_excerpt": repaired.model_output.as_ref().map(|output| crate::diagnostics::text_excerpt(output, 1_000)),
                     }),
                 );
                 repaired
@@ -194,9 +207,9 @@ pub(crate) fn extract_scholar_claim_with(
             "question": question,
                         "review_guidance": guidance,
             "source_title": source_title,
-            "selected_passage_excerpt": excerpt.chars().take(MAX_SELECTED_PASSAGE_CHARS).collect::<String>(),
-                        "selected_passage_chars": excerpt.chars().count(),
-                        "selected_passage_truncated": excerpt.chars().count() > MAX_SELECTED_PASSAGE_CHARS,
+            "selected_passage_excerpt": selected_passage_excerpt,
+            "selected_passage_chars": selected_passage_chars,
+            "selected_passage_truncated": selected_passage_truncated,
             "evidence_match": extraction_evidence_diagnostics(attempt.model_output.as_deref(), excerpt),
             "semantic_support": attempt.finding.as_ref().and_then(|finding| finding.semantic_support.as_ref()),
             "initial_status": initial_status,
@@ -204,7 +217,7 @@ pub(crate) fn extract_scholar_claim_with(
             "status": attempt.status,
             "relevance": attempt.relevance,
             "reason": attempt.reason,
-            "model_output_excerpt": attempt.model_output.as_ref().map(|output| output.chars().take(1_000).collect::<String>()),
+            "model_output_excerpt": attempt.model_output.as_ref().map(|output| crate::diagnostics::text_excerpt(output, 1_000)),
         }),
     );
     attempt
@@ -341,15 +354,7 @@ fn evaluate_extraction_with_support(
         "direct" | "related" | "tangential" => claim.question_relevance.clone(),
         _ => "unknown".into(),
     };
-    let safe_field = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 500
-            && !value.chars().any(char::is_control)
-            && !value.contains("<|")
-    };
-    if !safe_field(&claim.subject)
-        || !safe_field(&claim.relation)
-        || !safe_field(&claim.object)
+    if !crate::storage::valid_proposition_fields(&claim.subject, &claim.relation, &claim.object)
         || claim.evidence_text.contains("<|")
     {
         return rejected(
@@ -360,14 +365,11 @@ fn evaluate_extraction_with_support(
     }
     normalize_unsupported_qualifiers(&mut claim);
     clear_event_year_validity(&mut claim);
-    if !crate::storage::valid_claim_period(
+    if !crate::storage::claim_period_is_stated(
         claim.valid_from.as_deref(),
         claim.valid_until.as_deref(),
-    ) || [claim.valid_from.as_deref(), claim.valid_until.as_deref()]
-        .into_iter()
-        .flatten()
-        .any(|date| !excerpt.contains(date))
-    {
+        excerpt,
+    ) {
         return rejected(
             "ungrounded",
             "claim validity dates are invalid or absent from the passage".into(),
@@ -387,16 +389,16 @@ fn evaluate_extraction_with_support(
     let whitespace_restored = original_evidence != claim.evidence_text;
     claim.evidence_text = original_evidence.to_owned();
     let proposition = claim.proposition(&claim.evidence_text);
-    if semantic_support.is_none() {
-        if let Some(reason) = claim_grounding_failure(
+    if semantic_support.is_none()
+        && let Some(reason) = claim_grounding_failure(
             &claim.subject,
             &claim.relation,
             &claim.object,
             &claim.evidence_text,
             excerpt,
-        ) {
-            return rejected("ungrounded", reason.into(), relevance);
-        }
+        )
+    {
+        return rejected("ungrounded", reason.into(), relevance);
     }
     let finding = ScholarFinding {
         semantic_support,
@@ -487,14 +489,12 @@ fn clear_event_year_validity(claim: &mut ScholarFindingJson) {
 }
 
 pub(super) fn parse_extraction(reply: &str) -> io::Result<Extraction> {
-    let start = reply
-        .find('{')
-        .ok_or_else(|| invalid("scholar did not return JSON"))?;
-    let end = reply
-        .rfind('}')
-        .ok_or_else(|| invalid("scholar returned incomplete JSON"))?;
-    let json = &reply[start..=end];
-    let mut extraction = match serde_json::from_str::<Extraction>(json) {
+    let json = crate::research::json_object_slice(
+        reply,
+        "scholar did not return JSON",
+        "scholar returned incomplete JSON",
+    )?;
+    let extraction = match serde_json::from_str::<Extraction>(json) {
         Ok(extraction) => extraction,
         Err(nested_error) => {
             // Small local models sometimes flatten the requested `claim` object
@@ -540,72 +540,5 @@ pub(super) fn parse_extraction(reply: &str) -> io::Result<Extraction> {
                 .map_err(|error| invalid(&format!("scholar returned invalid JSON: {error}")))?
         }
     };
-    if let Some(claim) = extraction.claim.as_mut() {
-        normalize_source_reference_object(claim);
-    }
     Ok(extraction)
-}
-
-fn normalize_source_reference_object(claim: &mut ScholarFindingJson) {
-    if !is_source_reference_fragment(&claim.object) {
-        return;
-    }
-    let relation = claim.relation.trim().to_owned();
-    let lower = relation.to_lowercase();
-    for prefix in [
-        "cannot be ",
-        "can be ",
-        "will be ",
-        "is ",
-        "are ",
-        "was ",
-        "were ",
-        "cannot ",
-        "can ",
-    ] {
-        if lower.starts_with(prefix) {
-            let predicate = relation[prefix.len()..].trim().to_owned();
-            if !predicate.is_empty() {
-                claim.relation = prefix.trim().to_owned();
-                claim.object = predicate;
-                return;
-            }
-        }
-    }
-}
-
-fn is_source_reference_fragment(value: &str) -> bool {
-    let lowered = value.to_lowercase();
-    let words = lowered
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let Some(reference_type) = words.last().copied() else {
-        return false;
-    };
-    if !matches!(
-        reference_type,
-        "source"
-            | "passage"
-            | "article"
-            | "text"
-            | "document"
-            | "page"
-            | "author"
-            | "publication"
-            | "reference"
-            | "report"
-    ) {
-        return false;
-    }
-    matches!(
-        words.as_slice(),
-        ["by", "the", _] | ["by", "this", _] | ["by", "that", _] | ["by", "a", _]
-    ) || matches!(
-        words.as_slice(),
-        ["according", "to", "the", _]
-            | ["according", "to", "this", _]
-            | ["according", "to", "that", _]
-            | ["according", "to", "a", _]
-    )
 }

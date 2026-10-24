@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::inference::LocalModel;
 use crate::knowledge::KnowledgeMap;
-use crate::storage::{LearningStore, StoredAssistantClaim};
+use crate::storage::{ClaimTopic, LearningStore, StoredAssistantClaim};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Gap {
@@ -93,37 +93,35 @@ fn process_once_with_request(
     // Advance background coverage on every pass, including passes where an
     // urgent challenged or due claim is handled first.
     let review_batch = store.next_claims_for_maintenance(8)?;
-    for (id, subject, relation, object) in store.challenged_claim_topics(8)? {
-        let key = format!("claim:{id}");
-        if store.scout_topic_exists("challenged", &key)? {
-            continue;
-        }
+    for topic in store.challenged_claim_topics(8)? {
         let question = format!(
-            "Investigate the unresolved challenge to the claim that {subject} {relation} {object}. Find independent, trustworthy evidence and report whether it supports, contradicts, or qualifies this claim."
+            "Investigate the unresolved challenge to the claim that {} {} {}. Find independent, trustworthy evidence and report whether it supports, contradicts, or qualifies this claim.",
+            topic.subject, topic.relation, topic.object
         );
-        return Ok(usize::from(store.enqueue_scout_research_with_reason(
+        if let Some(queued) = enqueue_claim_topic(
+            &mut store,
+            &topic,
             "challenged",
-            &key,
-            &format!("db:{id}"),
             &question,
             "Unresolved challenge on an active map claim",
-        )?));
-    }
-    for (id, subject, relation, object) in store.due_claim_topics(8)? {
-        let key = format!("claim:{id}");
-        if store.scout_topic_exists("stale", &key)? {
-            continue;
+        )? {
+            return Ok(queued);
         }
+    }
+    for topic in store.due_claim_topics(8)? {
         let question = format!(
-            "Find current, trustworthy evidence for whether {subject} {relation} {object} remains accurate. Report evidence that supports or contradicts the claim."
+            "Find current, trustworthy evidence for whether {} {} {} remains accurate. Report evidence that supports or contradicts the claim.",
+            topic.subject, topic.relation, topic.object
         );
-        return Ok(usize::from(store.enqueue_scout_research_with_reason(
+        if let Some(queued) = enqueue_claim_topic(
+            &mut store,
+            &topic,
             "stale",
-            &key,
-            &format!("db:{id}"),
             &question,
             "Claim has passed its scheduled review date",
-        )?));
+        )? {
+            return Ok(queued);
+        }
     }
     for claim in &review_batch {
         if matches!(
@@ -213,8 +211,15 @@ fn process_once_with_request(
             },
         )?));
     }
-    if let Some((id, seed, topic, question, raw)) = store.deferred_model_probe()? {
-        return queue_model_lead(&mut store, id, &seed, &topic, &question, &raw);
+    if let Some(probe) = store.deferred_model_probe()? {
+        return queue_model_lead(
+            &mut store,
+            probe.id,
+            &probe.seed,
+            &probe.topic,
+            &probe.question,
+            &probe.raw_output,
+        );
     }
     let previous_topics = store.recent_model_topics()?;
     let Some(probe_id) = store.begin_model_probe(
@@ -268,7 +273,7 @@ fn process_once_with_request(
                 "probe_id": probe_id, "seed":seed,
                 "decision": "rejected",
                 "reason": "model lead must provide one focused question about the named starting subject",
-                "model_output_excerpt": raw.chars().take(300).collect::<String>(),
+                "model_output_excerpt": crate::diagnostics::text_excerpt(&raw, 300),
             }),
         );
         return Ok(0);
@@ -305,6 +310,27 @@ fn process_once_with_request(
         return Ok(0);
     }
     queue_model_lead(&mut store, probe_id, &seed, &topic, &question, &raw)
+}
+
+fn enqueue_claim_topic(
+    store: &mut LearningStore,
+    topic: &ClaimTopic,
+    kind: &str,
+    question: &str,
+    reason: &str,
+) -> io::Result<Option<usize>> {
+    let key = format!("claim:{}", topic.id);
+    if store.scout_topic_exists(kind, &key)? {
+        return Ok(None);
+    }
+    let queued = store.enqueue_scout_research_with_reason(
+        kind,
+        &key,
+        &format!("db:{}", topic.id),
+        question,
+        reason,
+    )?;
+    Ok(Some(usize::from(queued)))
 }
 
 fn queue_model_lead(
@@ -697,7 +723,8 @@ fn public_topic(subject: &str, relation: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{ScholarFinding, SemanticClaim, SemanticClaimDetail};
+    use crate::storage::{SemanticClaim, SemanticClaimDetail};
+    use crate::test_support::ScholarJobTestHelpers;
 
     #[test]
     fn seeded_question_must_stay_about_its_named_subject() {
@@ -769,14 +796,7 @@ mod tests {
 
     #[test]
     fn persisted_history_rejects_explored_subject_and_records_new_positive_seed() {
-        let directory = std::env::temp_dir().join(format!(
-            "scout-diversity-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("scout-diversity", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("learning.db");
         let knowledge = directory.join("knowledge.json");
@@ -804,14 +824,7 @@ mod tests {
 
     #[test]
     fn model_only_lead_is_queued_after_map_gaps_and_never_becomes_a_claim() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-model-probe-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-model-probe", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("learning.db");
         let knowledge = directory.join("knowledge.json");
@@ -849,21 +862,15 @@ mod tests {
                 "Byzantine Empire",
                 "https://en.wikipedia.org/wiki/Byzantine_Empire",
                 "The Byzantine Empire used themes as military-administrative districts.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Byzantine Empire".into(),
-                    relation: "used".into(),
-                    object: "themes as military-administrative districts".into(),
-                    evidence_text:
-                        "The Byzantine Empire used themes as military-administrative districts."
-                            .into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(crate::test_support::scholar_finding(
+                    "Byzantine Empire",
+                    "used",
+                    "themes as military-administrative districts",
+                    "The Byzantine Empire used themes as military-administrative districts.",
+                    0.99,
+                    "reference",
+                    None,
+                )),
                 None,
             )
             .unwrap();
@@ -907,14 +914,7 @@ mod tests {
 
     #[test]
     fn summary_gap_asks_a_focused_question_and_scholar_can_add_a_new_relation() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-scout-expansion-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-scout-expansion", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("learning.db");
         let knowledge = directory.join("knowledge.json");
@@ -962,19 +962,15 @@ mod tests {
                 "Chicken soup",
                 "https://en.wikipedia.org/wiki/Chicken_soup",
                 "Chicken soup includes noodles.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Chicken soup".into(),
-                    relation: "includes".into(),
-                    object: "noodles".into(),
-                    evidence_text: "Chicken soup includes noodles.".into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(crate::test_support::scholar_finding(
+                    "Chicken soup",
+                    "includes",
+                    "noodles",
+                    "Chicken soup includes noodles.",
+                    0.99,
+                    "reference",
+                    None,
+                )),
                 None,
             )
             .unwrap();

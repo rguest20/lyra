@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::agent::Message;
+use crate::errors::invalid_data as invalid;
 use crate::inference::LocalModel;
 use crate::knowledge::KnowledgeMap;
 use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore, ScholarProvenanceReview};
@@ -209,24 +210,20 @@ fn assess_retained_pair_with(
         Message {role:"user".into(),content:serde_json::to_string(pair).map_err(io::Error::other)?},
     ];
     let raw = ask(&messages)?;
-    let start = raw
-        .find('{')
-        .ok_or_else(|| invalid("claim-pair review omitted JSON"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| invalid("claim-pair review returned incomplete JSON"))?;
-    let review: RetainedEvidenceReview = serde_json::from_str(&raw[start..=end])
-        .map_err(|_| invalid("invalid claim-pair review JSON"))?;
+    let review: RetainedEvidenceReview = crate::research::deserialize_json_object(
+        &raw,
+        "claim-pair review omitted JSON",
+        "claim-pair review returned incomplete JSON",
+        |_| invalid("invalid claim-pair review JSON"),
+    )?;
     if !matches!(
         review.relation.as_str(),
         "supports" | "contradicts" | "qualifies" | "unrelated" | "insufficient"
-    ) || review.rationale.trim().is_empty()
+    ) || !crate::storage::valid_printable_field(&review.rationale, 500)
         || !matches!(
             review.semantic_relation.as_str(),
             "same_subject" | "related_facts" | "none"
         )
-        || review.rationale.chars().count() > 500
-        || review.rationale.chars().any(char::is_control)
     {
         return Err(invalid("invalid claim-pair review fields"));
     }
@@ -337,21 +334,18 @@ fn review_candidate_inbox(store: &mut LearningStore, model: &mut LocalModel) -> 
             },
         ];
         let raw = review_completion(model, &messages)?;
-        let start = raw
-            .find('{')
-            .ok_or_else(|| invalid("candidate AI reviewer did not return JSON"))?;
-        let end = raw
-            .rfind('}')
-            .ok_or_else(|| invalid("candidate AI reviewer returned incomplete JSON"))?;
-        let review: CandidateReview = serde_json::from_str(&raw[start..=end]).map_err(|error| {
-            invalid(&format!(
-                "candidate AI reviewer returned invalid JSON: {error}"
-            ))
-        })?;
+        let review: crate::research::DecisionRationale = crate::research::deserialize_json_object(
+            &raw,
+            "candidate AI reviewer did not return JSON",
+            "candidate AI reviewer returned incomplete JSON",
+            |error| {
+                invalid(&format!(
+                    "candidate AI reviewer returned invalid JSON: {error}"
+                ))
+            },
+        )?;
         if !matches!(review.decision.as_str(), "accept" | "reject")
-            || review.rationale.trim().is_empty()
-            || review.rationale.chars().count() > 500
-            || review.rationale.chars().any(char::is_control)
+            || !crate::storage::valid_printable_field(&review.rationale, 500)
         {
             return Err(invalid(
                 "candidate AI reviewer returned invalid decision fields",
@@ -399,12 +393,6 @@ fn review_candidate_inbox(store: &mut LearningStore, model: &mut LocalModel) -> 
     Ok(false)
 }
 
-#[derive(Deserialize)]
-struct CandidateReview {
-    decision: String,
-    rationale: String,
-}
-
 #[derive(Deserialize, serde::Serialize)]
 struct ScholarAssessment {
     suitable_for_topic: bool,
@@ -426,41 +414,35 @@ fn parse_scholar_assessment(
     raw: &str,
     context: &serde_json::Value,
 ) -> io::Result<ScholarAssessment> {
-    let start = raw
-        .find('{')
-        .ok_or_else(|| invalid("Scholar AI reviewer did not return JSON"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| invalid("Scholar AI reviewer returned incomplete JSON"))?;
-    let assessment: ScholarAssessment =
-        serde_json::from_str(&raw[start..=end]).map_err(|error| {
+    let assessment: ScholarAssessment = crate::research::deserialize_json_object(
+        raw,
+        "Scholar AI reviewer did not return JSON",
+        "Scholar AI reviewer returned incomplete JSON",
+        |error| {
             invalid(&format!(
                 "Scholar AI reviewer returned invalid JSON: {error}"
             ))
-        })?;
+        },
+    )?;
     if !matches!(assessment.source_kind.as_str(), "primary" | "secondary") {
         return Err(invalid("source_kind must be primary or secondary"));
     }
     if !matches!(assessment.claim_decision.as_str(), "accept" | "reject") {
         return Err(invalid("claim_decision must be accept or reject"));
     }
-    if assessment.rationale.trim().is_empty()
-        || assessment.rationale.chars().count() > 500
-        || assessment.rationale.chars().any(char::is_control)
-    {
+    if !crate::storage::valid_printable_field(&assessment.rationale, 500) {
         return Err(invalid("rationale must contain 1–500 printable characters"));
     }
-    if let Some(date) = assessment.published_at.as_deref() {
-        if !crate::storage::valid_claim_period(Some(date), None)
-            || !context["source_excerpt"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(date)
-        {
-            return Err(invalid(
-                "published_at must be a valid ISO date stated in source_excerpt, or null",
-            ));
-        }
+    if let Some(date) = assessment.published_at.as_deref()
+        && !crate::storage::claim_period_is_stated(
+            Some(date),
+            None,
+            context["source_excerpt"].as_str().unwrap_or_default(),
+        )
+    {
+        return Err(invalid(
+            "published_at must be a valid ISO date stated in source_excerpt, or null",
+        ));
     }
     if assessment
         .next_action
@@ -471,11 +453,11 @@ fn parse_scholar_assessment(
             "next_action must be none, repair, new_source, or stop",
         ));
     }
-    if assessment.guidance.as_deref().is_some_and(|guidance| {
-        guidance.trim().is_empty()
-            || guidance.chars().count() > 500
-            || guidance.chars().any(char::is_control)
-    }) {
+    if assessment
+        .guidance
+        .as_deref()
+        .is_some_and(|guidance| !crate::storage::valid_printable_field(guidance, 500))
+    {
         return Err(invalid("guidance must contain 1–500 printable characters"));
     }
     if assessment.source_verdict.as_deref().is_some_and(|verdict| {
@@ -488,18 +470,16 @@ fn parse_scholar_assessment(
             "source_verdict must be suitable, irrelevant, unreliable, or unknown",
         ));
     }
-    if let Some(evidence) = assessment.useful_evidence.as_deref() {
-        if evidence.trim().is_empty()
-            || evidence.chars().count() > 1500
-            || !context["source_excerpt"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(evidence)
-        {
-            return Err(invalid(
-                "useful_evidence must be an exact span of 1–1500 characters from source_excerpt, or null",
-            ));
-        }
+    if let Some(evidence) = assessment.useful_evidence.as_deref()
+        && !crate::storage::valid_exact_quote(
+            evidence,
+            context["source_excerpt"].as_str().unwrap_or_default(),
+            1500,
+        )
+    {
+        return Err(invalid(
+            "useful_evidence must be an exact span of 1–1500 characters from source_excerpt, or null",
+        ));
     }
     Ok(assessment)
 }
@@ -595,7 +575,7 @@ fn assess_scholar_source_with(
                         "job_id": context["job_id"],
                         "attempt": attempt,
                         "reason": error.to_string(),
-                        "model_output_excerpt": raw.chars().take(1500).collect::<String>(),
+                        "model_output_excerpt": crate::diagnostics::text_excerpt(&raw, 1500),
                     }),
                 );
                 if attempt == 2 {
@@ -610,7 +590,7 @@ fn assess_scholar_source_with(
                         role: "user".into(),
                         content: format!(
                             "Review context: {context}\nYour previous response was invalid: {error}\nPrevious response: {}\nReturn one corrected JSON assessment. Keep rationale to one short sentence. Use null for dates absent from the source. Do not change the judgment just to satisfy the format.",
-                            raw.chars().take(1500).collect::<String>()
+                            crate::diagnostics::text_excerpt(&raw, 1500)
                         ),
                     },
                 ];
@@ -622,7 +602,9 @@ fn assess_scholar_source_with(
 
 fn review_scholar_findings(store: &mut LearningStore, model: &mut LocalModel) -> io::Result<bool> {
     let mut failed_reviews = 0;
-    for (finding_id, job_id) in store.scholar_ai_review_queue()? {
+    for task in store.scholar_ai_review_queue()? {
+        let finding_id = task.finding_id;
+        let job_id = task.job_id;
         let Some(mut context) = store.scholar_review_context(finding_id)? else {
             if store.scholar_corroboration_exhausted(finding_id)? {
                 let reason = "AI-reviewed finding was rejected after independent corroboration attempts were exhausted";
@@ -872,26 +854,23 @@ fn assess_provenance(
     model: &mut LocalModel,
     review: &ScholarProvenanceReview,
 ) -> io::Result<(String, String)> {
-    let metadata = |value: &Option<String>| {
-        value
-            .as_deref()
-            .unwrap_or("No declared provenance metadata was found.")
-            .chars()
-            .take(2_500)
-            .collect::<String>()
-    };
-    let excerpt = |value: &str| value.chars().take(1_400).collect::<String>();
     let evidence = serde_json::json!({
         "signal": review.signal,
         "source_a": {
             "url": review.source_url,
-            "declared_metadata": metadata(&review.source_metadata_json),
-            "passage": excerpt(&review.source_excerpt),
+            "declared_metadata": crate::diagnostics::text_excerpt(
+                review.source_metadata_json.as_deref().unwrap_or("No declared provenance metadata was found."),
+                2_500,
+            ),
+            "passage": crate::diagnostics::text_excerpt(&review.source_excerpt, 1_400),
         },
         "source_b": {
             "url": review.related_source_url,
-            "declared_metadata": metadata(&review.related_metadata_json),
-            "passage": excerpt(&review.related_source_excerpt),
+            "declared_metadata": crate::diagnostics::text_excerpt(
+                review.related_metadata_json.as_deref().unwrap_or("No declared provenance metadata was found."),
+                2_500,
+            ),
+            "passage": crate::diagnostics::text_excerpt(&review.related_source_excerpt, 1_400),
         },
     });
     let messages = [
@@ -910,20 +889,16 @@ fn assess_provenance(
 }
 
 fn parse_provenance_assessment(text: &str) -> io::Result<ProvenanceAssessment> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| invalid("curmudgeon provenance review did not return JSON"))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| invalid("curmudgeon provenance review returned incomplete JSON"))?;
-    let parsed: ProvenanceAssessment = serde_json::from_str(&text[start..=end])
-        .map_err(|error| invalid(&format!("invalid provenance review JSON: {error}")))?;
+    let parsed: ProvenanceAssessment = crate::research::deserialize_json_object(
+        text,
+        "curmudgeon provenance review did not return JSON",
+        "curmudgeon provenance review returned incomplete JSON",
+        |error| invalid(&format!("invalid provenance review JSON: {error}")),
+    )?;
     if !matches!(
         parsed.verdict.as_str(),
         "likely_shared_origin" | "unclear" | "possibly_distinct_reporting"
-    ) || parsed.rationale.trim().is_empty()
-        || parsed.rationale.chars().count() > 800
-        || parsed.rationale.chars().any(char::is_control)
+    ) || !crate::storage::valid_printable_field(&parsed.rationale, 800)
     {
         return Err(invalid("curmudgeon provenance review fields are invalid"));
     }
@@ -958,7 +933,9 @@ fn extract_claims(model: &mut LocalModel, reply: &str) -> io::Result<Vec<Assista
                         &claim.object,
                         &claim.evidence_text,
                     ];
-                    (fields.iter().all(|field| safe_field(field))
+                    (fields
+                        .iter()
+                        .all(|field| crate::storage::valid_bounded_field(field, 500))
                         && reply.contains(&claim.evidence_text)
                         && claim.confidence.is_finite()
                         && (0.0..=1.0).contains(&claim.confidence))
@@ -1006,17 +983,16 @@ fn extract_claims(model: &mut LocalModel, reply: &str) -> io::Result<Vec<Assista
 }
 
 fn parse_extraction(text: &str) -> io::Result<Extraction> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| invalid("curmudgeon extractor did not return JSON"))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| invalid("curmudgeon extractor returned incomplete JSON"))?;
-    serde_json::from_str(&text[start..=end]).map_err(|error| {
-        invalid(&format!(
-            "curmudgeon extractor returned invalid JSON: {error}"
-        ))
-    })
+    crate::research::deserialize_json_object(
+        text,
+        "curmudgeon extractor did not return JSON",
+        "curmudgeon extractor returned incomplete JSON",
+        |error| {
+            invalid(&format!(
+                "curmudgeon extractor returned invalid JSON: {error}"
+            ))
+        },
+    )
 }
 
 fn fallback_measurement_claims(reply: &str) -> Vec<AssistantClaim> {
@@ -1156,17 +1132,6 @@ fn canonical_relation(value: &str) -> String {
     } else {
         value
     }
-}
-
-fn safe_field(value: &str) -> bool {
-    !value.trim().is_empty()
-        && value.chars().count() <= 500
-        && !value.chars().any(char::is_control)
-        && !value.contains("<|")
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]

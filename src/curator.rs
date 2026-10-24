@@ -3,34 +3,18 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::agent::Message;
+use crate::errors::{invalid_data as invalid, invalid_json};
 use crate::inference::LocalModel;
-use crate::inference::assignments::ModelRuntime;
-use crate::maintenance;
-use crate::storage::{CandidateClaim, LearningStore, Observation, valid_claim_period};
+use crate::storage::{CandidateClaim, LearningStore, Observation, claim_period_is_stated};
 
 const LEASE_SECONDS: u64 = 600;
 const MAX_BATCH: usize = 4;
 const MAX_CANDIDATES: usize = 16;
-const MAX_WEB_FOLLOW_UP_PASSES: usize = 3;
-
-enum Command {
-    Wake,
-    Stop,
-}
-
-pub struct CuratorHandle {
-    sender: mpsc::SyncSender<Command>,
-    thread: Option<JoinHandle<()>>,
-    shutdown_runtime: ModelRuntime,
-}
-
 /// Process a bounded batch of staged observations.
 pub fn process_once_limited(
     database_path: &str,
@@ -96,18 +80,6 @@ pub fn process_once_limited(
     Ok(processed)
 }
 
-#[derive(Deserialize)]
-struct CandidateReview {
-    decision: String,
-    rationale: String,
-}
-
-#[derive(Deserialize)]
-struct ObservationReview {
-    decision: String,
-    rationale: String,
-}
-
 fn ai_review_flagged_claims(
     model: &mut LocalModel,
     observation: &Observation,
@@ -141,19 +113,15 @@ fn ai_review_flagged_claims(
             },
         ];
         let raw = model.chat_for_extraction(&messages)?;
-        let start = raw
-            .find('{')
-            .ok_or_else(|| invalid("AI reviewer did not return JSON"))?;
-        let end = raw
-            .rfind('}')
-            .ok_or_else(|| invalid("AI reviewer returned incomplete JSON"))?;
-        let review: CandidateReview = serde_json::from_str(&raw[start..=end])
-            .map_err(|error| invalid(&format!("AI reviewer returned invalid JSON: {error}")))?;
+        let review: crate::research::DecisionRationale = crate::research::deserialize_json_object(
+            &raw,
+            "AI reviewer did not return JSON",
+            "AI reviewer returned incomplete JSON",
+            |error| invalid(&format!("AI reviewer returned invalid JSON: {error}")),
+        )?;
         let rationale = review.rationale.trim();
         if !matches!(review.decision.as_str(), "accept" | "reject")
-            || rationale.is_empty()
-            || rationale.chars().count() > 500
-            || rationale.chars().any(char::is_control)
+            || !crate::storage::valid_printable_field(rationale, 500)
         {
             return Err(invalid("AI reviewer returned invalid decision fields"));
         }
@@ -199,22 +167,18 @@ fn ai_review_flagged_claims(
             },
         ];
         let raw = model.chat_for_extraction(&messages)?;
-        let start = raw
-            .find('{')
-            .ok_or_else(|| invalid("observation AI reviewer did not return JSON"))?;
-        let end = raw
-            .rfind('}')
-            .ok_or_else(|| invalid("observation AI reviewer returned incomplete JSON"))?;
-        let review: ObservationReview =
-            serde_json::from_str(&raw[start..=end]).map_err(|error| {
+        let review: crate::research::DecisionRationale = crate::research::deserialize_json_object(
+            &raw,
+            "observation AI reviewer did not return JSON",
+            "observation AI reviewer returned incomplete JSON",
+            |error| {
                 invalid(&format!(
                     "observation AI reviewer returned invalid JSON: {error}"
                 ))
-            })?;
+            },
+        )?;
         if !matches!(review.decision.as_str(), "retry" | "discard")
-            || review.rationale.trim().is_empty()
-            || review.rationale.chars().count() > 500
-            || review.rationale.chars().any(char::is_control)
+            || !crate::storage::valid_printable_field(&review.rationale, 500)
         {
             return Err(invalid(
                 "observation AI reviewer returned invalid decision fields",
@@ -252,17 +216,11 @@ pub(crate) fn candidate_review_gate(
     if misattributes_possessive_name(&candidate.subject, &candidate.relation, observation_text) {
         return Err("possessive named entity was incorrectly attributed to the user");
     }
-    if !valid_claim_period(
+    if !claim_period_is_stated(
         candidate.valid_from.as_deref(),
         candidate.valid_until.as_deref(),
-    ) || [
-        candidate.valid_from.as_deref(),
-        candidate.valid_until.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|date| !observation_text.contains(date))
-    {
+        observation_text,
+    ) {
         return Err("candidate dates are invalid or absent from the user observation");
     }
     Ok(())
@@ -340,143 +298,6 @@ fn is_explicit_assertion(observation: &str) -> bool {
     ]
     .iter()
     .any(|prefix| text.starts_with(prefix))
-}
-
-impl CuratorHandle {
-    pub fn spawn(database_path: String, knowledge_path: String, models: ModelRuntime) -> Self {
-        Self::spawn_with_mode(database_path, knowledge_path, models, "chat", false)
-    }
-
-    pub fn spawn_for_web(
-        database_path: String,
-        knowledge_path: String,
-        models: ModelRuntime,
-    ) -> Self {
-        Self::spawn_with_mode(database_path, knowledge_path, models, "serve", true)
-    }
-
-    fn spawn_with_mode(
-        database_path: String,
-        knowledge_path: String,
-        models: ModelRuntime,
-        mode: &'static str,
-        drain_productive_passes: bool,
-    ) -> Self {
-        let (sender, receiver) = wake_queue();
-        let shutdown_runtime = models.clone();
-        let thread = thread::Builder::new()
-            .name("semantic-curator".into())
-            .spawn(move || {
-                run(
-                    database_path,
-                    knowledge_path,
-                    models,
-                    mode,
-                    drain_productive_passes,
-                    receiver,
-                )
-            });
-        let thread = match thread {
-            Ok(thread) => Some(thread),
-            Err(error) => {
-                eprintln!("could not start semantic curator: {error}");
-                None
-            }
-        };
-        Self {
-            sender,
-            thread,
-            shutdown_runtime,
-        }
-    }
-
-    pub fn wake(&self) {
-        send_wake(&self.sender);
-    }
-
-    pub fn stop(mut self) {
-        self.shutdown_runtime.stop_background_waits();
-        let _ = self.sender.send(Command::Stop);
-        self.join();
-    }
-
-    fn join(&mut self) {
-        if let Some(thread) = self.thread.take()
-            && thread.join().is_err()
-        {
-            eprintln!("semantic curator stopped unexpectedly");
-        }
-    }
-}
-
-impl Drop for CuratorHandle {
-    fn drop(&mut self) {
-        self.shutdown_runtime.stop_background_waits();
-        let _ = self.sender.send(Command::Stop);
-        self.join();
-    }
-}
-
-fn run(
-    database_path: String,
-    knowledge_path: String,
-    models: ModelRuntime,
-    mode: &'static str,
-    drain_productive_passes: bool,
-    receiver: mpsc::Receiver<Command>,
-) {
-    let mut productive_follow_ups = 0;
-    loop {
-        if drain_commands(&receiver) {
-            break;
-        }
-        let did_work = match maintenance::run_pass(
-            Path::new(&database_path),
-            Path::new(&knowledge_path),
-            &models,
-            mode,
-        ) {
-            Ok(summary) => summary.did_work(),
-            Err(error) => {
-                eprintln!("semantic maintenance pass failed: {error}");
-                false
-            }
-        };
-        if drain_productive_passes && did_work && productive_follow_ups < MAX_WEB_FOLLOW_UP_PASSES {
-            productive_follow_ups += 1;
-            continue;
-        }
-        productive_follow_ups = 0;
-
-        if !wait_for_next_pass(&receiver, maintenance::interval()) {
-            break;
-        }
-    }
-}
-
-fn wait_for_next_pass(receiver: &mpsc::Receiver<Command>, interval: std::time::Duration) -> bool {
-    matches!(
-        receiver.recv_timeout(interval),
-        Ok(Command::Wake) | Err(mpsc::RecvTimeoutError::Timeout)
-    )
-}
-
-fn wake_queue() -> (mpsc::SyncSender<Command>, mpsc::Receiver<Command>) {
-    mpsc::sync_channel(1)
-}
-
-fn send_wake(sender: &mpsc::SyncSender<Command>) {
-    let _ = sender.try_send(Command::Wake);
-}
-
-fn drain_commands(receiver: &mpsc::Receiver<Command>) -> bool {
-    loop {
-        match receiver.try_recv() {
-            Ok(Command::Wake) => {}
-            Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return true,
-            Err(mpsc::TryRecvError::Empty) => return false,
-        }
-    }
 }
 
 fn extract_observation(
@@ -581,14 +402,12 @@ struct ExtractedClaim {
 }
 
 fn parse_response(reply: &str) -> io::Result<ExtractionResponse> {
-    let start = reply
-        .find('{')
-        .ok_or_else(|| invalid("extractor did not return JSON"))?;
-    let end = reply
-        .rfind('}')
-        .ok_or_else(|| invalid("extractor returned incomplete JSON"))?;
-    serde_json::from_str(&reply[start..=end])
-        .map_err(|error| invalid(&format!("extractor returned invalid JSON: {error}")))
+    crate::research::deserialize_json_object(
+        reply,
+        "extractor did not return JSON",
+        "extractor returned incomplete JSON",
+        |error| invalid(&format!("extractor returned invalid JSON: {error}")),
+    )
 }
 
 fn validate_candidate(
@@ -596,21 +415,20 @@ fn validate_candidate(
     observation: &Observation,
     available_ids: &[String],
 ) -> io::Result<CandidateClaim> {
-    for field in [&candidate.subject, &candidate.relation, &candidate.object] {
-        check_field(field)?;
+    if !crate::storage::valid_proposition_fields(
+        &candidate.subject,
+        &candidate.relation,
+        &candidate.object,
+    ) {
+        return Err(invalid("candidate fields must be 1 to 500 safe characters"));
     }
     let invalid_evidence = candidate.evidence_text.is_empty()
         || !observation.raw_text.contains(&candidate.evidence_text);
-    let invalid_period = !valid_claim_period(
+    let invalid_period = !claim_period_is_stated(
         candidate.valid_from.as_deref(),
         candidate.valid_until.as_deref(),
-    ) || [
-        candidate.valid_from.as_deref(),
-        candidate.valid_until.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|date| !observation.raw_text.contains(date));
+        &observation.raw_text,
+    );
     let (valid_from, valid_until) = if invalid_period {
         crate::diagnostics::event(
             "curator.invalid_temporal_bounds_dropped",
@@ -812,65 +630,72 @@ fn is_confirmation_response(text: &str) -> bool {
     .any(|confirmation| normalized == *confirmation)
 }
 
-fn check_field(field: &str) -> io::Result<()> {
-    if field.trim().is_empty()
-        || field.chars().count() > 500
-        || field.chars().any(char::is_control)
-        || field.contains("<|")
-    {
-        return Err(invalid("candidate fields must be 1 to 500 safe characters"));
-    }
-    Ok(())
-}
-
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn invalid_json(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, ExtractedClaim, candidate_review_gate, contains_reference_pronoun,
-        is_confirmation_response, load_context, parse_response, send_wake, validate_candidate,
-        wait_for_next_pass, wake_queue,
+        ExtractedClaim, candidate_review_gate, contains_reference_pronoun,
+        is_confirmation_response, load_context, parse_response, validate_candidate,
     };
-    use crate::storage::Observation;
-
-    #[test]
-    fn terminal_maintenance_wakes_on_an_idle_interval() {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        assert!(wait_for_next_pass(
-            &receiver,
-            std::time::Duration::from_millis(1)
-        ));
-        sender.send(Command::Stop).unwrap();
-        assert!(!wait_for_next_pass(
-            &receiver,
-            std::time::Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn duplicate_wake_requests_coalesce_in_a_bounded_queue() {
-        let (sender, receiver) = wake_queue();
-        send_wake(&sender);
-        send_wake(&sender);
-        assert!(matches!(receiver.try_recv(), Ok(Command::Wake)));
-        assert!(receiver.try_recv().is_err());
-    }
+    use crate::storage::{CandidateClaim, Observation};
 
     fn observation() -> Observation {
+        observation_with("observation-a", "conversation-a", 2, "I gave it to you.")
+    }
+
+    fn observation_with(
+        id: &str,
+        conversation_id: &str,
+        turn_number: usize,
+        raw_text: &str,
+    ) -> Observation {
         Observation {
-            id: "observation-a".into(),
-            conversation_id: "conversation-a".into(),
-            turn_number: 2,
-            raw_text: "I gave it to you.".into(),
+            id: id.into(),
+            conversation_id: conversation_id.into(),
+            turn_number,
+            raw_text: raw_text.into(),
             status: "processing".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn candidate(
+        subject: &str,
+        relation: &str,
+        object: &str,
+        evidence: &str,
+        status: &str,
+    ) -> CandidateClaim {
+        CandidateClaim {
+            subject: subject.into(),
+            relation: relation.into(),
+            object: object.into(),
+            evidence_text: evidence.into(),
+            context_message_ids: Vec::new(),
+            resolution: None,
+            confidence: 0.99,
+            status: status.into(),
+            decision_reason: None,
+            valid_from: None,
+            valid_until: None,
+        }
+    }
+
+    fn extracted_claim(
+        subject: &str,
+        relation: &str,
+        object: &str,
+        evidence: &str,
+    ) -> ExtractedClaim {
+        ExtractedClaim {
+            subject: subject.into(),
+            relation: relation.into(),
+            object: object.into(),
+            evidence_text: evidence.into(),
+            context_message_ids: Vec::new(),
+            resolution: None,
+            confidence: 0.99,
+            valid_from: None,
+            valid_until: None,
         }
     }
 
@@ -893,62 +718,34 @@ mod tests {
     #[test]
     fn unsupported_evidence_is_held_and_unresolved_pronouns_are_reviewed() {
         assert!(contains_reference_pronoun("I gave it to you."));
-        let bad_evidence = ExtractedClaim {
-            subject: "Lyra".into(),
-            relation: "name was given by".into(),
-            object: "the user".into(),
-            evidence_text: "I named Lyra".into(),
-            context_message_ids: Vec::new(),
-            resolution: None,
-            confidence: 0.99,
-            valid_from: None,
-            valid_until: None,
-        };
+        let bad_evidence = extracted_claim("Lyra", "name was given by", "the user", "I named Lyra");
         let claim = validate_candidate(bad_evidence, &observation(), &[]).unwrap();
         assert_eq!(claim.status, "needs_review");
         assert_eq!(claim.evidence_text, observation().raw_text);
 
-        let unresolved = ExtractedClaim {
-            subject: "Lyra".into(),
-            relation: "name was given by".into(),
-            object: "the user".into(),
-            evidence_text: "I gave it to you.".into(),
-            context_message_ids: Vec::new(),
-            resolution: None,
-            confidence: 0.99,
-            valid_from: None,
-            valid_until: None,
-        };
+        let unresolved =
+            extracted_claim("Lyra", "name was given by", "the user", "I gave it to you.");
         let claim = validate_candidate(unresolved, &observation(), &[]).unwrap();
         assert_eq!(claim.status, "needs_review");
     }
 
     #[test]
     fn invented_validity_dates_are_cleared_without_discarding_an_exact_user_fact() {
-        let observation = Observation {
-            id: "named-object".into(),
-            conversation_id: "conversation-a".into(),
-            turn_number: 1,
-            raw_text: "My telescope is named Marigold.".into(),
-            status: "processing".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
-        let claim = validate_candidate(
-            ExtractedClaim {
-                subject: "the user's telescope".into(),
-                relation: "is named".into(),
-                object: "Marigold".into(),
-                evidence_text: observation.raw_text.clone(),
-                context_message_ids: Vec::new(),
-                resolution: None,
-                confidence: 0.99,
-                valid_from: Some("2024-01-01".into()),
-                valid_until: Some("2024-12-31".into()),
-            },
-            &observation,
-            &[],
-        )
-        .unwrap();
+        let observation = observation_with(
+            "named-object",
+            "conversation-a",
+            1,
+            "My telescope is named Marigold.",
+        );
+        let mut extracted = extracted_claim(
+            "the user's telescope",
+            "is named",
+            "Marigold",
+            &observation.raw_text,
+        );
+        extracted.valid_from = Some("2024-01-01".into());
+        extracted.valid_until = Some("2024-12-31".into());
+        let claim = validate_candidate(extracted, &observation, &[]).unwrap();
         assert_eq!(claim.status, "proposed");
         assert!(claim.valid_from.is_none());
         assert!(claim.valid_until.is_none());
@@ -961,63 +758,28 @@ mod tests {
             ("My telescope is named Marigold.", "Marigold"),
             ("My bicycle is called Clover.", "Clover"),
         ] {
-            let source = Observation {
-                id: "possessive-name".into(),
-                conversation_id: "conversation-a".into(),
-                turn_number: 1,
-                raw_text: observation.into(),
-                status: "processing".into(),
-                created_at: "2026-01-01T00:00:00Z".into(),
-            };
+            let source = observation_with("possessive-name", "conversation-a", 1, observation);
             let staged = validate_candidate(
-                ExtractedClaim {
-                    subject: "the user".into(),
-                    relation: "is named".into(),
-                    object: object.into(),
-                    evidence_text: observation.into(),
-                    context_message_ids: Vec::new(),
-                    resolution: None,
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                },
+                extracted_claim("the user", "is named", object, observation),
                 &source,
                 &[],
             )
             .unwrap();
             assert_eq!(staged.status, "needs_review");
-            let candidate = crate::storage::CandidateClaim {
-                subject: "the user".into(),
-                relation: "is named".into(),
-                object: object.into(),
-                evidence_text: observation.into(),
-                context_message_ids: Vec::new(),
-                resolution: None,
-                confidence: 0.99,
-                status: "proposed".into(),
-                decision_reason: None,
-                valid_from: None,
-                valid_until: None,
-            };
+            let candidate = candidate("the user", "is named", object, observation, "proposed");
             assert_eq!(
                 candidate_review_gate(&candidate, observation),
                 Err("possessive named entity was incorrectly attributed to the user")
             );
         }
 
-        let actual_user_name = crate::storage::CandidateClaim {
-            subject: "the user".into(),
-            relation: "is named".into(),
-            object: "Ryan".into(),
-            evidence_text: "My name is Ryan.".into(),
-            context_message_ids: Vec::new(),
-            resolution: None,
-            confidence: 0.99,
-            status: "proposed".into(),
-            decision_reason: None,
-            valid_from: None,
-            valid_until: None,
-        };
+        let actual_user_name = candidate(
+            "the user",
+            "is named",
+            "Ryan",
+            "My name is Ryan.",
+            "proposed",
+        );
         assert_eq!(
             candidate_review_gate(&actual_user_name, "My name is Ryan."),
             Ok(())
@@ -1026,19 +788,13 @@ mod tests {
 
     #[test]
     fn candidate_review_gate_rejects_logged_questions_and_requests() {
-        let claim = crate::storage::CandidateClaim {
-            subject: "the user".into(),
-            relation: "wants to learn".into(),
-            object: "poker".into(),
-            evidence_text: "Can you teach me poker?".into(),
-            context_message_ids: Vec::new(),
-            resolution: None,
-            confidence: 0.99,
-            status: "needs_review".into(),
-            decision_reason: None,
-            valid_from: None,
-            valid_until: None,
-        };
+        let claim = candidate(
+            "the user",
+            "wants to learn",
+            "poker",
+            "Can you teach me poker?",
+            "needs_review",
+        );
         for input in [
             "Can you teach me poker?",
             "What's the best hand?",
@@ -1057,11 +813,7 @@ mod tests {
 
     #[test]
     fn confirmations_need_an_assistant_question_and_resolution() {
-        let yes = Observation {
-            raw_text: "Yes, that's right.".into(),
-            turn_number: 3,
-            ..observation()
-        };
+        let yes = observation_with("observation-a", "conversation-a", 3, "Yes, that's right.");
         assert!(is_confirmation_response(&yes.raw_text));
         let claim = |context_message_ids: Vec<String>, resolution: Option<&str>| ExtractedClaim {
             subject: "the user".into(),
@@ -1095,14 +847,7 @@ mod tests {
 
     #[test]
     fn affirmative_confirmation_receives_the_previous_assistant_question_as_context() {
-        let path = std::env::temp_dir().join(format!(
-            "community-curator-context-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-curator-context", "json");
         let state = serde_json::json!({
             "history": [
                 {"role":"user", "content":"I live in Shifnal."},
@@ -1112,14 +857,7 @@ mod tests {
             ]
         });
         std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
-        let confirmation = Observation {
-            id: "confirmation".into(),
-            conversation_id: path.to_string_lossy().into_owned(),
-            turn_number: 3,
-            raw_text: "Yes".into(),
-            status: "processing".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        };
+        let confirmation = observation_with("confirmation", &path.to_string_lossy(), 3, "Yes");
         let (context, ids) = load_context(&confirmation).unwrap();
         assert_eq!(ids, ["turn:2:user", "turn:2:assistant"]);
         assert!(context.last().unwrap().content.contains("live in Shifnal"));
@@ -1128,14 +866,7 @@ mod tests {
 
     #[test]
     fn old_conversation_does_not_read_a_new_conversation_history() {
-        let path = std::env::temp_dir().join(format!(
-            "community-curator-reset-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-curator-reset", "json");
         let original_id = path.to_string_lossy().into_owned();
         let state = serde_json::json!({
             "conversation_id": format!("{original_id}::conversation:new"),

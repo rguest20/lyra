@@ -286,10 +286,10 @@ fn set_first(target: &mut Option<String>, value: &str) {
 }
 
 fn add_url(cited: &mut BTreeSet<String>, value: &str, page_url: &Url) {
-    if cited.len() < 8 {
-        if let Some(url) = normalized_url(value, page_url) {
-            cited.insert(url);
-        }
+    if cited.len() < 8
+        && let Some(url) = normalized_url(value, page_url)
+    {
+        cited.insert(url);
     }
 }
 

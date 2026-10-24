@@ -99,7 +99,7 @@ fn extract_baskets_with(
                     "research.basket_parse_failed",
                     serde_json::json!({
                         "source_id":source.id,"attempt":attempt+1,"output_budget":budget,"reason":error.to_string(),
-                        "output_characters":raw.chars().count(),"output_excerpt":raw.chars().take(2000).collect::<String>(),
+                        "output_characters":raw.chars().count(),"output_excerpt":crate::diagnostics::text_excerpt(&raw, 2000),
                         "output_tail":raw.chars().rev().take(600).collect::<String>().chars().rev().collect::<String>(),
                     }),
                 );
@@ -121,15 +121,12 @@ fn extract_baskets_with(
 }
 
 fn parse_baskets(raw: &str) -> io::Result<ResearchBaskets> {
-    let start = raw
-        .find('{')
-        .ok_or_else(|| invalid("basket extraction omitted JSON"))?;
-    let end = raw
-        .rfind('}')
-        .ok_or_else(|| invalid("basket extraction returned incomplete JSON"))?;
-    let baskets: ResearchBaskets = serde_json::from_str(&raw[start..=end])
-        .map_err(|error| invalid(&format!("invalid claims/questions basket JSON: {error}")))?;
-    Ok(baskets)
+    crate::research::deserialize_json_object(
+        raw,
+        "basket extraction omitted JSON",
+        "basket extraction returned incomplete JSON",
+        |error| invalid(&format!("invalid claims/questions basket JSON: {error}")),
+    )
 }
 
 #[cfg(test)]

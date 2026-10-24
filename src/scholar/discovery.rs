@@ -1,56 +1,10 @@
 use super::*;
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
-pub(super) trait SearchProvider {
-    fn discover(
-        &self,
-        store: &mut LearningStore,
-        job_id: &str,
-        query: &str,
-        trigger_reason: &str,
-    ) -> bool;
-}
-
-struct TavilyProvider;
-struct SerpApiProvider;
-struct SearxngProvider<'a>(&'a str);
-
-impl SearchProvider for TavilyProvider {
-    fn discover(&self, store: &mut LearningStore, job_id: &str, query: &str, reason: &str) -> bool {
-        run_tavily_discovery(store, job_id, query, reason)
-    }
-}
-
-impl SearchProvider for SerpApiProvider {
-    fn discover(&self, store: &mut LearningStore, job_id: &str, query: &str, reason: &str) -> bool {
-        run_serpapi_discovery(store, job_id, query, reason)
-    }
-}
-
-impl SearchProvider for SearxngProvider<'_> {
-    fn discover(&self, store: &mut LearningStore, job_id: &str, query: &str, reason: &str) -> bool {
-        run_searxng_discovery(store, job_id, query, reason, self.0)
-    }
-}
-
-pub(super) fn discover_tavily(
-    store: &mut LearningStore,
-    job_id: &str,
-    query: &str,
-    reason: &str,
-) -> bool {
-    TavilyProvider.discover(store, job_id, query, reason)
-}
-
-pub(super) fn discover_serpapi(
-    store: &mut LearningStore,
-    job_id: &str,
-    query: &str,
-    reason: &str,
-) -> bool {
-    SerpApiProvider.discover(store, job_id, query, reason)
-}
+pub(super) use crate::storage::ScholarSearchCandidateInput as SearchCandidate;
+pub(super) use run_serpapi_discovery as discover_serpapi;
+pub(super) use run_tavily_discovery as discover_tavily;
 
 pub(super) fn discover_searxng(
     store: &mut LearningStore,
@@ -59,7 +13,7 @@ pub(super) fn discover_searxng(
     reason: &str,
     endpoint: &str,
 ) -> bool {
-    SearxngProvider(endpoint).discover(store, job_id, query, reason)
+    run_searxng_discovery(store, job_id, query, reason, endpoint)
 }
 
 #[derive(Deserialize)]
@@ -78,12 +32,50 @@ struct SerpApiResult {
     snippet: Option<String>,
 }
 
-pub(super) struct SerpApiCandidate {
-    pub(super) result_type: String,
-    pub(super) title: String,
-    pub(super) url: String,
-    pub(super) snippet: String,
-    pub(super) structured_data_json: String,
+#[derive(Clone, Copy)]
+struct SearchAttempt<'a> {
+    job_id: &'a str,
+    provider: &'a str,
+    trigger_reason: &'a str,
+    query: &'a str,
+}
+
+impl SearchAttempt<'_> {
+    fn record(
+        self,
+        store: &mut LearningStore,
+        outcome: &str,
+        result_count: Option<usize>,
+        error: Option<&str>,
+    ) {
+        let _ = store.record_scholar_search_attempt_for_provider(
+            crate::storage::ScholarSearchAttemptInput {
+                job_id: self.job_id,
+                provider: self.provider,
+                trigger_reason: self.trigger_reason,
+                query: self.query,
+                status: outcome,
+                result_count,
+                error,
+            },
+        );
+    }
+
+    fn record_results(
+        self,
+        store: &mut LearningStore,
+        result_count: Option<usize>,
+        error: Option<&str>,
+    ) {
+        let outcome = if error.is_some() {
+            "error"
+        } else if result_count == Some(0) {
+            "no_result"
+        } else {
+            "results"
+        };
+        self.record(store, outcome, result_count, error);
+    }
 }
 
 pub(super) fn is_serpapi_metadata_field(name: &str) -> bool {
@@ -102,12 +94,12 @@ pub(super) fn is_serpapi_metadata_field(name: &str) -> bool {
 pub(super) fn linked_serpapi_results(
     result_type: &str,
     value: &serde_json::Value,
-) -> Vec<SerpApiCandidate> {
+) -> Vec<SearchCandidate> {
     fn visit(
         result_type: &str,
         value: &serde_json::Value,
         depth: usize,
-        output: &mut Vec<SerpApiCandidate>,
+        output: &mut Vec<SearchCandidate>,
     ) {
         if depth > 4 || output.len() >= 20 {
             return;
@@ -125,45 +117,39 @@ pub(super) fn linked_serpapi_results(
                 let link = ["link", "url", "website"]
                     .iter()
                     .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_str));
-                if let (Some(title), Some(link)) = (title, link) {
-                    let title = title.trim();
-                    if !title.is_empty() {
-                        if let Ok(url) = url::Url::parse(link) {
-                            if matches!(url.scheme(), "http" | "https") {
-                                if let Some(url) = clean_serpapi_result_url(url) {
-                                    let snippet = ["snippet", "description", "description_snippet"]
+                if let (Some(title), Some(link)) =
+                    (title.map(str::trim).filter(|title| !title.is_empty()), link)
+                    && let Ok(url) = url::Url::parse(link)
+                    && matches!(url.scheme(), "http" | "https")
+                    && let Some(url) = clean_serpapi_result_url(url)
+                {
+                    let snippet = ["snippet", "description", "description_snippet"]
+                        .iter()
+                        .find_map(|key| fields.get(*key).and_then(serde_json::Value::as_str))
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            fields
+                                .get("ingredients")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|items| {
+                                    items
                                         .iter()
-                                        .find_map(|key| {
-                                            fields.get(*key).and_then(serde_json::Value::as_str)
-                                        })
-                                        .map(str::to_owned)
-                                        .or_else(|| {
-                                            fields
-                                                .get("ingredients")
-                                                .and_then(serde_json::Value::as_array)
-                                                .map(|items| {
-                                                    items
-                                                        .iter()
-                                                        .take(30)
-                                                        .filter_map(serde_json::Value::as_str)
-                                                        .collect::<Vec<_>>()
-                                                        .join("; ")
-                                                })
-                                        })
-                                        .unwrap_or_default();
-                                    let structured = compact_serp_json(value);
-                                    output.push(SerpApiCandidate {
-                                        result_type: result_type.to_owned(),
-                                        title: title.chars().take(500).collect(),
-                                        url,
-                                        snippet: snippet.chars().take(2_000).collect(),
-                                        structured_data_json: structured,
-                                    });
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                                        .take(30)
+                                        .filter_map(serde_json::Value::as_str)
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                })
+                        })
+                        .unwrap_or_default();
+                    let structured = compact_serp_json(value);
+                    output.push(SearchCandidate {
+                        result_type: result_type.to_owned(),
+                        title: title.chars().take(500).collect(),
+                        url,
+                        snippet: snippet.chars().take(2_000).collect(),
+                        structured_data_json: structured,
+                    });
+                    return;
                 }
                 for child in fields.values() {
                     visit(result_type, child, depth + 1, output);
@@ -270,53 +256,40 @@ fn configured_interval_seconds(name: &str, default: i64) -> i64 {
 }
 
 fn spawn_search_curl() -> io::Result<Child> {
-    Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            "20",
-            "--max-filesize",
-            "1048576",
-            "--config",
-            "-",
-        ])
+    super::limited_curl(20, 1_048_576)
+        .args(["--config", "-"])
         .arg("--write-out")
-        .arg(format!(
-            "{HTTP_STATUS_MARKER}%{{http_code}}\t%header{{retry-after}}"
-        ))
+        .arg(super::http_response_write_out(HTTP_STATUS_MARKER))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
 }
 
-fn response_metadata(output: &[u8]) -> (Option<u16>, Option<i64>) {
-    let output = String::from_utf8_lossy(output);
-    let Some((_, metadata)) = output.rsplit_once(HTTP_STATUS_MARKER) else {
-        return (None, None);
-    };
-    let mut fields = metadata.trim_end_matches(['\r', '\n']).split('\t');
-    let status = fields.next().and_then(|value| value.parse().ok());
-    let _content_type = fields.next();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|time| i64::try_from(time.as_millis()).ok());
-    let retry_after = fields
-        .next()
-        .zip(now)
-        .and_then(|(header, now)| super::retry_after_delay_ms(header, now));
-    (status, retry_after)
+fn response_metadata(output: &[u8]) -> super::HttpResponseMetadata {
+    super::parse_http_response(output, HTTP_STATUS_MARKER)
+        .map_or_else(super::HttpResponseMetadata::default, |(_, metadata)| {
+            metadata
+        })
+}
+
+struct SearchHttpResponse {
+    body: String,
+    metadata: super::HttpResponseMetadata,
+}
+
+fn parse_search_http_response(output: &[u8]) -> SearchHttpResponse {
+    let (body, metadata) = super::parse_http_response(output, HTTP_STATUS_MARKER)
+        .unwrap_or((output, super::HttpResponseMetadata::default()));
+    SearchHttpResponse {
+        body: String::from_utf8_lossy(body).into_owned(),
+        metadata,
+    }
 }
 
 fn reserve_search_http_slot(
     store: &mut LearningStore,
-    job_id: &str,
-    provider: &str,
-    trigger_reason: &str,
-    query: &str,
+    attempt: SearchAttempt<'_>,
     host: &str,
     request_kind: &str,
 ) -> Option<crate::storage::HostRequestReservation> {
@@ -328,11 +301,8 @@ fn reserve_search_http_slot(
     ) {
         Ok(reservation) => Some(reservation),
         Err(error) => {
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                provider,
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("discovery request deferred: {error}")),
@@ -344,21 +314,10 @@ fn reserve_search_http_slot(
 
 fn record_provider_unavailable(
     store: &mut LearningStore,
-    job_id: &str,
-    provider: &str,
-    trigger_reason: &str,
-    query: &str,
+    attempt: SearchAttempt<'_>,
     reason: &str,
 ) -> bool {
-    let _ = store.record_scholar_search_attempt_for_provider(
-        job_id,
-        provider,
-        trigger_reason,
-        query,
-        "error",
-        None,
-        Some(reason),
-    );
+    attempt.record(store, "error", None, Some(reason));
     false
 }
 
@@ -370,32 +329,26 @@ pub(super) fn run_tavily_discovery(
     query: &str,
     trigger_reason: &str,
 ) -> bool {
-    let config = ProviderConfig::load().unwrap_or_default();
-    let api_key = match config.tavily_api_key {
-        Some(key) => key,
-        None => {
-            return record_provider_unavailable(
-                store,
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
-                config
-                    .config_error
-                    .as_deref()
-                    .unwrap_or("provider_unavailable: Tavily credentials are not configured"),
-            );
-        }
-    };
-    let Some(http_slot) = reserve_search_http_slot(
-        store,
+    let attempt = SearchAttempt {
         job_id,
-        "tavily",
+        provider: "tavily",
         trigger_reason,
         query,
-        "api.tavily.com",
-        "tavily_search",
-    ) else {
+    };
+    let config = ProviderConfig::load().unwrap_or_default();
+    let Some(api_key) = config.tavily_api_key else {
+        return record_provider_unavailable(
+            store,
+            attempt,
+            config
+                .config_error
+                .as_deref()
+                .unwrap_or("provider_unavailable: Tavily credentials are not configured"),
+        );
+    };
+    let Some(http_slot) =
+        reserve_search_http_slot(store, attempt, "api.tavily.com", "tavily_search")
+    else {
         return false;
     };
     let reservation = match store.reserve_tavily_search_with_interval(
@@ -409,11 +362,8 @@ pub(super) fn run_tavily_discovery(
                 None,
                 Some("Tavily request was not dispatched"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("Tavily request not dispatched: {error}")),
@@ -426,11 +376,8 @@ pub(super) fn run_tavily_discovery(
                 None,
                 Some("Tavily request was not dispatched"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("could not reserve Tavily search: {error}")),
@@ -450,11 +397,8 @@ pub(super) fn run_tavily_discovery(
         Err(error) => {
             let _ = store.complete_host_request(http_slot.id, None, Some("curl could not run"));
             let _ = store.complete_tavily_search(reservation.id, None, Some("curl could not run"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("curl could not run: {error}")),
@@ -462,49 +406,31 @@ pub(super) fn run_tavily_discovery(
             return true;
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "url = \"{TAVILY_SEARCH_API}\"");
-        let _ = writeln!(stdin, "request = \"POST\"");
-        let _ = writeln!(
-            stdin,
-            "header = \"Authorization: Bearer {}\"",
-            curl_config_escape(&api_key)
-        );
-        let _ = writeln!(stdin, "header = \"Content-Type: application/json\"");
-        let _ = writeln!(stdin, "data = \"{}\"", curl_config_escape(&body));
-    }
+    write_tavily_request(&mut child, &api_key, &body);
     let output = child.wait_with_output();
     let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            let (status, retry_after) = response_metadata(&output.stdout);
-            let _ = store.complete_host_request_with_retry_after(
+            let metadata = response_metadata(&output.stdout);
+            let _ = super::complete_reserved_http_request(
+                store,
                 http_slot.id,
-                status,
-                retry_after,
+                &metadata,
                 Some("Tavily request failed"),
             );
-            let _ =
-                store.complete_tavily_search(reservation.id, status, Some("Tavily request failed"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
-                "error",
-                None,
+            let _ = store.complete_tavily_search(
+                reservation.id,
+                metadata.status,
                 Some("Tavily request failed"),
             );
+            attempt.record(store, "error", None, Some("Tavily request failed"));
             return true;
         }
         Err(error) => {
             let _ = store.complete_host_request(http_slot.id, None, Some("curl could not run"));
             let _ = store.complete_tavily_search(reservation.id, None, Some("curl could not run"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("Tavily request failed: {error}")),
@@ -512,66 +438,34 @@ pub(super) fn run_tavily_discovery(
             return true;
         }
     };
-    let (response_status, retry_after) = response_metadata(&output.stdout);
-    let _ = store.complete_host_request_with_retry_after(
-        http_slot.id,
-        response_status,
-        retry_after,
-        None,
-    );
-    let response_body = String::from_utf8_lossy(&output.stdout)
-        .rsplit_once(HTTP_STATUS_MARKER)
-        .map(|(body, _)| body.to_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(&output.stdout).into_owned());
-    match serde_json::from_slice::<TavilyResponse>(response_body.as_bytes()) {
-        Ok(response) => {
-            let candidates = parse_tavily_candidates(response);
-            let result = candidates.iter().try_for_each(|(title, url, snippet)| {
-                store.record_typed_search_candidate(
-                    job_id,
-                    "tavily",
-                    query,
-                    "search_result",
-                    title,
-                    url,
-                    snippet,
-                    "{}",
-                )
-            });
-            let error = result.as_ref().err().map(|e| e.to_string());
-            let _ = store.complete_tavily_search(reservation.id, response_status, error.as_deref());
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
-                if candidates.is_empty() {
-                    "no_result"
-                } else {
-                    "results"
-                },
-                Some(candidates.len()),
+    let http_response = parse_search_http_response(&output.stdout);
+    let _ =
+        super::complete_reserved_http_request(store, http_slot.id, &http_response.metadata, None);
+    match parse_tavily_candidates(http_response.body.as_bytes()) {
+        Ok(candidates) => {
+            let result = persist_search_candidates(store, job_id, "tavily", query, &candidates);
+            let error = result.as_ref().err().map(std::string::ToString::to_string);
+            let _ = store.complete_tavily_search(
+                reservation.id,
+                http_response.metadata.status,
                 error.as_deref(),
             );
-            if should_retry_tavily_advanced(response_status, candidates.len(), error.is_some()) {
+            attempt.record_results(store, Some(candidates.len()), error.as_deref());
+            if should_retry_tavily_advanced(
+                http_response.metadata.status,
+                candidates.len(),
+                error.is_some(),
+            ) {
                 run_tavily_advanced_retry(store, job_id, query, &api_key);
             }
         }
         Err(_) => {
             let _ = store.complete_tavily_search(
                 reservation.id,
-                response_status,
+                http_response.metadata.status,
                 Some("Tavily returned invalid JSON"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some("Tavily returned invalid JSON"),
-            );
+            attempt.record(store, "error", None, Some("Tavily returned invalid JSON"));
         }
     }
     true
@@ -585,8 +479,9 @@ fn should_retry_tavily_advanced(
     response_status == Some(200) && usable_candidates == 0 && !basic_error
 }
 
-fn parse_tavily_candidates(response: TavilyResponse) -> Vec<(String, String, String)> {
-    response
+fn parse_tavily_candidates(body: &[u8]) -> Result<Vec<SearchCandidate>, serde_json::Error> {
+    let response = serde_json::from_slice::<TavilyResponse>(body)?;
+    Ok(response
         .results
         .into_iter()
         .filter_map(|item| {
@@ -597,23 +492,40 @@ fn parse_tavily_candidates(response: TavilyResponse) -> Vec<(String, String, Str
                 return None;
             }
             url.set_fragment(None);
-            Some((title, url.to_string(), item.content.unwrap_or_default()))
+            Some(SearchCandidate {
+                result_type: "search_result".into(),
+                title,
+                url: url.to_string(),
+                snippet: item.content.unwrap_or_default(),
+                structured_data_json: "{}".into(),
+            })
         })
         .take(20)
-        .collect()
+        .collect())
+}
+
+fn persist_search_candidates(
+    store: &mut LearningStore,
+    job_id: &str,
+    provider: &str,
+    query: &str,
+    candidates: &[SearchCandidate],
+) -> io::Result<()> {
+    candidates.iter().try_for_each(|candidate| {
+        store.record_typed_search_candidate(job_id, provider, query, candidate)
+    })
 }
 
 fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &str, api_key: &str) {
     const RETRY_REASON: &str = "advanced_retry";
-    let Some(slot) = reserve_search_http_slot(
-        store,
+    let attempt = SearchAttempt {
         job_id,
-        "tavily",
-        RETRY_REASON,
+        provider: "tavily",
+        trigger_reason: RETRY_REASON,
         query,
-        "api.tavily.com",
-        "tavily_search",
-    ) else {
+    };
+    let Some(slot) = reserve_search_http_slot(store, attempt, "api.tavily.com", "tavily_search")
+    else {
         return;
     };
     let reservation = match store.reserve_tavily_search_with_interval("advanced", 0) {
@@ -624,11 +536,8 @@ fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &st
                 None,
                 Some("Tavily advanced retry was not dispatched"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                RETRY_REASON,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("Tavily advanced retry not dispatched: {error}")),
@@ -648,11 +557,8 @@ fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &st
         Err(error) => {
             let _ = store.complete_host_request(slot.id, None, Some("curl could not run"));
             let _ = store.complete_tavily_search(reservation.id, None, Some("curl could not run"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                RETRY_REASON,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("Tavily advanced retry failed: {error}")),
@@ -660,27 +566,14 @@ fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &st
             return;
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "url = \"{TAVILY_SEARCH_API}\"");
-        let _ = writeln!(stdin, "request = \"POST\"");
-        let _ = writeln!(
-            stdin,
-            "header = \"Authorization: Bearer {}\"",
-            curl_config_escape(api_key)
-        );
-        let _ = writeln!(stdin, "header = \"Content-Type: application/json\"");
-        let _ = writeln!(stdin, "data = \"{}\"", curl_config_escape(&body));
-    }
+    write_tavily_request(&mut child, api_key, &body);
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
             let _ = store.complete_host_request(slot.id, None, Some("curl request failed"));
             let _ = store.complete_tavily_search(reservation.id, None, Some("curl request failed"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "tavily",
-                RETRY_REASON,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("Tavily advanced retry failed: {error}")),
@@ -688,47 +581,26 @@ fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &st
             return;
         }
     };
-    let (status, retry_after) = response_metadata(&output.stdout);
+    let response = parse_search_http_response(&output.stdout);
     let succeeded = output.status.success();
-    let _ = store.complete_host_request_with_retry_after(
+    let _ = super::complete_reserved_http_request(
+        store,
         slot.id,
-        status,
-        retry_after,
+        &response.metadata,
         (!succeeded).then_some("Tavily advanced request failed"),
     );
-    let response_text = String::from_utf8_lossy(&output.stdout);
-    let body = response_text
-        .rsplit_once(HTTP_STATUS_MARKER)
-        .map_or(response_text.as_ref(), |(body, _)| body);
     if !succeeded {
-        let _ = store.complete_tavily_search(reservation.id, status, Some("Tavily request failed"));
-        let _ = store.record_scholar_search_attempt_for_provider(
-            job_id,
-            "tavily",
-            RETRY_REASON,
-            query,
-            "error",
-            None,
-            Some("Tavily advanced request failed"),
+        let _ = store.complete_tavily_search(
+            reservation.id,
+            response.metadata.status,
+            Some("Tavily request failed"),
         );
+        attempt.record(store, "error", None, Some("Tavily advanced request failed"));
         return;
     }
-    let parsed = serde_json::from_slice::<TavilyResponse>(body.as_bytes());
-    let (candidate_count, error) = match parsed {
-        Ok(response) => {
-            let candidates = parse_tavily_candidates(response);
-            let result = candidates.iter().try_for_each(|(title, url, snippet)| {
-                store.record_typed_search_candidate(
-                    job_id,
-                    "tavily",
-                    query,
-                    "search_result",
-                    title,
-                    url,
-                    snippet,
-                    "{}",
-                )
-            });
+    let (candidate_count, error) = match parse_tavily_candidates(response.body.as_bytes()) {
+        Ok(candidates) => {
+            let result = persist_search_candidates(store, job_id, "tavily", query, &candidates);
             (
                 Some(candidates.len()),
                 result.err().map(|error| error.to_string()),
@@ -736,22 +608,9 @@ fn run_tavily_advanced_retry(store: &mut LearningStore, job_id: &str, query: &st
         }
         Err(_) => (None, Some("Tavily returned invalid JSON".into())),
     };
-    let _ = store.complete_tavily_search(reservation.id, status, error.as_deref());
-    let _ = store.record_scholar_search_attempt_for_provider(
-        job_id,
-        "tavily",
-        RETRY_REASON,
-        query,
-        if error.is_some() {
-            "error"
-        } else if candidate_count == Some(0) {
-            "no_result"
-        } else {
-            "results"
-        },
-        candidate_count,
-        error.as_deref(),
-    );
+    let _ =
+        store.complete_tavily_search(reservation.id, response.metadata.status, error.as_deref());
+    attempt.record_results(store, candidate_count, error.as_deref());
 }
 
 fn curl_config_escape(value: &str) -> String {
@@ -761,6 +620,20 @@ fn curl_config_escape(value: &str) -> String {
         .replace(['\n', '\r'], " ")
 }
 
+fn write_tavily_request(child: &mut Child, api_key: &str, body: &str) {
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "url = \"{TAVILY_SEARCH_API}\"");
+        let _ = writeln!(stdin, "request = \"POST\"");
+        let _ = writeln!(
+            stdin,
+            "header = \"Authorization: Bearer {}\"",
+            curl_config_escape(api_key)
+        );
+        let _ = writeln!(stdin, "header = \"Content-Type: application/json\"");
+        let _ = writeln!(stdin, "data = \"{}\"", curl_config_escape(body));
+    }
+}
+
 fn run_searxng_discovery(
     store: &mut LearningStore,
     job_id: &str,
@@ -768,41 +641,28 @@ fn run_searxng_discovery(
     trigger_reason: &str,
     endpoint: &str,
 ) -> bool {
+    let attempt = SearchAttempt {
+        job_id,
+        provider: "searxng",
+        trigger_reason,
+        query,
+    };
     let (request_url, host) = match local_searxng_url(endpoint, query) {
         Ok(value) => value,
         Err(error) => {
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "searxng",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some(&error.to_string()),
-            );
+            attempt.record(store, "error", None, Some(&error.to_string()));
             return false;
         }
     };
-    let Some(slot) = reserve_search_http_slot(
-        store,
-        job_id,
-        "searxng",
-        trigger_reason,
-        query,
-        &host,
-        "searxng_search",
-    ) else {
+    let Some(slot) = reserve_search_http_slot(store, attempt, &host, "searxng_search") else {
         return false;
     };
     let mut child = match spawn_search_curl() {
         Ok(child) => child,
         Err(error) => {
             let _ = store.complete_host_request(slot.id, None, Some("curl could not run"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "searxng",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("SearXNG request failed: {error}")),
@@ -817,11 +677,8 @@ fn run_searxng_discovery(
         Ok(output) => output,
         Err(error) => {
             let _ = store.complete_host_request(slot.id, None, Some("curl request failed"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "searxng",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("SearXNG request failed: {error}")),
@@ -829,73 +686,28 @@ fn run_searxng_discovery(
             return true;
         }
     };
-    let (status, retry_after) = response_metadata(&output.stdout);
+    let response = parse_search_http_response(&output.stdout);
     let succeeded = output.status.success();
-    let _ = store.complete_host_request_with_retry_after(
+    let _ = super::complete_reserved_http_request(
+        store,
         slot.id,
-        status,
-        retry_after,
+        &response.metadata,
         (!succeeded).then_some("SearXNG request failed"),
     );
     if !succeeded {
-        let _ = store.record_scholar_search_attempt_for_provider(
-            job_id,
-            "searxng",
-            trigger_reason,
-            query,
-            "error",
-            None,
-            Some("SearXNG request failed"),
-        );
+        attempt.record(store, "error", None, Some("SearXNG request failed"));
         return true;
     }
-    let response = String::from_utf8_lossy(&output.stdout);
-    let body = response
-        .rsplit_once(HTTP_STATUS_MARKER)
-        .map_or(response.as_ref(), |(body, _)| body);
-    let results = match parse_searxng_candidates(body.as_bytes()) {
+    let results = match parse_searxng_candidates(response.body.as_bytes()) {
         Ok(results) => results,
         Err(error) => {
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "searxng",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some(&error.to_string()),
-            );
+            attempt.record(store, "error", None, Some(&error.to_string()));
             return true;
         }
     };
-    let persisted = results.iter().try_for_each(|candidate| {
-        store.record_typed_search_candidate(
-            job_id,
-            "searxng",
-            query,
-            &candidate.category,
-            &candidate.title,
-            &candidate.url,
-            &candidate.snippet,
-            "{}",
-        )
-    });
+    let persisted = persist_search_candidates(store, job_id, "searxng", query, &results);
     let error = persisted.err().map(|error| error.to_string());
-    let _ = store.record_scholar_search_attempt_for_provider(
-        job_id,
-        "searxng",
-        trigger_reason,
-        query,
-        if error.is_some() {
-            "error"
-        } else if results.is_empty() {
-            "no_result"
-        } else {
-            "results"
-        },
-        Some(results.len()),
-        error.as_deref(),
-    );
+    attempt.record_results(store, Some(results.len()), error.as_deref());
     true
 }
 
@@ -933,15 +745,7 @@ fn local_searxng_url(endpoint: &str, query: &str) -> io::Result<(url::Url, Strin
     Ok((url, host))
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SearxngCandidate {
-    category: String,
-    title: String,
-    url: String,
-    snippet: String,
-}
-
-fn parse_searxng_candidates(body: &[u8]) -> io::Result<Vec<SearxngCandidate>> {
+fn parse_searxng_candidates(body: &[u8]) -> io::Result<Vec<SearchCandidate>> {
     let value: serde_json::Value = serde_json::from_slice(body)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SearXNG returned invalid JSON"))?;
     let Some(results) = value.get("results").and_then(serde_json::Value::as_array) else {
@@ -969,11 +773,12 @@ fn parse_searxng_candidates(body: &[u8]) -> io::Result<Vec<SearxngCandidate>> {
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            Some(SearxngCandidate {
-                category: category.chars().take(80).collect(),
+            Some(SearchCandidate {
+                result_type: category.chars().take(80).collect(),
                 title: title.chars().take(500).collect(),
                 url: url.to_string(),
                 snippet: snippet.chars().take(2_000).collect(),
+                structured_data_json: "{}".into(),
             })
         })
         .collect())
@@ -981,9 +786,9 @@ fn parse_searxng_candidates(body: &[u8]) -> io::Result<Vec<SearxngCandidate>> {
 
 fn count_search_domain(domains: &mut std::collections::BTreeMap<String, usize>, url: &url::Url) {
     if let Some(host) = url.host_str() {
-        let domain = host.trim_end_matches('.').to_ascii_lowercase();
-        let domain = domain.strip_prefix("www.").unwrap_or(&domain);
-        *domains.entry(domain.to_owned()).or_default() += 1;
+        *domains
+            .entry(crate::storage::normalize_domain(host))
+            .or_default() += 1;
     }
 }
 
@@ -995,28 +800,21 @@ pub(super) fn run_serpapi_discovery(
     query: &str,
     trigger_reason: &str,
 ) -> bool {
-    let api_key = match ProviderConfig::load().unwrap_or_default().serp_api_key {
-        Some(key) => key,
-        None => {
-            return record_provider_unavailable(
-                store,
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                "provider_unavailable: SERP_API_KEY is not configured",
-            );
-        }
-    };
-    let Some(http_slot) = reserve_search_http_slot(
-        store,
+    let attempt = SearchAttempt {
         job_id,
-        "serpapi",
+        provider: "serpapi",
         trigger_reason,
         query,
-        "serpapi.com",
-        "serpapi_search",
-    ) else {
+    };
+    let Some(api_key) = ProviderConfig::load().unwrap_or_default().serp_api_key else {
+        return record_provider_unavailable(
+            store,
+            attempt,
+            "provider_unavailable: SERP_API_KEY is not configured",
+        );
+    };
+    let Some(http_slot) = reserve_search_http_slot(store, attempt, "serpapi.com", "serpapi_search")
+    else {
         return false;
     };
     let interval_seconds = serp_interval_seconds();
@@ -1042,11 +840,8 @@ pub(super) fn run_serpapi_discovery(
                     None,
                     Some("SerpAPI request was not dispatched"),
                 );
-                let _ = store.record_scholar_search_attempt_for_provider(
-                    job_id,
-                    "serpapi",
-                    trigger_reason,
-                    query,
+                attempt.record(
+                    store,
                     "error",
                     None,
                     Some(&format!("could not reserve SerpAPI search: {error}")),
@@ -1064,11 +859,8 @@ pub(super) fn run_serpapi_discovery(
                 None,
                 Some("invalid SerpAPI endpoint"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("invalid SerpAPI endpoint: {error}")),
@@ -1087,11 +879,8 @@ pub(super) fn run_serpapi_discovery(
         Err(error) => {
             let _ = store.complete_host_request(http_slot.id, None, Some("curl could not run"));
             let _ = store.complete_serpapi_search(reservation.id, None, Some("curl could not run"));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
+            attempt.record(
+                store,
                 "error",
                 None,
                 Some(&format!("curl could not run: {error}")),
@@ -1107,27 +896,19 @@ pub(super) fn run_serpapi_discovery(
     let output = match output {
         Ok(output) if output.status.success() => output,
         Ok(output) => {
-            let (status, retry_after) = response_metadata(&output.stdout);
-            let _ = store.complete_host_request_with_retry_after(
+            let metadata = response_metadata(&output.stdout);
+            let _ = super::complete_reserved_http_request(
+                store,
                 http_slot.id,
-                status,
-                retry_after,
+                &metadata,
                 Some("SerpAPI request failed"),
             );
             let _ = store.complete_serpapi_search(
                 reservation.id,
-                status,
+                metadata.status,
                 Some("SerpAPI request failed"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some("SerpAPI request failed"),
-            );
+            attempt.record(store, "error", None, Some("SerpAPI request failed"));
             return true;
         }
         Err(error) => {
@@ -1137,30 +918,14 @@ pub(super) fn run_serpapi_discovery(
                 Some("curl could not run for SerpAPI"),
             );
             let _ = store.complete_serpapi_search(reservation.id, None, Some(&error.to_string()));
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some("curl could not run for SerpAPI"),
-            );
+            attempt.record(store, "error", None, Some("curl could not run for SerpAPI"));
             return true;
         }
     };
-    let (response_status, retry_after) = response_metadata(&output.stdout);
-    let _ = store.complete_host_request_with_retry_after(
-        http_slot.id,
-        response_status,
-        retry_after,
-        None,
-    );
-    let body = String::from_utf8_lossy(&output.stdout)
-        .rsplit_once(HTTP_STATUS_MARKER)
-        .map(|(body, _)| body.to_owned())
-        .unwrap_or_else(|| String::from_utf8_lossy(&output.stdout).into_owned());
-    let parsed = serde_json::from_slice::<SerpApiResponse>(body.as_bytes());
+    let http_response = parse_search_http_response(&output.stdout);
+    let _ =
+        super::complete_reserved_http_request(store, http_slot.id, &http_response.metadata, None);
+    let parsed = serde_json::from_slice::<SerpApiResponse>(http_response.body.as_bytes());
     match parsed {
         Ok(response) if response.error.is_none() => {
             let mut domains = std::collections::BTreeMap::<String, usize>::new();
@@ -1184,13 +949,13 @@ pub(super) fn run_serpapi_discovery(
                 let Some(clean_url) = clean_serpapi_result_url(url) else {
                     continue;
                 };
-                candidates.push((
-                    "organic_result".to_owned(),
+                candidates.push(SearchCandidate {
+                    result_type: "organic_result".into(),
                     title,
-                    clean_url,
-                    item.snippet.unwrap_or_default(),
-                    "{}".to_owned(),
-                ));
+                    url: clean_url,
+                    snippet: item.snippet.unwrap_or_default(),
+                    structured_data_json: "{}".into(),
+                });
             }
             for (result_type, results) in response.structured_results {
                 if is_serpapi_metadata_field(&result_type) {
@@ -1204,82 +969,47 @@ pub(super) fn run_serpapi_discovery(
                         continue;
                     };
                     count_search_domain(&mut domains, &url);
-                    candidates.push((
-                        candidate.result_type,
-                        candidate.title,
-                        candidate.url,
-                        candidate.snippet,
-                        candidate.structured_data_json,
-                    ));
+                    candidates.push(candidate);
                 }
             }
             let domain_rows = domains.into_iter().collect::<Vec<_>>();
             let domain_result = store.record_serpapi_search_domains(reservation.id, &domain_rows);
-            let result = candidates.iter().try_for_each(
-                |(result_type, title, url, snippet, structured_data)| {
-                    store.record_typed_search_candidate(
-                        job_id,
-                        "serpapi",
-                        query,
-                        result_type,
-                        title,
-                        url,
-                        snippet,
-                        structured_data,
-                    )
-                },
-            );
+            let result = persist_search_candidates(store, job_id, "serpapi", query, &candidates);
             let result = domain_result.and(result);
             let _ = store.complete_serpapi_search(
                 reservation.id,
-                response_status,
-                result.as_ref().err().map(|e| e.to_string()).as_deref(),
+                http_response.metadata.status,
+                result
+                    .as_ref()
+                    .err()
+                    .map(std::string::ToString::to_string)
+                    .as_deref(),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                if candidates.is_empty() {
-                    "no_result"
-                } else {
-                    "results"
-                },
+            attempt.record_results(
+                store,
                 Some(candidates.len()),
-                result.as_ref().err().map(|e| e.to_string()).as_deref(),
+                result
+                    .as_ref()
+                    .err()
+                    .map(std::string::ToString::to_string)
+                    .as_deref(),
             );
         }
         Ok(_response) => {
             let _ = store.complete_serpapi_search(
                 reservation.id,
-                response_status,
+                http_response.metadata.status,
                 Some("SerpAPI returned an API error"),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some("SerpAPI returned an API error"),
-            );
+            attempt.record(store, "error", None, Some("SerpAPI returned an API error"));
         }
         Err(error) => {
             let _ = store.complete_serpapi_search(
                 reservation.id,
-                response_status,
+                http_response.metadata.status,
                 Some(&error.to_string()),
             );
-            let _ = store.record_scholar_search_attempt_for_provider(
-                job_id,
-                "serpapi",
-                trigger_reason,
-                query,
-                "error",
-                None,
-                Some("SerpAPI returned invalid JSON"),
-            );
+            attempt.record(store, "error", None, Some("SerpAPI returned invalid JSON"));
         }
     }
     true
@@ -1288,20 +1018,37 @@ pub(super) fn run_serpapi_discovery(
 #[cfg(test)]
 mod tests {
     use super::{
-        local_searxng_url, parse_searxng_candidates, record_provider_unavailable,
+        SearchAttempt, linked_serpapi_results, local_searxng_url, parse_search_http_response,
+        parse_searxng_candidates, parse_tavily_candidates, record_provider_unavailable,
         response_metadata, should_retry_tavily_advanced,
     };
 
     #[test]
+    fn nested_serpapi_results_keep_valid_candidates_and_clean_their_urls() {
+        let candidates = linked_serpapi_results(
+            "recipes_results",
+            &serde_json::json!({
+                "items": [
+                    {
+                        "title": " Soup ",
+                        "link": "https://food.example/soup?token=private#recipe",
+                        "ingredients": ["chicken", "carrots"]
+                    },
+                    {"title": " ", "link": "https://food.example/empty"}
+                ]
+            }),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].result_type, "recipes_results");
+        assert_eq!(candidates[0].title, "Soup");
+        assert_eq!(candidates[0].url, "https://food.example/soup");
+        assert_eq!(candidates[0].snippet, "chicken; carrots");
+    }
+
+    #[test]
     fn missing_provider_credentials_are_recorded_without_stopping_the_queue() {
-        let path = std::env::temp_dir().join(format!(
-            "community-provider-unavailable-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-provider-unavailable", "db");
         let mut store = crate::storage::LearningStore::open(&path).unwrap();
         store
             .enqueue_research("provider-unavailable", 1, "What are Mars's moons?")
@@ -1309,10 +1056,12 @@ mod tests {
         let job = store.claim_scholar_job().unwrap().unwrap();
         assert!(!record_provider_unavailable(
             &mut store,
-            &job.id,
-            "tavily",
-            "wikipedia_insufficient",
-            &job.question,
+            SearchAttempt {
+                job_id: &job.id,
+                provider: "tavily",
+                trigger_reason: "wikipedia_insufficient",
+                query: &job.question,
+            },
             "provider_unavailable: Tavily credentials are not configured",
         ));
         let attempts = store.scholar_search_attempts(&job.id).unwrap();
@@ -1328,6 +1077,42 @@ mod tests {
         );
         drop(store);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_attempt_maps_result_counts_and_errors_to_ledger_outcomes() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        store
+            .enqueue_research("search-outcomes", 1, "What are Mars's moons?")
+            .unwrap();
+        let job = store.claim_scholar_job().unwrap().unwrap();
+        let attempt = SearchAttempt {
+            job_id: &job.id,
+            provider: "fixture",
+            trigger_reason: "test",
+            query: &job.question,
+        };
+
+        attempt.record_results(&mut store, Some(0), None);
+        attempt.record_results(&mut store, Some(2), None);
+        attempt.record_results(&mut store, Some(3), Some("candidate persistence failed"));
+
+        let attempts = store.scholar_search_attempts(&job.id).unwrap();
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| (attempt.status.as_str(), attempt.result_count))
+                .collect::<Vec<_>>(),
+            [
+                ("no_result", Some(0)),
+                ("results", Some(2)),
+                ("error", Some(3))
+            ]
+        );
+        assert_eq!(
+            attempts[2].error.as_deref(),
+            Some("candidate persistence failed")
+        );
     }
 
     #[test]
@@ -1359,21 +1144,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].category, "recipes");
+        assert_eq!(results[0].result_type, "recipes");
         assert_eq!(results[0].snippet, "A snippet");
         assert!(parse_searxng_candidates(br#"{"oops":[]}"#).is_err());
     }
 
     #[test]
-    fn curl_response_fixture_preserves_retry_after_and_redirect_status() {
-        let (status, retry_after) =
-            response_metadata(b"response body\nCOMMUNITY_HTTP_STATUS:429\tapplication/json\t120");
-        assert_eq!(status, Some(429));
-        assert_eq!(retry_after, Some(120_000));
+    fn tavily_results_use_the_shared_search_candidate_shape() {
+        let candidates = parse_tavily_candidates(
+            br#"{"results":[{"title":" Soup ","url":"https://food.example/soup#recipe","content":"A snippet"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].result_type, "search_result");
+        assert_eq!(candidates[0].title, "Soup");
+        assert_eq!(candidates[0].url, "https://food.example/soup");
+        assert_eq!(candidates[0].snippet, "A snippet");
+        assert_eq!(candidates[0].structured_data_json, "{}");
+        assert!(parse_tavily_candidates(b"not JSON").is_err());
+    }
 
-        let (status, retry_after) = response_metadata(b"\nCOMMUNITY_HTTP_STATUS:302\ttext/html\t");
-        assert_eq!(status, Some(302));
-        assert_eq!(retry_after, None);
+    #[test]
+    fn curl_response_fixture_preserves_retry_after_and_redirect_status() {
+        let response = parse_search_http_response(
+            b"response body\nCOMMUNITY_HTTP_STATUS:429\tapplication/json\t120",
+        );
+        assert_eq!(response.metadata.status, Some(429));
+        assert_eq!(response.metadata.retry_after_ms, Some(120_000));
+        assert_eq!(response.body, "response body");
+
+        let metadata = response_metadata(b"\nCOMMUNITY_HTTP_STATUS:302\ttext/html\t");
+        assert_eq!(metadata.status, Some(302));
+        assert_eq!(metadata.retry_after_ms, None);
+
+        let response = parse_search_http_response(
+            b"response body\nCOMMUNITY_HTTP_STATUS:200\tapplication/json\t",
+        );
+        assert_eq!(response.metadata.status, Some(200));
+        assert_eq!(response.body, "response body");
+
+        let response = parse_search_http_response(b"body without metadata");
+        assert_eq!(response.metadata.status, None);
+        assert_eq!(response.metadata.retry_after_ms, None);
+        assert_eq!(response.body, "body without metadata");
     }
 
     #[test]

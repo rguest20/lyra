@@ -18,10 +18,9 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::agent::Message;
+pub(crate) use crate::errors::invalid_data as invalid;
 use crate::inference::LocalModel;
-use crate::storage::{
-    CorroborationTask, LearningStore, ScholarEvidence, ScholarFinding, ScholarSourceProfile,
-};
+use crate::storage::{CorroborationTask, LearningStore, ScholarEvidence, ScholarFinding};
 
 use wikipedia::{
     html_to_text, page_relevance_score, ranked_sections, relevant_passages, text_property,
@@ -55,12 +54,165 @@ const HTTP_STATUS_MARKER: &str = "\nCOMMUNITY_HTTP_STATUS:";
 const SERPAPI_SEARCH_API: &str = "https://serpapi.com/search.json";
 const TAVILY_SEARCH_API: &str = "https://api.tavily.com/search";
 
+pub(super) fn limited_curl(max_time_seconds: u64, max_bytes: usize) -> std::process::Command {
+    let mut command = std::process::Command::new("curl");
+    command
+        .args(["--silent", "--show-error", "--fail", "--max-time"])
+        .arg(max_time_seconds.to_string())
+        .arg("--max-filesize")
+        .arg(max_bytes.to_string());
+    command
+}
+
+pub(super) fn run_reserved_curl(
+    store: &mut LearningStore,
+    reservation_id: i64,
+    command: &mut std::process::Command,
+) -> io::Result<std::process::Output> {
+    match command.output() {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            store.complete_host_request(reservation_id, None, Some("curl could not run"))?;
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn run_reserved_http_response(
+    store: &mut LearningStore,
+    reservation_id: i64,
+    command: &mut std::process::Command,
+    marker: &str,
+    missing_metadata_reason: &'static str,
+    missing_metadata_error: &'static str,
+) -> io::Result<(std::process::Output, HttpResponseMetadata)> {
+    let mut output = run_reserved_curl(store, reservation_id, command)?;
+    let Some((body, metadata)) = parse_http_response(&output.stdout, marker) else {
+        store.complete_host_request(reservation_id, None, Some(missing_metadata_reason))?;
+        return Err(io::Error::other(missing_metadata_error));
+    };
+    output.stdout.truncate(body.len());
+    Ok((output, metadata))
+}
+
+pub(super) fn split_http_response<'a>(
+    output: &'a [u8],
+    marker: &str,
+) -> Option<(&'a [u8], &'a [u8])> {
+    let marker = marker.as_bytes();
+    if marker.is_empty() {
+        return None;
+    }
+    let index = output
+        .windows(marker.len())
+        .rposition(|window| window == marker)?;
+    Some((&output[..index], &output[index + marker.len()..]))
+}
+
+#[derive(Default)]
+pub(super) struct HttpResponseMetadata {
+    pub status_text: Option<String>,
+    pub status: Option<u16>,
+    pub content_type: Option<String>,
+    pub retry_after_ms: Option<i64>,
+}
+
+pub(super) fn complete_reserved_http_request(
+    store: &mut LearningStore,
+    reservation_id: i64,
+    metadata: &HttpResponseMetadata,
+    error: Option<&str>,
+) -> io::Result<()> {
+    store.complete_host_request_with_retry_after(
+        reservation_id,
+        metadata.status,
+        metadata.retry_after_ms,
+        error,
+    )
+}
+
+pub(super) fn require_http_status(
+    store: &mut LearningStore,
+    reservation_id: i64,
+    metadata: &HttpResponseMetadata,
+    completion_reason: &'static str,
+    error_message: &'static str,
+) -> io::Result<u16> {
+    match metadata.status {
+        Some(status) => Ok(status),
+        None => {
+            store.complete_host_request(reservation_id, None, Some(completion_reason))?;
+            Err(io::Error::other(error_message))
+        }
+    }
+}
+
+pub(super) fn parse_http_response_metadata(bytes: &[u8]) -> HttpResponseMetadata {
+    let text = String::from_utf8_lossy(bytes);
+    let mut fields = text.trim_end_matches(['\r', '\n']).split('\t');
+    let status_text = fields.next().map(str::to_owned);
+    let status = status_text.as_deref().and_then(|value| value.parse().ok());
+    let content_type = fields.next().map(str::to_owned);
+    let retry_after_ms = fields.next().and_then(retry_after_delay_ms_now);
+    HttpResponseMetadata {
+        status_text,
+        status,
+        content_type,
+        retry_after_ms,
+    }
+}
+
+pub(super) fn parse_http_response<'a>(
+    output: &'a [u8],
+    marker: &str,
+) -> Option<(&'a [u8], HttpResponseMetadata)> {
+    let (body, metadata) = split_http_response(output, marker)?;
+    Some((body, parse_http_response_metadata(metadata)))
+}
+
+pub(super) fn http_response_write_out(marker: &str) -> String {
+    format!("{marker}%{{http_code}}\t%{{content_type}}\t%header{{retry-after}}")
+}
+
+pub(super) fn wait_for_host_request(scheduled_at_ms: u128) -> io::Result<()> {
+    let now_ms = crate::storage::unix_time_millis()?;
+    if scheduled_at_ms > now_ms {
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::try_from(scheduled_at_ms - now_ms).unwrap_or(u64::MAX),
+        ));
+    }
+    Ok(())
+}
+
 struct ResearchResult {
     page: SearchPage,
     excerpt: String,
     finding: Option<ScholarFinding>,
     research_relevance: String,
     candidate_count: usize,
+}
+
+enum ResearchOutcome {
+    Found(ResearchResult),
+    NoResult,
+    Deferred(io::Error),
+    Failed(io::Error),
+}
+
+impl ResearchOutcome {
+    fn search_record(&self) -> (&'static str, usize, Option<String>) {
+        match self {
+            Self::Found(result) => ("results", result.candidate_count, None),
+            Self::NoResult => ("no_result", 0, None),
+            Self::Deferred(error) | Self::Failed(error) => ("error", 0, Some(error.to_string())),
+        }
+    }
+}
+
+fn decode_wikipedia_response<T: serde::de::DeserializeOwned>(
+    value: serde_json::Value,
+) -> io::Result<T> {
+    serde_json::from_value(value).map_err(crate::errors::invalid_json)
 }
 
 #[derive(Deserialize)]
@@ -94,6 +246,15 @@ struct SearchPage {
     extract: Option<String>,
     fullurl: Option<String>,
     revisions: Option<Vec<Revision>>,
+}
+
+impl SearchPage {
+    fn revision_timestamp(&self) -> Option<&str> {
+        self.revisions
+            .as_ref()
+            .and_then(|revisions| revisions.first())
+            .and_then(|revision| revision.timestamp.as_deref())
+    }
 }
 
 #[derive(Deserialize)]
@@ -159,33 +320,14 @@ struct ScholarFindingJson {
 impl ScholarFindingJson {
     fn proposition(&self, evidence: &str) -> crate::storage::PropositionMetadata {
         use crate::storage::{ClaimModality, ClaimPolarity, PropositionMetadata};
-        let attribution = self
-            .attribution
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| {
-                !value.is_empty()
-                    && value.chars().count() <= 240
-                    && evidence.contains(value)
-                    && !value.chars().any(char::is_control)
-            })
-            .map(str::to_owned);
+        let polarity = self.polarity.trim().to_ascii_lowercase();
+        let modality = self.modality.trim().to_ascii_lowercase();
         PropositionMetadata {
-            attribution,
+            attribution: exact_scope(&self.attribution, evidence),
             geographic_scope: exact_scope(&self.geographic_scope, evidence),
             context_scope: exact_scope(&self.context_scope, evidence),
-            polarity: match self.polarity.trim().to_ascii_lowercase().as_str() {
-                "asserted" => ClaimPolarity::Asserted,
-                "negated" => ClaimPolarity::Negated,
-                _ => ClaimPolarity::Unknown,
-            },
-            modality: match self.modality.trim().to_ascii_lowercase().as_str() {
-                "factual" => ClaimModality::Factual,
-                "possible" => ClaimModality::Possible,
-                "necessary" => ClaimModality::Necessary,
-                "conditional" => ClaimModality::Conditional,
-                _ => ClaimModality::Unknown,
-            },
+            polarity: ClaimPolarity::from_storage_value(&polarity),
+            modality: ClaimModality::from_storage_value(&modality),
         }
     }
 }
@@ -194,12 +336,7 @@ fn exact_scope(value: &Option<String>, evidence: &str) -> Option<String> {
     value
         .as_deref()
         .map(str::trim)
-        .filter(|scope| {
-            !scope.is_empty()
-                && scope.chars().count() <= 240
-                && !scope.chars().any(char::is_control)
-                && evidence.contains(scope)
-        })
+        .filter(|scope| crate::storage::valid_quoted_field(scope, evidence, 240))
         .map(str::to_owned)
 }
 
@@ -259,6 +396,11 @@ pub(super) fn retry_after_delay_ms(value: &str, now_ms: i64) -> Option<i64> {
         .saturating_add(hour * 3_600 + minute * 60 + second)
         .saturating_mul(1_000);
     Some(response_ms.saturating_sub(now_ms).max(1_000))
+}
+
+pub(super) fn retry_after_delay_ms_now(value: &str) -> Option<i64> {
+    let now_ms = crate::storage::unix_time_ms_i64_with_overflow(io::Error::other).ok()?;
+    retry_after_delay_ms(value, now_ms)
 }
 
 pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<usize> {
@@ -380,14 +522,16 @@ fn process_job(
                 logged_query = query;
                 result = research(
                     store,
-                    &job.id,
-                    &job.question,
-                    &logged_query,
                     model,
-                    expansion,
-                    feedback.as_ref().map(|task| task.guidance.as_str()),
-                    &excluded_sources,
-                    &names,
+                    ResearchRequest {
+                        job_id: &job.id,
+                        question: &job.question,
+                        search_phrase: &logged_query,
+                        expansion,
+                        guidance: feedback.as_ref().map(|task| task.guidance.as_str()),
+                        excluded_sources: &excluded_sources,
+                        names: &names,
+                    },
                 );
                 if let Ok(Some(found)) = &mut result {
                     found.finding = found.finding.take().filter(|finding| {
@@ -406,33 +550,26 @@ fn process_job(
                     break;
                 }
                 store.record_scholar_search_attempt_for_provider(
-                    &job.id,
-                    "wikipedia",
-                    "lookup_query_no_result",
-                    &logged_query,
-                    "no_result",
-                    Some(0),
-                    None,
+                    crate::storage::ScholarSearchAttemptInput {
+                        job_id: &job.id,
+                        provider: "wikipedia",
+                        trigger_reason: "lookup_query_no_result",
+                        query: &logged_query,
+                        status: "no_result",
+                        result_count: Some(0),
+                        error: None,
+                    },
                 )?;
             }
         }
     }
-    let search_status = match &result {
-        Ok(Some(_)) => "results",
-        Ok(None) => "no_result",
-        Err(_) => "error",
-    };
     let wikipedia_weak = !matches!(
         &result,
         Ok(Some(found)) if found.finding.is_some() && found.research_relevance == "direct"
     );
-    let now_ms = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis(),
-    )
-    .map_err(|_| io::Error::other("search timestamp too large"))?;
+    let now_ms = crate::storage::unix_time_ms_i64_with_overflow(|_| {
+        io::Error::other("search timestamp too large")
+    })?;
     let mut sources = Vec::new();
     if !foreground || wikipedia_weak {
         discover_configured_searxng(
@@ -469,71 +606,79 @@ fn process_job(
             foreground,
         )?;
     }
+    let outcome = match result {
+        Ok(Some(result)) => ResearchOutcome::Found(result),
+        Ok(None) => ResearchOutcome::NoResult,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => ResearchOutcome::Deferred(error),
+        Err(error) => ResearchOutcome::Failed(error),
+    };
+    finish_job_outcome(store, &job.id, &logged_query, outcome, sources, feedback)
+}
+
+fn finish_job_outcome(
+    store: &mut LearningStore,
+    job_id: &str,
+    query: &str,
+    outcome: ResearchOutcome,
+    mut sources: Vec<ScholarEvidence>,
+    feedback: Option<crate::storage::ScholarFeedbackTask>,
+) -> io::Result<usize> {
+    let (search_status, candidate_count, search_error) = outcome.search_record();
     store.record_scholar_search_attempt(
-        &job.id,
-        &logged_query,
+        job_id,
+        query,
         search_status,
-        result
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .map(|result| result.candidate_count)
-            .or_else(|| Some(0)),
-        result
-            .as_ref()
-            .err()
-            .map(|error| error.to_string())
-            .as_deref(),
+        Some(candidate_count),
+        search_error.as_deref(),
     )?;
-    match result {
-        Ok(result) => {
-            let note = if result.is_none() {
-                Some("no relevant encyclopedia result")
-            } else {
-                None
-            };
-            if let Some(result) = result {
-                sources.insert(
-                    0,
-                    ScholarEvidence {
-                        source_title: result.page.title,
-                        source_url: result.page.fullurl.unwrap_or_else(|| SEARCH_API.to_owned()),
-                        source_excerpt: result.excerpt,
-                        finding: result.finding,
-                        profile: ScholarSourceProfile::default(),
-                        research_relevance: result.research_relevance,
-                    },
-                );
-            }
-            store.finish_scholar_job_with_evidence(&job.id, &sources, note)?;
+    let (persist_sources, note) = match outcome {
+        ResearchOutcome::Found(result) => {
+            sources.insert(
+                0,
+                ScholarEvidence::new(
+                    result.page.title,
+                    result.page.fullurl.unwrap_or_else(|| SEARCH_API.to_owned()),
+                    result.excerpt,
+                    result.finding,
+                    result.research_relevance,
+                ),
+            );
+            (true, None)
         }
-        Err(error) if sources.iter().any(|source| source.finding.is_some()) => {
-            store.finish_scholar_job_with_evidence(&job.id, &sources, None)?;
+        ResearchOutcome::NoResult => (true, Some("no relevant encyclopedia result")),
+        ResearchOutcome::Failed(error) | ResearchOutcome::Deferred(error)
+            if sources.iter().any(|source| source.finding.is_some()) =>
+        {
             eprintln!(
                 "scholar completed job {} using fetched sources after encyclopedia research failed: {error}",
-                job.id
+                job_id
             );
+            (true, None)
         }
-        Err(error) => {
-            if error.kind() == io::ErrorKind::WouldBlock {
-                let retry_at_ms = store.next_research_retry_ms()?;
-                store.defer_scholar_job(&job.id, &error.to_string(), retry_at_ms)?;
-                crate::diagnostics::event(
-                    "scholar.job_deferred",
-                    serde_json::json!({"job_id":job.id,"reason":error.to_string(),"retry_at_ms":retry_at_ms}),
-                );
-                return Ok(1);
-            }
-            store.fail_scholar_job(&job.id, &error.to_string())?;
+        ResearchOutcome::Deferred(error) => {
+            let retry_at_ms = store.next_research_retry_ms()?;
+            store.defer_scholar_job(job_id, &error.to_string(), retry_at_ms)?;
+            crate::diagnostics::event(
+                "scholar.job_deferred",
+                serde_json::json!({"job_id":job_id,"reason":error.to_string(),"retry_at_ms":retry_at_ms}),
+            );
+            return Ok(1);
+        }
+        ResearchOutcome::Failed(error) => {
+            store.fail_scholar_job(job_id, &error.to_string())?;
             crate::diagnostics::event(
                 "scholar.job_failed",
-                serde_json::json!({"job_id": job.id, "error": error.to_string()}),
+                serde_json::json!({"job_id": job_id, "error": error.to_string()}),
             );
-            eprintln!("scholar recorded no result for job {}: {error}", job.id);
+            eprintln!("scholar recorded no result for job {job_id}: {error}");
+            (false, None)
         }
+    };
+    if persist_sources {
+        store.finish_scholar_job_with_evidence(job_id, &sources, note)?;
     }
     if let Some(task) = feedback {
-        let found = !store.scholar_findings(&job.id)?.is_empty();
+        let found = !store.scholar_findings(job_id)?.is_empty();
         store.finish_scholar_feedback(
             &task,
             found,
@@ -563,20 +708,19 @@ fn process_feedback_task_with(
     let mut attempt = extract(task);
     let finding = attempt.finding.take();
     let found = finding.is_some();
-    let relevance = finding
-        .as_ref()
-        .map(|finding| calibrate_research_relevance(&task.question, finding, &attempt.relevance))
-        .unwrap_or_else(|| "unknown".into());
+    let relevance = finding.as_ref().map_or_else(
+        || "unknown".into(),
+        |finding| calibrate_research_relevance(&task.question, finding, &attempt.relevance),
+    );
     store.finish_scholar_job_with_evidence(
         &task.job_id,
-        &[ScholarEvidence {
-            source_title: task.source_title.clone(),
-            source_url: task.source_url.clone(),
-            source_excerpt: task.source_excerpt.clone(),
+        &[ScholarEvidence::new(
+            task.source_title.clone(),
+            task.source_url.clone(),
+            task.source_excerpt.clone(),
             finding,
-            profile: ScholarSourceProfile::default(),
-            research_relevance: relevance,
-        }],
+            relevance,
+        )],
         Some(&attempt.reason),
     )?;
     store.finish_scholar_feedback(task, found, &attempt.reason)?;
@@ -734,15 +878,11 @@ fn process_discovered_candidates(
                 break;
             }
             if feedback_source_blocked(&candidate.url, &excluded_sources) {
-                store.record_scholar_candidate_fetch_result(
-                    candidate.id,
-                    "skipped",
+                let review = site_policy::CandidateReview::skipped(
                     "allowed",
-                    Some("source excluded by Curmudgeon feedback"),
-                    "skipped",
-                    None,
-                    None,
-                )?;
+                    "source excluded by Curmudgeon feedback",
+                );
+                store.record_scholar_candidate_fetch_result(candidate.id, &review)?;
                 crate::diagnostics::event(
                     "internet.page_review",
                     serde_json::json!({
@@ -767,15 +907,11 @@ fn process_discovered_candidates(
                 .as_ref()
                 .is_some_and(|host| existing_hosts.contains(&normalized_source_host(host)))
             {
-                store.record_scholar_candidate_fetch_result(
-                    candidate.id,
-                    "skipped",
+                let review = site_policy::CandidateReview::skipped(
                     "allowed",
-                    Some("host already supplied evidence for this claim"),
-                    "skipped",
-                    None,
-                    None,
-                )?;
+                    "host already supplied evidence for this claim",
+                );
+                store.record_scholar_candidate_fetch_result(candidate.id, &review)?;
                 continue;
             }
             if host.is_some_and(|host| !visited_hosts.insert(host)) {
@@ -791,15 +927,12 @@ fn process_discovered_candidates(
                 .as_deref()
                 .is_some_and(|url| feedback_source_blocked(url, &excluded_sources))
             {
-                store.record_scholar_candidate_fetch_result(
-                    candidate.id,
-                    "skipped",
+                let excluded = site_policy::CandidateReview::skipped_with_url(
                     "allowed",
-                    Some("redirected source excluded by Curmudgeon feedback"),
-                    "skipped",
-                    review.fetched_url.as_deref(),
-                    None,
-                )?;
+                    "redirected source excluded by Curmudgeon feedback",
+                    review.fetched_url.clone(),
+                );
+                store.record_scholar_candidate_fetch_result(candidate.id, &excluded)?;
                 crate::diagnostics::event(
                     "internet.page_review",
                     serde_json::json!({
@@ -810,15 +943,7 @@ fn process_discovered_candidates(
                 );
                 continue;
             }
-            store.record_scholar_candidate_fetch_result(
-                candidate.id,
-                review.status,
-                review.policy_status,
-                Some(&review.policy_reason),
-                review.fetch_status,
-                review.fetched_url.as_deref(),
-                review.excerpt.as_deref(),
-            )?;
+            store.record_scholar_candidate_fetch_result(candidate.id, &review)?;
             crate::diagnostics::event(
                 "internet.page_review",
                 serde_json::json!({
@@ -836,79 +961,69 @@ fn process_discovered_candidates(
             if let Some(provenance_json) = review.provenance_json.as_deref() {
                 store.record_scholar_candidate_provenance(candidate.id, provenance_json)?;
             }
-            if review.status == "fetched" {
-                if let (Some(source_url), Some(excerpt)) = (review.fetched_url, review.excerpt) {
-                    let mut accepted = None;
-                    for (index, passage) in review.passages.iter().enumerate() {
-                        let mut attempt = extract_scholar_claim_guided(
-                            question,
-                            &candidate.title,
-                            passage,
-                            "unknown",
-                            None,
-                            feedback.as_ref().map(|task| task.guidance.as_str()),
-                            model,
-                        );
-                        attempt.finding =
-                            select_finding(attempt.finding, expansion).filter(|finding| {
-                                crate::entities::matches_claim(
-                                    &names,
-                                    &finding.subject,
-                                    &finding.object,
-                                    &aliases,
-                                )
-                            });
-                        if let Some(target) = target {
-                            attempt.finding = attempt
-                                .finding
-                                .filter(|finding| finding_matches_target(finding, target));
-                        }
-                        if attempt.status == "accepted" && attempt.finding.is_none() {
-                            attempt.status = "filtered_expansion";
-                            attempt.reason = if target.is_some() {
-                                "extracted claim did not match the queued corroboration target"
-                                    .into()
-                            } else {
-                                "expansion question would repeat an encyclopedia summary".into()
-                            };
-                        }
-                        store.record_scholar_extraction_attempt(
-                            candidate.id,
-                            index + 1,
-                            passage,
-                            attempt.status,
-                            &attempt.reason,
-                            attempt.model_output.as_deref(),
-                        )?;
-                        if let Some(finding) = attempt.finding {
-                            let research_relevance = calibrate_research_relevance(
-                                question,
-                                &finding,
-                                &attempt.relevance,
-                            );
-                            accepted = Some(ScholarEvidence {
-                                source_title: candidate.title.clone(),
-                                source_url: source_url.clone(),
-                                source_excerpt: passage.clone(),
-                                finding: Some(finding),
-                                profile: ScholarSourceProfile::default(),
-                                research_relevance,
-                            });
-                            break;
-                        }
+            if review.status == "fetched"
+                && let (Some(source_url), Some(excerpt)) = (review.fetched_url, review.excerpt)
+            {
+                let mut accepted = None;
+                for (index, passage) in review.passages.iter().enumerate() {
+                    let mut attempt = extract_scholar_claim_guided(
+                        question,
+                        &candidate.title,
+                        passage,
+                        "unknown",
+                        None,
+                        feedback.as_ref().map(|task| task.guidance.as_str()),
+                        model,
+                    );
+                    attempt.finding =
+                        select_finding(attempt.finding, expansion).filter(|finding| {
+                            crate::entities::matches_claim(
+                                &names,
+                                &finding.subject,
+                                &finding.object,
+                                &aliases,
+                            )
+                        });
+                    if let Some(target) = target {
+                        attempt.finding = attempt
+                            .finding
+                            .filter(|finding| finding_matches_target(finding, target));
                     }
-                    let grounded = accepted.is_some();
-                    evidence.push(accepted.unwrap_or_else(|| ScholarEvidence {
-                        source_title: candidate.title,
-                        source_url,
-                        source_excerpt: excerpt,
-                        finding: None,
-                        profile: ScholarSourceProfile::default(),
-                        research_relevance: "unknown".into(),
-                    }));
-                    if grounded {
+                    if attempt.status == "accepted" && attempt.finding.is_none() {
+                        attempt.status = "filtered_expansion";
+                        attempt.reason = if target.is_some() {
+                            "extracted claim did not match the queued corroboration target".into()
+                        } else {
+                            "expansion question would repeat an encyclopedia summary".into()
+                        };
+                    }
+                    store.record_scholar_extraction_attempt(
+                        candidate.id,
+                        index + 1,
+                        passage,
+                        attempt.status,
+                        &attempt.reason,
+                        attempt.model_output.as_deref(),
+                    )?;
+                    if let Some(finding) = attempt.finding {
+                        let research_relevance =
+                            calibrate_research_relevance(question, &finding, &attempt.relevance);
+                        accepted = Some(ScholarEvidence::new(
+                            candidate.title.clone(),
+                            source_url.clone(),
+                            passage.clone(),
+                            Some(finding),
+                            research_relevance,
+                        ));
                         break;
                     }
+                }
+                let grounded = accepted.is_some();
+                evidence.push(accepted.unwrap_or_else(|| {
+                    ScholarEvidence::new(candidate.title, source_url, excerpt, None, "unknown")
+                }));
+                if grounded {
+                    break;
                 }
             }
         }
@@ -946,17 +1061,53 @@ fn feedback_source_blocked(value: &str, excluded: &[String]) -> bool {
     })
 }
 
-fn research(
+fn retain_wikipedia_source(
     store: &mut LearningStore,
     job_id: &str,
-    question: &str,
-    search_phrase: &str,
-    model: &mut LocalModel,
+    page: &SearchPage,
+    body: &str,
+    source_scope: &str,
+    query: &str,
+) -> io::Result<()> {
+    let Some(url) = page.fullurl.as_deref() else {
+        return Ok(());
+    };
+    store.retain_research_source_with_metadata(crate::storage::ResearchSourceInput {
+        job_id,
+        title: &page.title,
+        url,
+        body,
+        provider: "wikipedia",
+        source_scope,
+        query: Some(query),
+        published_at: page.revision_timestamp(),
+    })
+}
+
+struct ResearchRequest<'a> {
+    job_id: &'a str,
+    question: &'a str,
+    search_phrase: &'a str,
     expansion: bool,
-    guidance: Option<&str>,
-    excluded_sources: &[String],
-    names: &[String],
+    guidance: Option<&'a str>,
+    excluded_sources: &'a [String],
+    names: &'a [String],
+}
+
+fn research(
+    store: &mut LearningStore,
+    model: &mut LocalModel,
+    request: ResearchRequest<'_>,
 ) -> io::Result<Option<ResearchResult>> {
+    let ResearchRequest {
+        job_id,
+        question,
+        search_phrase,
+        expansion,
+        guidance,
+        excluded_sources,
+        names,
+    } = request;
     let response: SearchResponse = wikipedia_json_request(
         store,
         "wikipedia_search",
@@ -976,31 +1127,23 @@ fn research(
             ("gsrsearch", search_phrase.to_owned()),
         ],
     )
-    .and_then(|json| {
-        serde_json::from_value(json)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    })?;
+    .and_then(decode_wikipedia_response::<SearchResponse>)?;
     let Some(mut pages) = response.query.map(|query| query.pages) else {
         return Ok(None);
     };
     pages.sort_by_key(|page| page.index);
     for page in &pages {
-        if let (Some(url), Some(excerpt)) = (page.fullurl.as_deref(), page.extract.as_deref()) {
-            if url.starts_with("https://en.wikipedia.org/wiki/") {
-                store.retain_research_source_with_metadata(
-                    job_id,
-                    &page.title,
-                    url,
-                    excerpt,
-                    "wikipedia",
-                    "lead_extract_excerpt",
-                    Some(search_phrase),
-                    page.revisions
-                        .as_ref()
-                        .and_then(|revisions| revisions.first())
-                        .and_then(|revision| revision.timestamp.as_deref()),
-                )?;
-            }
+        if let (Some(url), Some(excerpt)) = (page.fullurl.as_deref(), page.extract.as_deref())
+            && url.starts_with("https://en.wikipedia.org/wiki/")
+        {
+            retain_wikipedia_source(
+                store,
+                job_id,
+                page,
+                excerpt,
+                "lead_extract_excerpt",
+                search_phrase,
+            )?;
         }
     }
     let mut candidates = pages
@@ -1020,26 +1163,16 @@ fn research(
                     .as_deref()
                     .is_some_and(|text| !text.trim().is_empty())
                 && (names.is_empty()
+                    || matches_named_page_title(&page.title, names)
                     || names.iter().any(|name| {
-                        page.title.eq_ignore_ascii_case(name)
-                            || page
-                                .title
-                                .to_lowercase()
-                                .starts_with(&format!("{} (", name.to_lowercase()))
-                            || page.extract.as_deref().is_some_and(|excerpt| {
-                                excerpt.to_lowercase().contains(&name.to_lowercase())
-                            })
+                        page.extract.as_deref().is_some_and(|excerpt| {
+                            excerpt.to_lowercase().contains(&name.to_lowercase())
+                        })
                     }))
                 && (relevant_page(question, page) || relevant_page(search_phrase, page))
         })
         .map(|page| {
-            let named_title = names.iter().any(|name| {
-                page.title.eq_ignore_ascii_case(name)
-                    || page
-                        .title
-                        .to_lowercase()
-                        .starts_with(&format!("{} (", name.to_lowercase()))
-            });
+            let named_title = matches_named_page_title(&page.title, names);
             let score = page_relevance_score(question, &page) + if named_title { 1000 } else { 0 };
             let excerpt = relevant_passages(question, page.extract.as_deref().unwrap_or_default());
             (score, page, excerpt)
@@ -1067,15 +1200,11 @@ fn research(
             ("formatversion", "2".into()),
         ],
     )
-    .and_then(|json| {
-        serde_json::from_value(json)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    })?;
+    .and_then(decode_wikipedia_response::<ParsedPageResponse>)?;
     let available_sections = section_response
         .parse
         .as_ref()
-        .map(|parsed| &parsed.sections[..])
-        .unwrap_or(&[]);
+        .map_or(&[][..], |parsed| &parsed.sections[..]);
     let section_titles = available_sections
         .iter()
         .take(60)
@@ -1128,10 +1257,7 @@ fn research(
                 ("formatversion", "2".into()),
             ],
         )
-        .and_then(|json| {
-            serde_json::from_value(json)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-        })?;
+        .and_then(decode_wikipedia_response::<ParsedPageResponse>)?;
         let section_text = parsed
             .parse
             .as_ref()
@@ -1143,21 +1269,14 @@ fn research(
         let Some(section_text) = section_text else {
             continue;
         };
-        if let Some(url) = page.fullurl.as_deref() {
-            store.retain_research_source_with_metadata(
-                job_id,
-                &page.title,
-                url,
-                &section_text,
-                "wikipedia",
-                "selected_section",
-                Some(question),
-                page.revisions
-                    .as_ref()
-                    .and_then(|revisions| revisions.first())
-                    .and_then(|revision| revision.timestamp.as_deref()),
-            )?;
-        }
+        retain_wikipedia_source(
+            store,
+            job_id,
+            &page,
+            &section_text,
+            "selected_section",
+            question,
+        )?;
         let section_text = section_text
             .chars()
             .take(MAX_PARSED_ARTICLE_CHARS)
@@ -1173,11 +1292,7 @@ fn research(
     } else {
         section_passages.join("\n\n")
     };
-    let source_updated_at = page
-        .revisions
-        .as_ref()
-        .and_then(|revisions| revisions.first())
-        .and_then(|revision| revision.timestamp.clone());
+    let source_updated_at = page.revision_timestamp().map(str::to_owned);
     let mut attempt = extract_scholar_claim_guided(
         question,
         &page.title,
@@ -1212,11 +1327,7 @@ fn research(
         .unwrap_or(attempt.relevance);
     if finding.is_none() {
         for (_, alternative_page, alternative_excerpt) in candidates.take(2) {
-            let alternative_updated_at = alternative_page
-                .revisions
-                .as_ref()
-                .and_then(|revisions| revisions.first())
-                .and_then(|revision| revision.timestamp.clone());
+            let alternative_updated_at = alternative_page.revision_timestamp().map(str::to_owned);
             let mut alternative_attempt = extract_scholar_claim_guided(
                 question,
                 &alternative_page.title,
@@ -1273,8 +1384,12 @@ fn relevant_page(question: &str, page: &SearchPage) -> bool {
     hits >= terms.len().min(2)
 }
 
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
+fn matches_named_page_title(title: &str, names: &[String]) -> bool {
+    let normalized_title = title.to_lowercase();
+    names.iter().any(|name| {
+        title.eq_ignore_ascii_case(name)
+            || normalized_title.starts_with(&format!("{} (", name.to_lowercase()))
+    })
 }
 
 #[cfg(test)]

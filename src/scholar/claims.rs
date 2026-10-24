@@ -63,6 +63,7 @@ pub(super) fn select_finding(
     extracted.filter(|claim| !expansion || claim.relation != "has encyclopedia summary")
 }
 
+#[cfg(test)]
 pub(super) fn claim_is_grounded(
     subject: &str,
     relation: &str,
