@@ -1,6 +1,6 @@
 # Autonomous Knowledge Maintenance
 
-**Status:** implemented and verified (SQLite schema 19)
+**Status:** implemented and verified (SQLite schema 63)
 
 This document describes what happens after Community starts, what the current
 autonomous loop can change, and the remaining work to make unattended

@@ -1,9 +1,47 @@
-# Community Lab
+# Lyra
 
 One local multi-agent chatbot in Rust, supporting original **BF16 Qwen3 and
 Qwen3.5** checkpoints on Apple Metal. A persistent local MLX worker runs Qwen3.5's hybrid attention model;
 Rust handles conversations, research, grounding, AI review, logging, and storage.
 No hosted inference service is required. The legacy Qwen3 backend uses Candle.
+
+## How the system works
+
+Lyra keeps conversation, research, review, and learning as separate steps so a
+useful answer does not turn an uncertain interpretation into stored knowledge.
+
+| Part | Responsibility |
+| --- | --- |
+| Interaction | Answers the current turn using the user's full session history and relevant context. Chat, one-shot replies, and browser sessions share the same reply services. |
+| Knowledge map | `state/knowledge.json` holds manually learned, editable relationships. These remain user-reported information and are not treated as verified facts. |
+| Research ledger | `state/learning.db` stores source archives, extracted findings, exact evidence, review decisions, conflicts, jobs, and maintenance history. Migrations preserve prior records. |
+| Scholar | Searches configured providers, checks page policy, retains source passages, extracts candidate claims, and requests semantic and source review. Provider quotas and retry state are persisted. |
+| Curmudgeon | Reviews claims and source relationships, checks assistant statements against retained knowledge, and leaves unresolved assessments explicit. It cannot bypass storage promotion rules. |
+| Scout | Turns unanswered details and reviewed knowledge gaps into bounded research jobs. It prioritizes current conversation questions and avoids personal facts. |
+| Curator | Extracts claims from user observations and routes uncertain candidates for review. User reports remain distinct from externally sourced claims. |
+| Maintenance | Runs Curator, Curmudgeon, Scout, and Scholar during quiet time. It records each role's outcome and keeps foreground replies ahead of background work. |
+| Model runtime | Routes agent requests to local Candle or MLX backends, with separate foreground and maintenance lanes, caches, and process locks. |
+
+For a factual request, Interaction checks the conversation and existing
+evidence, then queues bounded research when a relevant public fact is missing.
+Scholar retains the fetched passage before evaluating an extracted claim.
+Semantic review checks whether the claim follows from that passage; source,
+provenance, conflict, and corroboration gates remain separate. Accepted research
+can support an answer, while automatic promotion to the durable claim ledger
+requires its own evidence gates. The answer keeps its source attribution and
+scope. If evidence is incomplete or disputed, Lyra reports the gap or gives a
+qualified partial answer.
+
+Ordinary conversational replies are delivered before advisory quality audits
+run during maintenance. Those audits can inform later review but cannot rewrite
+the reply or verify a factual claim. Assistant statements, user observations,
+source-backed findings, and manually edited map entries keep distinct origins
+and review states. Rejected or uncertain outcomes remain recorded rather than
+being approved by a fallback.
+
+The current work list is [nextSteps.txt](nextSteps.txt). This README is the
+system and operator guide; the linked documents below provide detailed
+component references, dated validation evidence, and historical design notes.
 
 ## Set up the model
 
@@ -41,21 +79,23 @@ records conversation migration and measured results. The knowledge map and
 SQLite research database remain shared. Context exhaustion returns an error;
 it does not silently discard conversation history.
 
+### Model runtime
+
 `model.loaded` logs backend, precision, shard count, context cap, template,
 device, and adapter selection. Agents use lazy model handles. Background upkeep
-and foreground chat have separate warm model caches and request locks, so an
-upkeep generation already in progress cannot block a chat turn. Each lane is
-serialized internally; the background lock is derived from `COMMUNITY_MODEL_LOCK`
+waits throughout foreground replies and for two idle minutes afterward. Its
+separate warm cache and request lock mean an upkeep generation already in
+progress cannot block chat. Each lane is serialized internally; the background
+lock is derived from `COMMUNITY_MODEL_LOCK`
 (default `state/model-inference.lock`) with `.requests` appended, while chat uses
 `.chat.requests`. A waiting process emits `model.waiting_for_lease`, and
 `model.request_wait` records quiet-window, local-pool, and process-lock waiting.
 `agent.inference` records agent/model identity, duration, and visible token usage
 where available, without prompt contents. Models remain cached up to
-`COMMUNITY_MODEL_CACHE_SIZE` (default 1) per lane. The browser server and its
-background curator keep separate long-lived runtimes, so the same checkpoint
-may be resident twice. Agents with matching checkpoint, adapter, and device
-assignments share a backend within a lane. Restart running processes to pick up
-adapter changes.
+`COMMUNITY_MODEL_CACHE_SIZE` (default 1) per lane. Foreground and background
+lanes have separate caches, so the same checkpoint may be resident twice.
+Agents with matching checkpoint, adapter, and device assignments share a
+backend within a lane. Restart running processes to pick up adapter changes.
 
 For per-agent configuration, the 0.6B/2B MacBook profile, measured memory
 constraints, and cache limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
@@ -133,10 +173,11 @@ cargo run --release -- serve
 ```
 
 The server accepts connections only on a loopback address. It loads Interaction
-at startup and keeps the shared model runtime alive between turns. Background
-maintenance runs in a thread using that same runtime and cache. Each browser tab
-gets a separate conversation
-history under `state/web-sessions/`. Reloading a tab keeps its session; a new
+at startup and keeps the model runtime alive between turns. Background
+maintenance uses the same model assignments. See [Model runtime](#model-runtime)
+for the cache, lock and startup grace-period behavior.
+Each browser tab gets a separate conversation history under
+`state/web-sessions/`. Reloading a tab keeps its session; a new
 tab or **Start a new conversation** begins a fresh history. Learned knowledge
 is shared across sessions. Topic changes do not clear the session history;
 Lyra keeps earlier turns available for later clarifications and corrections.
@@ -145,10 +186,6 @@ use; non-loopback addresses are rejected.
 
 Starting a new browser conversation keeps the previous session file in place.
 Archives created by older automatic topic resets also remain intact.
-Background inference yields throughout each browser reply and for two idle
-minutes afterward; startup provides the same grace period. An inference already
-in progress must finish before chat can use the shared backend.
-
 Reply diagnostics include `conversation.context_selected` with the retrieved
 claim and finding IDs. Ordinary replies are generated by Lyra; conversational
 quality audits run afterward during upkeep and record advisory verdicts in the
@@ -235,8 +272,9 @@ and parent/subsidiary relationships do not establish identity. Links require exp
 as”. They are direct, without transitive merging. Multiple known identities
 for the same name and context-dependent identities remain unresolved.
 Source-linked aliases stop applying when their finding is rejected or its
-promoted claim is retracted. SQLite schema 44 retains lookup plans and alias
-provenance; existing claims are not rewritten or bulk-merged.
+promoted claim is retracted. Migration 44 introduced retained lookup plans and
+alias provenance; later migrations preserve them. Existing claims are not
+rewritten or bulk-merged.
 
 Unanswered public questions such as "What crisp flavours do you know?" trigger
 research even when phrased conversationally. The newest queued conversation
@@ -588,8 +626,11 @@ Chat and `say` save every user input as a pending observation in
 from the same conversation are included as user-reported context; the latest
 input remains the final prompt message. Repeating an input for the same
 conversation turn after a failure reuses its observation. The `chat` command
-starts one asynchronous curator thread that shares the model cache and extracts
-claims with source evidence. A second AI reviewer assesses flagged extractions;
+starts a background maintenance worker for Curator, Curmudgeon, Scout, and
+Scholar. It prioritizes pending conversation research, then runs bounded role
+work in the recorded pass order. It uses the separate background model lane
+described in [Model runtime](#model-runtime). Curator extracts claims with source
+evidence. A second AI reviewer assesses flagged extractions;
 acceptance still requires the 0.95 confidence threshold, exact evidence, valid
 dates, and conflict checks. Curmudgeon resolves any remaining candidate
 conflicts through a separate AI review. Failed model reviews are logged and

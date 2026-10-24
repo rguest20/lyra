@@ -1,7 +1,7 @@
 # Rust File Guide
 
 A brief map of the Rust source files in this repository. Each entry says what
-that file is for and, in short, how it does the work. The list covers the 40
+that file is for and, in short, how it does the work. The list covers the 94
 `.rs` files under `src/`.
 
 ## Application and conversation
@@ -10,8 +10,10 @@ that file is for and, in short, how it does the work. The list covers the 40
 | --- | --- |
 | `src/main.rs` | Starts the program. It declares the application modules, builds the CLI configuration, and dispatches the requested command. |
 | `src/agent.rs` | Runs Lyra’s conversation turn. It assembles the system prompt, conversation history, relevant map evidence, generates a reply, and records durable work that other roles can process. |
-| `src/inference.rs` | Loads and runs the local Qwen model. It tokenizes and generates text with Candle, manages the small trainable adapter, and handles model checkpoint updates. |
+| `src/inference.rs` | Loads and runs the Candle and MLX Qwen backends, manages adapters, and handles model checkpoint updates. See [Model runtime](../README.md#model-runtime) for backend routing, caches, and request lanes. |
 | `src/knowledge.rs` | Represents the editable semantic map. It validates, reads, writes, revises, and retracts sourced claims in the map file. |
+| `src/errors.rs` | Provides the shared `InvalidData` error constructor used by parsing and validation boundaries. |
+| `src/test_support.rs` | Provides unique temporary paths and shared answer-evidence fixtures for tests, keeping repeated setup consistent. |
 | `src/web.rs` | Serves the browser chat UI on a loopback address. It handles HTTP requests and starts bounded maintenance work when chats, timers, or completed passes call for it. |
 
 ## Command-line interface

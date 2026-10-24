@@ -906,3 +906,96 @@ test server also exposed a shutdown wait while upkeep was paused; interruptible
 shutdown is recorded in the runtime roadmap. Prior failed replay logs and session
 archives remain intact. Stale resident locks from stopped test processes were
 removed without touching the live runtime's locks.
+
+### Partial-answer review and retained failures — 15 October
+
+The latest ordinary source-backed reply changes keep review rationales out of
+rewrites and present evidence limits as source guidance rather than internal
+status labels. Rewrites retain the prior user-facing draft as fallible context.
+This improves direct answers but has not eliminated irrelevant caveats or
+repeated conclusions. Source guidance remains data and cannot override policy.
+
+The ambiguous-title replay `part1-grounding-2026-10-15m` preserved the exact
+passage and acknowledged that item boundaries were unresolved. Subsequent code
+review found that this final recovery could bypass semantic review. Two new
+regressions reproduced that gap before its fix. The source-literal candidate now
+requires a separate structured useful-partial assessment. Rejected, malformed,
+or uncertain assessments leave the answer unresolved. Review validates a
+nonempty rationale and exact nonempty answer/source quotations, applies
+source-state policy, and masks source URLs so their paths cannot act as evidence.
+These are review-contract checks, not deterministic proofs of semantic quality.
+
+A newly added repeated-conjunction shape heuristic was removed during cleanup.
+It inferred too much about human meaning from a narrow token pattern. Shortened
+names instead rely on semantic review; a regression verifies that a semantic
+rejection produces a fresh reviewed answer. This does not prove the local model
+will identify every such error. The archived shortening failure remains useful
+adversarial evidence. Older literal restructuring/name/causality guards remain
+explicit follow-up work, including their false-rejection risk.
+
+An uncertain ordinary answer review can also trigger this bounded assessment.
+It independently checks whether all factual assertions are supported or
+attributed, useful information addresses the request, and unresolved conclusions
+remain explicit. It authorizes conversational delivery only; it cannot promote
+claims or establish source independence. Review prompts distinguish confidence
+in answer acceptability from uncertainty of the subject. Temporal classification
+now explicitly separates request intent from ability to supply its factual answer.
+
+The `part1-grounding-2026-10-15q` BF16 run reached both conflicting dates with an
+explicit unresolved conclusion, but repeated itself under unnecessary headings.
+It then timed out at 600 seconds during the extra partial review, without a
+completed answer. The runner stopped its process group and no fixture worker
+remained. This is a retained failure, not a pass. The configured BF16 browser
+server was left running. The live test findings do not establish that model
+contention caused the timeout.
+
+The full Rust suite passed 446 tests; 65 focused reply tests subsequently passed
+after the final-review policy/masking changes. A development build succeeds with
+the existing three dead-code warnings. The independent blind benchmark and the
+ordinary-dialogue acceptance gate remain open; same-model reviews and mocked
+orchestration tests do not satisfy them.
+
+The `15r` production-lock replay was deliberately interrupted without a completed
+sample, retaining an `interruption.json` record and its raw traces. Some request
+waits exceeded two minutes while inference itself took about twenty seconds.
+The stopped fixture's resident marker was removed after confirming its process
+had exited. During the separate chatbot replay, process samples showed the web
+thread waiting for an MLX response and the background thread inside an already
+started Scholar harvest. They did not show the web thread waiting for upkeep's
+Rust pool lock. The samples are archived alongside `15r`; this does not establish
+which hardware/resource effect accounts for all latency.
+
+A full-suite run during active chat also exposed test isolation, not a scheduling
+regression: the chat-priority test isolated only its background request lock and
+could block on the live application's chat lock. Both test locks are now private.
+The subsequent full run passed all 446 tests while the dialogue replay continued.
+
+The dialogue replay then exposed an input-provenance failure. Asked to draft an
+introduction using supplied details and placeholders, Lyra converted its own
+research advice into an unsupported claim that the user had already researched
+the role. It also claimed to have used placeholders when its preceding answer
+contained none. The code turn supplied the correct example but added a false
+limitation based on the preceding interview topic. The raw conversation remains
+in `state/part1-dialogue-replay-2026-10-15.json`. A shared context-use policy now
+keeps supplied facts distinct from assistant suggestions/examples in both
+conversation and task prompts, and limits earlier constraints to their actual
+scope. A wiring regression preserves original speaker roles. These prompt
+changes are not yet demonstrated semantic fixes.
+
+The final dialogue turn answered the library question but queued an unrelated
+combined research objective about both code and placeholders. Inspection found
+the phrase-matching follow-up helper appending the previous two user questions.
+That helper is removed. The existing intent pass now emits a bounded standalone
+request along with its routing decision, preserving role/context data and
+repairing incomplete output once. Source-check intent uses the original message
+and context separately so request rewriting cannot waive explicit verification.
+The schema and orchestration regressions do not prove semantic resolution quality.
+
+Final validation passes **450 Rust tests**, three Python fixture-runner tests,
+formatting and whitespace checks, and the release build. Two additional test
+isolation issues were corrected without changing production policy: checkpoint
+fixture directories now have a counter as well as a timestamp, and database
+fixture filenames resist stale files after PID reuse. The live browser service
+was left running on its earlier build at the user's request to wrap up; no
+post-change dialogue or full benchmark pass is claimed. Restart it and replay
+the retained failures before treating the context/intent changes as verified.

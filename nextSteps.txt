@@ -1,455 +1,60 @@
-LYRA — NEXT STEPS
-Working plan, updated 15 October 2026
+LYRA — CURRENT TASKS
+Updated 24 October 2026
 
-This document sets direction; unchecked items are proposed work, not completed
-features. Implementation should proceed in small, reviewable steps.
+Lyra should understand requests, give useful grounded answers, and learn without
+turning uncertain interpretations into established knowledge. Unchecked work is
+proposed, not implemented capability. Preserve original requests, retained
+source evidence, attribution, scope, review history, and unresolved outcomes.
 
-Overall aim
-Help Lyra understand requests, give useful grounded answers, and learn without
-turning uncertain interpretations or unverified material into settled knowledge.
+1. Finish grounding acceptance
 
-Working principles
-- Keep solutions agnostic across topics; avoid patches for individual phrases.
-- Use contextual model judgments for human meaning. Multiple bounded model
-  passes are preferable to maintained runtime word lists. Keep wording examples
-  in tests; enforce schemas, verdict handling and review requirements in code.
-- A failed, uncertain or disputed semantic assessment remains unresolved after
-  bounded repair/review attempts; do not substitute a keyword-based verdict.
-- Preserve original user messages, source evidence, uncertainty and review history.
-- Attempt constructive tasks, then research specific gaps when needed.
-- Judge whether another investigation would materially improve the conversation;
-  recognise when to continue, reconsider the objective, answer or stop unresolved.
-- Keep code focused and reasonably sized; consolidate overlapping responsibilities.
-- Measure improvements against retained failures and fresh, unrelated scenarios.
-- Keep model training and scaling behind the grounding acceptance benchmark.
+- [ ] Obtain independent judgments for the nine fixed benchmark cases and the
+  16 cross-domain cases. Keep the blinded packets and raw outputs unchanged.
+- [ ] Replay the current source-reference extraction candidate on the fixed
+  nine-case corpus, all cross-domain fixtures, and retained multi-turn failures.
+  Review assertion-level support, useful partial answers, unnecessary
+  abstentions, shared-model errors, repair counts, and latency.
+- [ ] Continue conversation-quality review after delivery, including
+  corrections, challenges, constructive tasks, knowledge gaps, and research
+  follow-ups. These audits remain advisory and separate from factual review.
+- Keep training and scaling gated until this benchmark passes. Unit tests and
+  same-model review do not establish semantic acceptance.
 
+2. Continue investigation judgment
 
-1. FINISH GROUNDING AND TIDY-UP
+- Preserve the original request and conversation context separately from any
+  resolved research objective. Track answer coverage, concrete gaps, progress,
+  useful partial answers, and why another investigation would help or stop.
+- Keep bounded retry, quota, and parking limits. A failed attempt is not a
+  semantic verdict; unresolved outcomes stay explicit.
+- Use existing agents and orchestration first. Do not add a model role or call
+  solely to match a proposed architecture.
 
-Goal: useful, properly attributed answers across varied topics and conversations.
+3. Continue code simplification after candidate evaluation
 
-Already exercised
-- [x] Repeat the final museum case and expand the candidate across new domains
-  and the unchanged nine-case benchmark; retain results, including failures.
-  Latest live fixture replays also retained the negative experiment, island
-  scope and Clark Kent/Superman identity across unrelated domains.
-- [x] Split large Rust modules by responsibility while preserving regression
-  coverage. Continue this practice as later work changes the code.
-- [x] Replace natural-language evidence-limit strings with compact qualification
-  codes, and keep failed answer drafts out of repair prompts. Add regressions
-  against instruction leakage and retain the failing cross-domain examples.
-- [x] Keep claims with opposite polarity when they address the same yes/no
-  property, and retain differing source values so answers can state conflicts.
-- [x] Keep initial model thinking for inspection while using a no-thinking,
-  fresh-context rewrite when the answer leaks private process commentary.
-- [x] Keep qualification metadata structured and separate from evidence text;
-  do not let evidence-carried free text become answer instructions.
-- [x] Retain competing source values for a requested property and preserve
-  negative claims for yes/no questions so the answer can report disagreement.
-- [x] Keep evaluation scope metadata out of the retrieval question and add a
-  conservative lexical property fallback when model extraction is unusable.
-- [x] Match freshness and sensitivity terms at token boundaries, with common
-  inflections and regressions against accidental substring matches.
+- Steps 1–7 of the simplification review are implemented. The latest candidate
+  removes source-reference phrase rewriting from extraction; its live replays
+  and independent judgments remain pending.
+- Revisit semantic interpretation only with retained before/after evidence.
+  Keep language meaning contextual and model-assessed; keep schemas, evidence
+  identity, provenance, allowed states, resource limits, and review gates
+  deterministic.
+- Preserve SQLite migration history, stored source bytes and hashes, exact quote
+  offsets, claim qualifications, job state, and public CLI/browser contracts.
 
-- [ ] Finish grounding answers in ordinary generated dialogue before starting
-  Phase 2. Ordinary conversation-quality audits now run after delivery during
-  upkeep; source-backed answer review and knowledge-promotion gates stay in
-  place. Fresh conversation replays still need adjudication for redundant
-  narration, unsupported scope and unnecessary abstention. Cover corrections,
-  challenges, task attempts, knowledge gaps and research follow-ups.
-- [ ] Complete assertion-level answer review and an independently adjudicated
-  grounding benchmark. Check each answer claim against its evidence, retain the
-  fixed nine-case and unrelated-domain fixtures, and measure unsupported claims,
-  unnecessary abstentions, shared-model errors and latency. Unit tests alone do
-  not establish acceptance.
+4. Defer gated architecture and training proposals
 
-Later follow-up (does not block Phase 2)
-- [ ] Reconcile conflict metadata for semantically equivalent claims with
-  different extracted relation/object shapes. Review candidate links between
-  unverified findings and active claims, testing paraphrases, scope changes and
-  real contradictions without merging distinct claims.
-- [ ] Expand freshness and consequential-claim review. Replace remaining
-  promotion-policy word lists with structured risk and time-scope judgments;
-  preserve required review for medical, legal and financial claims.
-- [ ] Finish removing runtime language-meaning lists and remaining personal-fact
-  or currentness heuristics. Use contextual judgments, bounded repair and
-  adversarial evaluation; keep phrase variants in tests rather than runtime
-  policy.
-- [ ] Measure extra model passes for benefit, false rejections, shared-model
-  blind spots and latency. Agreement by the same model is not independent
-  corroboration.
-- [ ] Independently adjudicate museum/currentness behavior across more topics
-  and question forms, and broaden live conversation replays beyond the Phase 2
-  grounding gate.
-- [ ] Investigate and improve personal-fact context retention beyond the
-  telescope correction and pronoun regression.
-- [ ] Implement the learning-from-observed-mistakes workflow: record sufficient
-  context and versions, flag suspected mistakes provisionally, review factual
-  corrections and interpretation lessons separately, preserve provenance and
-  rollback, then replay unrelated/adversarial failures to measure recurrence.
+- Evaluate a single knowledge authority, inference ownership changes, async
+  orchestration, new interpretation roles, and broader adapters only with the
+  compatibility, benchmark, latency, and rollback evidence specified in the
+  detailed plans. None is implied by the cleanup work.
 
-Completed in Phase 1
-- [x] Keep conversation context within the user-selected session. Inferred topic
-  changes no longer archive and clear history; the browser's explicit new-chat
-  action supplies a fresh session. A live failure incorrectly reset on a
-  clarification request; persistence/prompt regressions retain mixed-topic
-  dialogue across follow-ups and model changes.
-- [x] Generate ordinary replies through Lyra's Interaction backend using the
-  full dialogue. Remove the separate acknowledgment generator that used
-  Curmudgeon and could misroute clarification or task requests. Remove the
-  literal repeated-answer retry, which could also retry an intentional restatement.
-- [x] Include source instructions and source fields in ordinary task prompts
-  only when evidence is supplied; include user-statement guidance only when
-  reports are supplied. Live advice and clarification now answer in context
-  without discussing an empty source basket or invoking a style-review refusal.
-- [x] Exercise conflicting start dates and a two-year population comparison
-  through the live fixture path, retaining successful and failed replays.
-  Both census values stay attached to their dates; conflict narration remains
-  unstable and requires the blocker work above.
-- [x] Stop interpreting different relation strings as proof of different
-  properties. Schema 63 reopens links made by the old lexical rule as unresolved
-  while preserving model-reviewed relationships, claims and promotion gates.
-- [x] Assess present-state and latest-knowledge needs as separate model
-  judgments. Fixed-date population and present museum requests now route
-  appropriately in production-path replays; ambiguity and broader accuracy
-  remain later evaluation work.
-- [x] Repair bounded answer-review orchestration and stale model-double calls.
-  Reviewers share grounding policy; disagreement triggers a fresh answer and
-  final review, never approval of a rejected draft.
-- [x] Keep source relationship metadata and free-form curation rationale out
-  of ordinary answer generation and entailment review; include relationship
-  metadata only for source-independence requests.
-- [x] Correct conflict-answer policy to report attributed accounts, leave
-  unresolved what evidence does not decide, and explain scope only when sources
-  support it. A live conflict replay returns both dates and passes review.
-- [x] Remove irrelevant independence and limitation commentary from population
-  answers, and add one bounded extra evidence-checked repair after reviewer
-  disagreement. Some redundant summary narration remains in follow-up work.
-- [x] Remove the source-list parser's topic/cue fallback; route list claims
-  through extraction, entailment review and bounded repair.
-- [x] Replace uncertainty, polarity and plurality phrase checks in semantic
-  support with a separate adversarial review against the original passage;
-  malformed reviews remain unresolved.
-- [x] Retain fixed nine-case and unrelated-domain fixtures with archived runs.
-- [x] Re-run museum/currentness fixture and preserve a useful historical partial
-  answer when the source cannot establish current status.
-- [x] Fix possessive named-entity misattribution in curation and verify that a
-  correction updates the telescope fact used by a pronoun follow-up.
+The original code-simplification review and dated progress records are retained
+as historical references. They record completed work, deferred options, raw
+benchmark limits, and why the remaining acceptance gates stay closed.
 
-Learning from observed mistakes (later work)
-- [ ] Record the original request and conversation context, retrieved evidence,
-  answer, model/review versions and structured review decisions for diagnosis.
-- [ ] Flag suspected mistakes from user corrections, reviewer disagreement and
-  recurring evaluation failures. Keep suspicions provisional; neither a user
-  correction nor a reviewer verdict alone establishes an external fact.
-- [ ] Distinguish factual corrections from interpretation lessons. Correct or
-  challenge factual claims with sources and scope while retaining prior versions.
-  Store reviewed interpretation lessons separately from world-fact claims, with
-  the failure context, corrected judgment and a general explanation of the error.
-- [ ] Review proposed lessons before making them eligible for retrieval. Preserve
-  provenance, approval state, versions and rollback; rejected assistant drafts
-  and unreviewed critiques must never become supporting factual evidence.
-- [ ] Retrieve relevant approved lessons during interpretation and answer review.
-  Treat them as contextual guidance, subject to current evidence and enforced
-  system policy; do not turn examples into runtime phrase rules or silently
-  change model weights.
-- [ ] Replay each retained failure alongside unrelated and adversarial examples
-  after a lesson update. Measure error recurrence, unnecessary abstention,
-  regressions and latency, including whether the lesson was retrieved and used.
-  Revise or withdraw lessons that generalize poorly.
-
-Phase 2 entry gate
-Complete the two blocker items above with fresh, independently adjudicated runs:
-Lyra should answer the useful supported part, identify what remains unknown,
-preserve attribution and scope, and avoid replacing the request with nearby facts.
-Measure unsupported answers and unnecessary abstentions. Later follow-up work can
-continue alongside Phase 2.
-
-
-2. BUILD INVESTIGATION JUDGEMENT
-
-Goal: distinguish "I need better evidence", "I need to reconsider the question"
-and "I have learned enough to have a useful conversation about this".
-
-Priority and scope
-Build this alongside the remaining grounding work, before expanding agent roles,
-adding Tokio, or experimenting with broader adapters. Start with the existing
-agents and a small investigation controller in ordinary orchestration code.
-Introducing Lens is not a prerequisite. Essential runtime fault repairs can
-proceed when they are needed to exercise this work reliably.
-
-Role boundaries
-- Lens, when introduced, interprets the user's purpose and what a useful answer
-  would achieve. Initially use the existing conversation and intent machinery.
-- Scholar reports evidence coverage, concrete remaining gaps, progress and
-  promising next investigations.
-- Curmudgeon challenges support, attribution, qualifications and scope. Rejecting
-  a claim does not establish that it is false or automatically require more research.
-- The investigation controller owns the final decision, combining structured
-  assessments with deterministic evidence policy and hard resource limits.
-  It does not need to become another model agent.
-
-Decision outcomes
-- Continue: a specific missing fact matters and there is a plausible route to it.
-- Reconsider the objective: the target is unsuitable, ambiguous or depends on an
-  unsupported assumption. Refine the investigation while preserving user intent.
-- Return a useful answer: enough is known to address the user's purpose, with
-  remaining uncertainty, provisional evidence and subjective preferences explicit.
-- Stop unresolved: a material gap remains, but another investigation currently
-  has little prospect of resolving it. State the gap and why work stopped.
-
-Work to plan and implement
-- [ ] Preserve the original request separately from the current research objective,
-  factual prerequisites and the description of what would make an answer useful.
-- [ ] Assess the objective before research starts and reassess after meaningful
-  results, rejected evidence, repeated failures or a user correction.
-- [ ] Track answer coverage, material remaining gaps and progress across attempts.
-  Separate missing evidence from search failures, extraction failures and an
-  unsuitable objective; repeated rejection alone cannot diagnose the cause.
-- [ ] Require a proposed continuation to explain what it will do differently,
-  which gap it could resolve and how that would improve the answer.
-- [ ] Allow useful partial answers before every possible uncertainty is resolved.
-  Adequacy for a conversation is separate from verification of individual claims.
-- [ ] Keep explicit user requests to check sources in the objective. A plausible
-  draft cannot count as having performed the requested verification.
-- [ ] Make material reframing visible; ask for clarification when it would change
-  the user's purpose. Do not silently substitute an easier, unrelated question.
-- [ ] Keep quotas, retry limits and parking as hard ceilings. A budget stop must
-  remain distinguishable from "enough learned" or "no promising next step".
-- [ ] Bound reconsideration itself so reframing cannot create an endless loop.
-- [ ] Persist decisions, reasons, gaps and proposed next actions as investigation
-  history, separate from source evidence and factual claim confidence.
-- [ ] Define when new evidence, changed scope or an explicit user request can
-  reopen a stopped investigation without repeating an unchanged plan.
-- [ ] Prefer reusing existing assessments over adding several model calls for
-  every message. Consolidate overlapping decision logic as it becomes clear.
-
-Evaluation cases
-- [ ] A recommendation needs available options and relevant characteristics, not
-  evidence of an objective preference winner. Once enough options are known,
-  Lyra can discuss preferences honestly. Include food and unrelated domains.
-- [ ] A precise factual gap has a promising untried source, so research continues.
-- [ ] Irrelevant search results lead to a better search strategy, while malformed
-  extraction leads to bounded repair rather than a conclusion about truth.
-- [ ] A flawed or ambiguous objective prompts reconsideration or clarification.
-- [ ] Partial or conflicting evidence supports a qualified conversation while
-  preserving unresolved dates, scopes and disagreements.
-- [ ] Repeated equivalent sources yield no new coverage, so work stops unresolved
-  rather than treating repetition as corroboration.
-- [ ] An explicit verification request is attempted or reported as incomplete.
-- [ ] Exhausted budgets and reconsideration limits stop work without manufacturing
-  a conclusion, suppressing important uncertainty or losing the original request.
-
-Acceptance
-Retained cross-topic runs demonstrate justified continuation, reconsideration,
-useful answers and unresolved stops. Neither indiscriminate research nor blanket
-abstention can count as success. "Enough to discuss" never promotes provisional
-claims into verified knowledge. Complete this milestone before later complexity.
-
-
-3. MAKE RUNTIME ACCESS RELIABLE AND PRIORITISED
-
-Goal: dependable inference before adding more agent responsibilities.
-
-Current foundation
-The browser and background maintenance share a long-lived runtime, with separate
-warm chat and upkeep model lanes. Inference remains serial within each lane;
-matching role assignments can reuse a warm backend there.
-
-- [x] Allow MLX to load quantized Qwen3.5 checkpoints with the normal
-  quantization-aware loader. Keep the output adapter separate and reject merge
-  requests for quantized weights. The BF16 model remains the active default.
-- [ ] Compare the 4-bit 2B checkpoint against BF16 on representative full
-  conversations, including answer quality, end-to-end latency, token rate,
-  memory, and adapter training. A short 128-token local generation measured
-  52 tokens/second at 4-bit versus 21 at BF16, with peak model memory about
-  1.15 GB versus 3.82 GB. Both outputs hit the cap, so this is a speed signal,
-  not a quality result or a production acceptance run. A single end-to-end
-  advice replay took 14.4 seconds at 4-bit and 162.7 seconds at BF16, but BF16
-  exhausted its output budget and needed another attempt, so that comparison
-  does not isolate quantization speed. See
-  `docs/quantized-runtime-experiment.md` for the measurements and caveats.
-
-- [x] Add a quiet window during browser turns, for two idle minutes afterward,
-  and during startup.
-  Pause background inference while allowing every model call serving the chat,
-  including Curmudgeon reviews and Scholar research. A regression reproduces
-  the original role-based mistake; scheduling tests verify paused upkeep leaves
-  the shared pool available to foreground reviews and research. This does not
-  interrupt inference already in progress. Foreground-handle lifetime also keeps
-  upkeep paused during responses longer than the idle window; a regression
-  covers cloned model handles and resumption after completion.
-- [x] Give foreground chat a separate warm model cache and process request lock
-  from background upkeep, so a background generation already underway cannot
-  occupy chat's only inference worker. This permits one foreground and one
-  background generation at once, at the cost of a second resident model.
-- [x] Record quiet-window, local-pool, and process-lock wait durations per model
-  request to identify which part of the queue is responsible for latency.
-- [x] Verify simultaneous MLX generation with two local Qwen3.5 2B 4-bit workers.
-  Two 512-token generations took 11.69 seconds concurrently versus 12.10 seconds
-  through one worker. This confirms concurrent calls work, but shows little
-  throughput gain on this GPU. Each worker reported about 1.07 GB active memory;
-  system free memory dipped from 53% to 46% during the overlap and recovered to
-  49% afterward. This low-level test does not establish end-to-end chat benefit.
-- [x] Exercise the foreground lane through an isolated application `say` run.
-  The greeting completed with zero quiet-window, pool, or process-lock wait.
-  Interaction inference took 13.96 seconds and used 1,024 thinking tokens, so
-  this run points to generation work as a major delay; it did not overlap with
-  background work.
-- [x] Verify one live browser overlap on the development Mac. With background
-  Scholar still running, a follow-up chat acquired the chat lane with zero pool
-  or process-lock wait and completed while Scholar remained active. The
-  interaction's 1,024-token thinking phase took 82.5 seconds during overlap,
-  compared with 40.9 seconds in the preceding idle-background turn; a warm
-  Curmudgeon call took 19.9 seconds during overlap versus 0.44 seconds idle.
-  System free memory reached about 10% at peak and recovered to 21% afterward.
-  This verifies lock isolation but also confirms severe GPU contention with two
-  BF16 workers; it is one conversational sample, not a speed or quality pass.
-- [ ] Evaluate a chat-specific quantized assignment and more varied live loads
-  before treating parallel workers as a general latency improvement. The current
-  browser listener still handles HTTP requests serially, and each lane still
-  permits one generation at a time; measure those limits too.
-
-- [ ] Recover from a dead MLX worker or broken pipe without leaving later agents
-  attached to an unusable cached backend. Preserve durable jobs and bound retries.
-- [ ] Introduce explicit inference scheduling: conversation requests first,
-  conversation-derived research next, other background work after that.
-- [ ] Ensure background work eventually progresses without monopolising inference.
-- [ ] Initially give foreground requests the next available generation slot.
-  Treat interruption of an active generation as a separate design decision.
-- [x] Move ordinary conversation-quality audits to background upkeep. Record
-  accept/revise/uncertain verdicts with historical context and model identity in
-  the proposal ledger, without changing delivered text or approving factual
-  claims. Malformed assessments remain uncertain. The existing factual reply
-  audit and source-backed answer gates are retained.
-- [ ] Consolidate pre-answer intent checks currently routed through Curmudgeon
-  into Lyra's response planning. Keep unreviewed replies distinct from verified
-  knowledge, and define how advisory audit findings surface later corrections.
-  Explicit requests for verification must not silently become unchecked answers.
-- [ ] Diagnose excessive reasoning and semantic misrouting in basic conversation.
-  Earlier replays returned a greeting in 39 seconds, a generic clarification in
-  148 seconds, and an interview-advice research refusal in 170 seconds. With a
-  deliverable-first intent rationale and scoped source instructions, the latest
-  replay answers the advice request and restates it on clarification, taking
-  about 43 seconds per turn. Latency and broader semantic evaluation remain
-  open. Retain failures; do not conceal them with phrase-specific routing.
-- [ ] Distinguish queue waiting, model loading and generation time in diagnostics.
-- [ ] Test worker failure during generation, recovery on a subsequent request,
-  queued conversation work and continued background progress.
-- [x] Make quiet-window waits interruptible on shutdown. A development-server
-  restart remained waiting for upkeep to leave the pause and required stopping
-  the test process. Curator shutdown now cancels a maintenance wait without
-  discarding its durable work; a regression checks prompt exit.
-
-Acceptance
-A failed worker does not strand the other agents. Foreground requests take
-precedence over queued background work, with visible reasons for waits.
-
-
-4. INTRODUCE LENS: INTENT, CONTEXT AND VOICE
-
-Goal: interpret what the user means and guide an appropriate response while
-preserving the original message and the evidence boundary.
-
-Interpretation responsibilities
-- [ ] Identify the requested outcome and references to earlier conversation.
-- [ ] Recognise corrections, challenges, humour, rhetorical questions and plausible
-  literal readings. Preserve alternatives when the interpretation is ambiguous.
-- [ ] Treat frustration, danger or deception as possible contextual assessments,
-  not established facts about the user. Keep relevant safety/evidence review intact.
-- [ ] Guide direct assistance, research or clarification as appropriate.
-- [ ] Supply purpose and ambiguity assessments to the investigation controller
-  from Step 2; keep the final continue/reconsider/answer/stop decision there.
-- [ ] Keep interpretation separate from factual evidence: Lens cannot verify a
-  world claim merely by interpreting the user's intent.
-
-Integration
-- [ ] Inventory existing continuity, task-intent and source-check decisions.
-- [ ] Gradually consolidate those responsibilities into a structured interpretation
-  result, retaining their regression tests and explicit source-check requirements.
-- [ ] Avoid adding a Lens call on top of every existing classification call.
-- [ ] Preserve raw input and conversation context; interpretations supplement them.
-- [ ] Test Lens across unrelated domains and ambiguous conversations. For example,
-  "Are you sure?" after a factual answer should trigger reconsideration of that
-  answer rather than an unrelated new topic.
-
-Personality and voice
-- [ ] Define a stable foundation file for honesty, uncertainty, evidence handling
-  and permitted behaviour. Lyra cannot edit this foundation herself.
-- [ ] Define an editable voice file for warmth, brevity, humour, vocabulary and
-  conversational preferences. Voice changes cannot weaken the foundation.
-- [ ] Make voice changes small, versioned, inspectable and reversible.
-- [ ] Distinguish individual user preferences from Lyra's general personality.
-- [ ] Apply voice guidance during answer generation and retain final grounding
-  checks, so style changes cannot silently alter factual meaning or uncertainty.
-
-Open decision
-Should Lyra amend the voice file automatically within defined boundaries, propose
-changes for human review, or begin with proposals and earn limited autonomy?
-Agree this policy before enabling self-modification.
-
-Acceptance
-Lens improves interpretation and response relevance without inventing intent,
-overriding evidence policy, or adding unnecessary sequential inference calls.
-
-
-5. ADD ASYNCHRONOUS ORCHESTRATION WHERE IT HELPS
-
-Goal: agents and frontend activity can make progress concurrently while sharing
-model access safely.
-
-- [ ] Measure where requests spend time before choosing the migration scope.
-- [ ] Consider Tokio incrementally for frontend handling, source fetching, timers
-  and queue coordination. Keep blocking inference off asynchronous executor threads.
-- [ ] Route model requests through one owned inference worker and the priority
-  queue from Step 3. Keep conversation histories and request results isolated.
-- [ ] Retain process-level locks where separate processes share model resources;
-  use internal scheduling for requests within one running application.
-- [ ] Test overlapping research fetches and frontend requests, bounded queues,
-  cancellation and graceful shutdown. Avoid holding database transactions while
-  waiting for network access or inference.
-
-Separate investigation: simultaneous generation
-- [ ] Investigate supported batching or multiple inference workers only after
-  measuring the single-worker queue. Measure throughput, foreground latency and
-  memory use before adopting either approach.
-
-Acceptance
-Research I/O and frontend activity can overlap. Model requests remain correctly
-coordinated. Adding Tokio alone is not evidence of faster or parallel inference.
-
-
-6. EVALUATE BROADER LORA ADAPTATION
-
-Goal: improve stable model behaviours through measured, reversible adaptation.
-
-Current foundation
-The MLX implementation already freezes the base model and trains a rank-8 adapter
-on the output projection. It can merge that adjustment into a checkpoint.
-The question is whether broader adapters improve the behaviours we need.
-
-- [ ] Keep training disabled until the grounding acceptance benchmark passes.
-- [ ] Define a small, auditable training set and held-out evaluation scenarios.
-- [ ] Compare the existing output adapter with adapters in selected internal
-  layers, such as attention projections. Measure benefit and regression risk.
-- [ ] Start with stable behaviours: following response contracts, expressing
-  uncertainty and generating valid structured output.
-- [ ] Keep changing or contested factual knowledge in retrieval and the evidence
-  store. Behavioural training needs its own reviewed examples and approval policy;
-  it must not bypass the existing training gate.
-- [ ] Preserve adapter versions, training provenance and rollback/rebuild paths.
-- [ ] Decide whether adapters remain separate or are merged based on measured
-  deployment and recovery needs, rather than merging by default.
-
-Acceptance
-Held-out evaluations demonstrate improvement without reduced grounding quality.
-Every trained change has auditable inputs and a tested way to roll it back.
-
-
-REFERENCE MATERIAL
+Component and evidence references:
 - docs/learning-integrity-roadmap.md — evidence policy and benchmark acceptance.
 - docs/grounding-generalization-progress.md — retained failures and recent fixes.
 - docs/per-agent-models.md — runtime and model assignments.
 - docs/research-baskets-and-quotas.md — bounded harvesting and explicit retry.
-- https://tokio.rs/tokio/topics/bridging — incremental async/synchronous integration.
-- https://arxiv.org/abs/2106.09685 — original LoRA paper.

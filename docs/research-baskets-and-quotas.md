@@ -125,9 +125,10 @@ chat as established truth and does not automatically promote or retract claims.
 ## Operations
 
 Stop running Lyra processes, back up the learning database, then restart with the
-new binary. Additive SQLite migrations upgrade schema 44 through 47 and retain
-existing findings, learning/audit records, and semantic claims. The JSON map
-format is unchanged. Do not run old and new binaries against the same database.
+new binary. The original additive rollout upgraded schema 44 through 47 and
+retained existing findings, learning/audit records, and semantic claims; later
+migrations bring the current schema to version 63. The JSON map format remains
+unchanged. Do not run old and new binaries against the same database.
 
 If the source basket is empty, the next background Scholar pass automatically
 imports previously saved finding/candidate excerpts once material is available.
