@@ -29,9 +29,7 @@ pub(crate) fn assess_with(
         },
     ];
     let result = ask(&messages).and_then(|raw| {
-        let parsed = crate::research::json_object(&raw)?;
-        let review: ConversationReview = serde_json::from_value(parsed)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let review: ConversationReview = crate::research::json_object_as(&raw)?;
         if !matches!(review.verdict.as_str(), "accept" | "revise" | "uncertain")
             || (review.verdict != "accept" && review.reason.trim().is_empty())
         {

@@ -1,4 +1,5 @@
 //! AI entailment assessments bound to the exact claim and original source span.
+use crate::errors::invalid_data as invalid;
 use crate::{agent::Message, storage::ScholarFinding};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -113,13 +114,13 @@ For entailed, copy candidate_evidence_to_check_first verbatim as evidence_text; 
         "scholar.semantic_support",
         serde_json::json!({
             "question":question,"source_title":title,"candidate":context["candidate"],
-            "verdict":result.as_ref().map(|v|v.verdict()).unwrap_or("invalid"),
-            "reason":result.as_ref().map(|v|v.reason().to_owned()).unwrap_or_else(|e|e.to_string()),
-            "original_evidence":result.as_ref().ok().map(|v|v.evidence()),
+            "verdict":result.as_ref().map_or("invalid", SemanticSupport::verdict),
+            "reason":result.as_ref().map_or_else(std::string::ToString::to_string, |v|v.reason().to_owned()),
+            "original_evidence":result.as_ref().ok().map(SemanticSupport::evidence),
         "model_verdict":result.as_ref().ok().map(|v|v.model_verdict.as_str()),
         "review_verdict":result.as_ref().ok().and_then(|v|v.review_verdict.as_deref()),
         "review_override":result.as_ref().ok().and_then(|v|v.review_override.as_deref()),
-            "model_output_excerpt":raw.chars().take(6000).collect::<String>()
+            "model_output_excerpt":crate::diagnostics::text_excerpt(&raw, 6000)
         }),
     );
     result
@@ -160,7 +161,7 @@ Return entailed only when the candidate's complete meaning follows from the pass
             "initial_verdict": initial.verdict,
             "review_verdict": reviewed.verdict,
             "review_reason": reviewed.reason,
-            "review_output_excerpt": raw.chars().take(6000).collect::<String>()
+            "review_output_excerpt": crate::diagnostics::text_excerpt(&raw, 6000)
         }),
     );
     reviewed.model_verdict = initial.model_verdict.clone();
@@ -180,8 +181,7 @@ fn parse(raw: &str, finding: &ScholarFinding, passage: &str) -> io::Result<Seman
         .unwrap_or(raw)
         .trim();
     let mut assessed: Assessment =
-        serde_json::from_str(text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+        serde_json::from_str(text).map_err(crate::errors::invalid_json)?;
     if !matches!(
         assessed.verdict.as_str(),
         "entailed" | "contradicted" | "qualified" | "insufficient"

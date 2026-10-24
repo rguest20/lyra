@@ -33,6 +33,27 @@ pub(super) fn resolve_source_labels(answer: &str, sources: &[&str]) -> String {
     result
 }
 
+pub(super) fn append_source_list(answer: &mut String, sources: &[&str], label: &str) {
+    let mut unique_sources = Vec::new();
+    for source in sources {
+        if !unique_sources.contains(source) {
+            unique_sources.push(*source);
+        }
+    }
+    if !unique_sources.is_empty() && !unique_sources.iter().any(|source| answer.contains(source)) {
+        answer.push_str(&format!("\n\n{label}: {}", unique_sources.join(", ")));
+    }
+}
+
+pub(super) fn mask_source_urls(answer: &str, sources: &[&str]) -> String {
+    sources
+        .iter()
+        .enumerate()
+        .fold(answer.to_owned(), |masked, (index, source)| {
+            masked.replace(source, &format!("source_{}", index + 1))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +72,43 @@ mod tests {
         assert_eq!(
             resolve_source_labels("Évidence: SOURCE_2", &sources),
             "Évidence: https://example.org/second"
+        );
+    }
+
+    #[test]
+    fn appends_sources_once_and_keeps_the_requested_label() {
+        let sources = ["https://example.org/one", "https://example.org/two"];
+        let mut answer = "Supported answer.".to_owned();
+        append_source_list(&mut answer, &sources, "Sources");
+        assert_eq!(
+            answer,
+            "Supported answer.\n\nSources: https://example.org/one, https://example.org/two"
+        );
+        append_source_list(&mut answer, &sources, "Sources");
+        assert_eq!(answer.matches("Sources:").count(), 1);
+        let mut checked = "Useful partial.".to_owned();
+        append_source_list(&mut checked, &sources, "Sources checked");
+        assert!(
+            checked.ends_with("Sources checked: https://example.org/one, https://example.org/two")
+        );
+        let mut repeated = "Useful partial.".to_owned();
+        append_source_list(
+            &mut repeated,
+            &[sources[0], sources[0], sources[1]],
+            "Sources",
+        );
+        assert!(repeated.ends_with("Sources: https://example.org/one, https://example.org/two"));
+    }
+
+    #[test]
+    fn masks_only_the_supplied_urls_with_their_evidence_labels() {
+        let sources = ["https://example.org/one", "https://example.org/two"];
+        assert_eq!(
+            mask_source_urls(
+                "One account (https://example.org/one), then another.",
+                &sources
+            ),
+            "One account (source_1), then another."
         );
     }
 }

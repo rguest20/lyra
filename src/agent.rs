@@ -7,9 +7,10 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::curator::CuratorHandle;
-use crate::inference::LocalModel;
+use crate::errors::{invalid_data as invalid, invalid_json};
+use crate::inference::{LocalModel, assignments::ReplyModels};
 use crate::knowledge::KnowledgeMap;
+use crate::maintenance::MaintenanceHandle;
 use crate::storage::{
     LearningStore, Observation, ScholarEvidenceForAnswer, SemanticClaim, StoredAssistantClaim,
     StoredCandidate,
@@ -22,6 +23,7 @@ use research_reply::answer_from_research_with_thinking;
 pub(crate) use research_reply::{answer_from_research, semantic_research_evidence};
 
 const STATE_VERSION: u64 = 1;
+const CONTEXT_USE_POLICY: &str = "Keep supplied facts distinct from generated suggestions, examples and assumptions. Earlier assistant content does not establish facts about the user or actions the user has completed. When constructing a draft from supplied information, preserve that information boundary and represent missing details as placeholders if requested. Use earlier turns to resolve references while letting the latest request define the current task. Apply earlier constraints within their actual scope; a previous topic does not itself restrict what can be requested next.";
 pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Speak as the assistant, not as a narrator describing what the user requested or what your system prompt contains. Describe missing evidence directly in terms of the user's actual question. For thanks or praise, acknowledge it briefly; do not attribute your own honesty or uncertainty to the user. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. For semantic claims, extraction confidence describes only how confidently the extractor mapped text into a claim; it is not truth probability or evidence strength. Source quality is a categorical assessment of the cited source, and freshness describes that source's recency for time-sensitive information; neither alone proves a claim. Claim status controls answer use: active means eligible with source attribution, not verified; uncertain means qualify and seek corroboration; challenged means do not present as established and explain the disagreement if relevant. Treat unknown assessments as unknown, not as strong evidence. User-reported information is evidence of what the user said, not independent verification. Ask a brief confirmation question when the user's intent or a material fact remains unclear. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,7 +41,6 @@ pub struct Agent {
 pub struct AgentReply {
     pub text: String,
     pub thinking: Option<String>,
-    pub new_conversation: bool,
     pub research_queued: bool,
 }
 
@@ -48,8 +49,51 @@ pub struct ReplyServices<'a> {
     pub database_path: &'a Path,
     pub research_model: &'a mut LocalModel,
     pub scholar_model: &'a mut LocalModel,
-    pub curator: Option<&'a CuratorHandle>,
+    pub maintenance: Option<&'a MaintenanceHandle>,
     pub state_path: &'a Path,
+}
+
+impl<'a> ReplyServices<'a> {
+    pub(crate) fn split_models(
+        models: &'a mut ReplyModels,
+        store: &'a LearningStore,
+        database_path: &'a Path,
+        maintenance: Option<&'a MaintenanceHandle>,
+        state_path: &'a Path,
+    ) -> (&'a mut LocalModel, Self) {
+        let ReplyModels {
+            interaction,
+            research: research_model,
+            scholar: scholar_model,
+        } = models;
+        (
+            interaction,
+            Self {
+                store,
+                database_path,
+                research_model,
+                scholar_model,
+                maintenance,
+                state_path,
+            },
+        )
+    }
+}
+
+struct ResearchResolution {
+    answer: String,
+    thinking: Option<String>,
+    queued: bool,
+    limitation: Option<String>,
+}
+
+struct ResearchTurn<'a> {
+    request: &'a task::ResolvedTurnRequest<'a>,
+    pending: &'a [Observation],
+    initial_evidence: &'a [ScholarEvidenceForAnswer],
+    plan: io::Result<Option<crate::research::ResearchPlan>>,
+    answer: String,
+    thinking: Option<String>,
 }
 
 impl Agent {
@@ -116,8 +160,7 @@ impl Agent {
             history,
             conversation_id: value["conversation_id"]
                 .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+                .map_or_else(|| path.to_string_lossy().into_owned(), str::to_owned),
         })
     }
 
@@ -148,7 +191,7 @@ impl Agent {
         input: &str,
         backend: &mut LocalModel,
         map: &KnowledgeMap,
-        services: ReplyServices<'_>,
+        mut services: ReplyServices<'_>,
         show_thinking: bool,
     ) -> io::Result<AgentReply> {
         let raw_input = input.trim_end_matches(['\r', '\n']);
@@ -163,155 +206,175 @@ impl Agent {
             self.turn_count() + 1,
             raw_input,
         )?;
-        if let Some(curator) = services.curator {
-            curator.wake();
+        if let Some(maintenance) = services.maintenance {
+            maintenance.wake();
         }
-        let pending = services.store.relevant_observations(
+        let request = task::assess_request(input, &self.history, |messages| {
+            services.research_model.chat_for_extraction(messages)
+        });
+        let turn_context = task::select_turn_context(
+            services.store,
             &self.conversation_id,
-            input,
             &observation_id,
-            32,
+            &request,
+            map,
+            services.research_model,
         )?;
-        let curated = services.store.relevant_semantic_claims(input, 5)?;
-        let lookup_request = contextual_lookup_request(input, &self.history);
-        let needs_external_facts =
-            crate::research::external_fact_request_with(input, &self.history, |messages| {
-                services.research_model.chat_for_extraction(messages)
-            })
-            .unwrap_or_else(|error| {
-                crate::diagnostics::research_decision(
-                    "conversation.request_intent_failed",
-                    json!({"error":error.to_string()}),
-                );
-                true
-            });
-        let requires_source_check = if needs_external_facts {
-            false
-        } else {
-            let required = task::requires_source_check(&lookup_request, |messages| {
-                services.research_model.chat_for_extraction(messages)
-            })
-            .unwrap_or_else(|error| {
-                crate::diagnostics::research_decision(
-                    "conversation.source_check_intent_failed",
-                    json!({"request":input,"error":error.to_string()}),
-                );
-                true
-            });
-            crate::diagnostics::research_decision(
-                "conversation.source_check_intent",
-                json!({"request":input,"requires_source_check":required}),
-            );
-            required
-        };
-        crate::diagnostics::research_decision(
-            "conversation.request_intent",
-            json!({"question":input,"needs_external_facts":needs_external_facts,"requires_source_check":requires_source_check}),
-        );
-        let research_evidence = if !needs_external_facts {
-            Vec::new()
-        } else {
-            semantic_research_evidence(services.store, &lookup_request, services.research_model)?
-        };
-        crate::diagnostics::event(
-            "conversation.context_selected",
-            json!({
-                "conversation_id":self.conversation_id,"question":input,
-                "map_claim_ids":if needs_external_facts { map.relevant(input,5).iter().map(|claim|claim.id).collect::<Vec<_>>() } else { Vec::new() },
-                "curated_claim_ids":if needs_external_facts { curated.iter().map(|claim|claim.id).collect::<Vec<_>>() } else { Vec::new() },
-                "scholar_finding_ids":research_evidence.iter().map(|finding|finding.id).collect::<Vec<_>>(),
-                "pending_observation_count":pending.len(),
-            }),
-        );
-        let active_db_ids = services.store.active_semantic_claim_ids()?;
-        let challenges = live_challenges(
-            services
-                .store
-                .relevant_assistant_challenges(input, usize::MAX)?,
-            map,
-            &active_db_ids,
-            3,
-        );
-        let review_candidates =
-            services
-                .store
-                .relevant_review_candidates(&self.conversation_id, input, 5)?;
-        let uncertain_candidate = review_candidates
-            .iter()
-            .filter(|candidate| {
-                is_user_entity(&candidate.subject)
-                    && (candidate.confidence < 0.95 || candidate.status == "needs_review")
-            })
-            .min_by_key(|candidate| {
-                (
-                    !candidate
-                        .evidence_text
-                        .to_lowercase()
-                        .contains(&candidate.object.to_lowercase()),
-                    candidate.evidence_text.chars().count(),
-                )
-            });
-        let mut messages = self.prompt_messages_with_scholar_evidence(
-            input,
-            map,
-            &pending,
-            &curated,
-            &review_candidates,
+        let (answer, answer_thinking) =
+            self.initial_draft(&request, &turn_context, backend, services.research_model)?;
+        let task::TurnContext {
+            pending,
+            research_evidence,
+            uncertain_candidate,
+            ..
+        } = turn_context;
+        let plan = self.plan_research(
+            &request,
+            &answer,
             &research_evidence,
+            services.research_model,
         );
-        let mut baseline = self.prompt_messages(input, map, &[], &curated, &[]);
-        if !needs_external_facts {
-            messages = task::messages(input, &self.history, &pending, &[]);
-            baseline = task::messages(input, &self.history, &[], &[]);
+        let ResearchResolution {
+            answer,
+            thinking,
+            queued: research_queued,
+            limitation: task_research_limitation,
+        } = self.resolve_research(
+            ResearchTurn {
+                request: &request,
+                pending: &pending,
+                initial_evidence: &research_evidence,
+                plan,
+                answer,
+                thinking: answer_thinking,
+            },
+            backend,
+            &mut services,
+        )?;
+        let (answer, thinking) = finalize_answer(
+            answer,
+            thinking,
+            task_research_limitation,
+            uncertain_candidate.as_ref(),
+            || {
+                personal_fact_question_with(request.original_message, &self.history, |messages| {
+                    services.research_model.chat_for_extraction(messages)
+                })
+            },
+        )?;
+        self.deliver_reply(
+            request.original_message,
+            answer,
+            thinking,
+            research_queued,
+            services,
+            show_thinking,
+        )
+    }
+
+    fn plan_research(
+        &self,
+        request: &task::ResolvedTurnRequest<'_>,
+        draft: &str,
+        evidence: &[ScholarEvidenceForAnswer],
+        model: &mut LocalModel,
+    ) -> io::Result<Option<crate::research::ResearchPlan>> {
+        if !request.needs_external_facts {
+            return task::research_plan(
+                &request.resolved_request,
+                draft,
+                request.requires_source_check,
+                |messages| model.chat_for_extraction(messages),
+            );
         }
-        if let Some(challenge) = challenge_message(&challenges) {
+        // The draft is not evidence; factual lookup planning receives only
+        // already selected source passages.
+        let known_evidence = evidence
+            .iter()
+            .map(|finding| json!({"source":finding.source_url,"passage":finding.evidence_text}))
+            .collect::<Vec<_>>();
+        let known_evidence = serde_json::to_string(&known_evidence).map_err(io::Error::other)?;
+        crate::research::plan_with(&request.resolved_request, &known_evidence, |messages| {
+            model.chat_for_extraction(messages)
+        })
+    }
+
+    fn initial_draft(
+        &self,
+        request: &task::ResolvedTurnRequest<'_>,
+        context: &task::TurnContext,
+        backend: &mut LocalModel,
+        research_model: &mut LocalModel,
+    ) -> io::Result<(String, Option<String>)> {
+        if !context.research_evidence.is_empty() {
+            return answer_from_research_with_thinking(
+                request.original_message,
+                &self.history,
+                &context.research_evidence,
+                research_model,
+            );
+        }
+        let mut messages = if request.needs_external_facts {
+            self.prompt_messages_with_selected_map_claims(
+                request.original_message,
+                &context.map_claims,
+                &context.pending,
+                &context.curated,
+                &context.review_candidates,
+                &context.research_evidence,
+            )
+        } else {
+            task::messages(
+                request.original_message,
+                &self.history,
+                &context.pending,
+                &[],
+            )
+        };
+        let mut baseline = if request.needs_external_facts {
+            self.prompt_messages_with_selected_map_claims(
+                request.original_message,
+                &context.map_claims,
+                &[],
+                &context.curated,
+                &[],
+                &[],
+            )
+        } else {
+            task::messages(request.original_message, &self.history, &[], &[])
+        };
+        if let Some(challenge) = challenge_message(&context.challenges) {
             messages.insert(1, challenge.clone());
             baseline.insert(1, challenge);
         }
-        let extra_prompt_tokens = if research_evidence.is_empty() {
-            backend.additional_prompt_tokens(&baseline, &messages)?
-        } else {
-            0
-        };
-        let (mut answer, mut answer_thinking) = if research_evidence.is_empty() {
-            let answer = backend.chat(&messages, extra_prompt_tokens, true)?;
-            (answer, backend.take_thinking())
-        } else {
-            answer_from_research_with_thinking(
-                input,
-                &self.history,
-                &research_evidence,
-                services.research_model,
-            )?
-        };
-        // A generated draft is not evidence of its own factual adequacy.
-        let known_evidence = research_evidence
-            .iter()
-            .map(|f| json!({"source":f.source_url,"passage":f.evidence_text}))
-            .collect::<Vec<_>>();
-        let plan = if !needs_external_facts {
-            task::research_plan(
-                &lookup_request,
-                &answer,
-                requires_source_check,
-                |messages| services.research_model.chat_for_extraction(messages),
-            )
-        } else {
-            crate::research::plan_with(
-                &lookup_request,
-                &serde_json::to_string(&known_evidence).map_err(io::Error::other)?,
-                |messages| services.research_model.chat_for_extraction(messages),
-            )
-        };
-        let mut research_queued = false;
-        let mut task_research_limitation = None;
+        let extra_prompt_tokens = backend.additional_prompt_tokens(&baseline, &messages)?;
+        let answer = backend.chat(&messages, extra_prompt_tokens, true)?;
+        Ok((answer, backend.take_thinking()))
+    }
+
+    fn resolve_research(
+        &self,
+        turn: ResearchTurn<'_>,
+        backend: &mut LocalModel,
+        services: &mut ReplyServices<'_>,
+    ) -> io::Result<ResearchResolution> {
+        let ResearchTurn {
+            request,
+            pending,
+            initial_evidence,
+            plan,
+            mut answer,
+            mut thinking,
+        } = turn;
+        let mut queued = false;
+        let mut limitation = None;
         match plan {
             Ok(Some(plan)) => {
                 let turn = self.turn_count() + 1;
                 services
                     .store
                     .enqueue_research_plan(&self.conversation_id, turn, &plan)?;
-                research_queued = true;
+                queued = true;
                 crate::diagnostics::research_decision(
                     "conversation.lookup_plan",
                     json!({
@@ -328,8 +391,8 @@ impl Agent {
                 }
                 let found = semantic_research_evidence(
                     services.store,
-                    if needs_external_facts {
-                        &lookup_request
+                    if request.needs_external_facts {
+                        &request.resolved_request
                     } else {
                         &plan.question
                     },
@@ -342,33 +405,38 @@ impl Agent {
                     }),
                 );
                 if !found.is_empty() {
-                    let (researched, thinking) = if needs_external_facts {
+                    let (researched, revised_thinking) = if request.needs_external_facts {
                         answer_from_research_with_thinking(
-                            input,
+                            request.original_message,
                             &self.history,
                             &found,
                             services.research_model,
                         )?
                     } else {
-                        messages = task::messages(input, &self.history, &pending, &found);
+                        let messages = task::messages(
+                            request.original_message,
+                            &self.history,
+                            pending,
+                            &found,
+                        );
                         let answer = backend.chat(&messages, 0, true)?;
                         (answer, backend.take_thinking())
                     };
                     answer = researched;
-                    answer_thinking = thinking;
-                } else if needs_external_facts {
-                    answer_thinking = None;
+                    thinking = revised_thinking;
+                } else if request.needs_external_facts {
+                    thinking = None;
                     answer =
                         "I haven't found enough relevant evidence to answer that reliably yet."
                             .into();
                 } else {
-                    task_research_limitation = Some(format!(
+                    limitation = Some(format!(
                         "I couldn't find relevant sources to resolve the remaining gap: {}.",
                         plan.question.trim_end_matches(['.', '?'])
                     ));
                 }
-                if let Some(curator) = services.curator {
-                    curator.wake();
+                if let Some(maintenance) = services.maintenance {
+                    maintenance.wake();
                 }
             }
             Ok(None) => crate::diagnostics::research_decision(
@@ -376,9 +444,9 @@ impl Agent {
                 json!({
                     "conversation_id":self.conversation_id,
                     "turn":self.turn_count()+1,
-                    "request":input,
-                    "needs_external_facts":needs_external_facts,
-                    "requires_source_check":requires_source_check,
+                    "request":request.original_message,
+                    "needs_external_facts":request.needs_external_facts,
+                    "requires_source_check":request.requires_source_check,
                 }),
             ),
             Err(error) => {
@@ -387,35 +455,37 @@ impl Agent {
                     json!({"reason":error.to_string()}),
                 );
                 eprintln!("could not assess missing public information: {error}");
-                if !needs_external_facts && requires_source_check {
-                    task_research_limitation = Some(
+                if !request.needs_external_facts && request.requires_source_check {
+                    limitation = Some(
                         "I haven't checked the requested sources, so this attempt is unverified."
                             .into(),
                     );
                 }
-                if needs_external_facts && research_evidence.is_empty() {
-                    answer_thinking = None;
+                if request.needs_external_facts && initial_evidence.is_empty() {
+                    thinking = None;
                     answer =
                         "I haven't found enough relevant evidence to answer that reliably yet."
                             .into();
                 }
             }
         }
-        if let Some(limitation) = task_research_limitation {
-            answer.push_str("\n\n");
-            answer.push_str(&limitation);
-        }
-        if let Some(candidate) = uncertain_candidate
-            && personal_fact_question_with(input, &self.history, |messages| {
-                services.research_model.chat_for_extraction(messages)
-            }) == Some(true)
-        {
-            answer = confirmation_question(&candidate.evidence_text);
-            answer_thinking = None;
-        }
-        if answer.trim().is_empty() {
-            return Err(invalid("model returned an empty reply"));
-        }
+        Ok(ResearchResolution {
+            answer,
+            thinking,
+            queued,
+            limitation,
+        })
+    }
+
+    fn deliver_reply(
+        &mut self,
+        input: &str,
+        answer: String,
+        answer_thinking: Option<String>,
+        research_queued: bool,
+        services: ReplyServices<'_>,
+        show_thinking: bool,
+    ) -> io::Result<AgentReply> {
         self.history.push(Message {
             role: "user".into(),
             content: input.into(),
@@ -424,28 +494,24 @@ impl Agent {
             role: "assistant".into(),
             content: answer.clone(),
         });
-        if let Err(error) = self.save(services.state_path) {
-            self.history.truncate(self.history.len() - 2);
-            return Err(error);
-        }
+        self.save(services.state_path)?;
         if let Err(error) =
             services
                 .store
                 .stage_assistant_reply(&self.conversation_id, self.turn_count(), &answer)
         {
             eprintln!("could not queue Curmudgeon audit: {error}");
-        } else if let Some(curator) = services.curator {
-            curator.wake();
+        } else if let Some(maintenance) = services.maintenance {
+            maintenance.wake();
         }
-        let thinking = if show_thinking { answer_thinking } else { None };
         Ok(AgentReply {
             text: answer,
-            thinking,
-            new_conversation: false,
+            thinking: if show_thinking { answer_thinking } else { None },
             research_queued,
         })
     }
 
+    #[cfg(test)]
     fn prompt_messages(
         &self,
         input: &str,
@@ -464,6 +530,7 @@ impl Agent {
         )
     }
 
+    #[cfg(test)]
     fn prompt_messages_with_scholar_evidence(
         &self,
         input: &str,
@@ -473,11 +540,34 @@ impl Agent {
         review_candidates: &[StoredCandidate],
         scholar_evidence: &[ScholarEvidenceForAnswer],
     ) -> Vec<Message> {
+        let relevant = map
+            .relevant(input, 5)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.prompt_messages_with_selected_map_claims(
+            input,
+            &relevant,
+            observations,
+            curated,
+            review_candidates,
+            scholar_evidence,
+        )
+    }
+
+    fn prompt_messages_with_selected_map_claims(
+        &self,
+        input: &str,
+        relevant: &[crate::knowledge::Claim],
+        observations: &[Observation],
+        curated: &[SemanticClaim],
+        review_candidates: &[StoredCandidate],
+        scholar_evidence: &[ScholarEvidenceForAnswer],
+    ) -> Vec<Message> {
         let mut messages = vec![Message {
             role: "system".into(),
-            content: SYSTEM_PROMPT.into(),
+            content: format!("{SYSTEM_PROMPT}\n{CONTEXT_USE_POLICY}"),
         }];
-        let relevant = map.relevant(input, 5);
         let map_claims = relevant
             .iter()
             .map(|claim| {
@@ -799,63 +889,27 @@ fn recent_dialogue(history: &[Message]) -> Vec<Value> {
         .collect()
 }
 
-fn lookup_uses_prior_reference(input: &str) -> bool {
-    let normalized = input.trim().to_lowercase();
-    [
-        "are you sure",
-        "what about",
-        "and ",
-        "also ",
-        "really",
-        "actually",
-    ]
-    .iter()
-    .any(|prefix| normalized.starts_with(prefix))
-        || normalized
-            .split(|ch: char| !ch.is_alphanumeric())
-            .any(|word| {
-                matches!(
-                    word,
-                    "that"
-                        | "those"
-                        | "this"
-                        | "these"
-                        | "it"
-                        | "they"
-                        | "them"
-                        | "same"
-                        | "again"
-                        | "either"
-                        | "too"
-                )
-            })
-}
-
-fn contextual_lookup_request(input: &str, history: &[Message]) -> String {
-    if history.is_empty()
-        || !lookup_uses_prior_reference(input)
-        || crate::research::private_fact_request(input)
+fn finalize_answer(
+    mut answer: String,
+    mut thinking: Option<String>,
+    limitation: Option<String>,
+    uncertain_candidate: Option<&StoredCandidate>,
+    mut personal_fact_question: impl FnMut() -> Option<bool>,
+) -> io::Result<(String, Option<String>)> {
+    if let Some(limitation) = limitation {
+        answer.push_str("\n\n");
+        answer.push_str(&limitation);
+    }
+    if let Some(candidate) = uncertain_candidate
+        && personal_fact_question() == Some(true)
     {
-        return input.into();
+        answer = confirmation_question(&candidate.evidence_text);
+        thinking = None;
     }
-    let previous = history
-        .iter()
-        .rev()
-        .filter(|m| m.role == "user")
-        .take(2)
-        .collect::<Vec<_>>();
-    if previous.is_empty() {
-        return input.into();
+    if answer.trim().is_empty() {
+        return Err(invalid("model returned an empty reply"));
     }
-    format!(
-        "{}\nFollow-up: {input}",
-        previous
-            .into_iter()
-            .rev()
-            .map(|m| m.content.chars().take(500).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    )
+    Ok((answer, thinking))
 }
 
 fn confirmation_question(evidence: &str) -> String {
@@ -877,26 +931,14 @@ pub(super) fn normalized_words(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn invalid(message: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
-}
-
-fn invalid_json(error: serde_json::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::ScholarFinding;
+    use crate::test_support::ScholarJobTestHelpers;
 
     #[test]
     fn followups_keep_the_saved_session_context_across_topics_and_model_changes() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("lyra-context-{unique}.json"));
+        let path = crate::test_support::unique_temp_path("lyra-context", "json");
         let history = vec![
             Message {
                 role: "user".into(),
@@ -971,11 +1013,6 @@ mod tests {
         assert_eq!(data["latest_request"], correction);
         assert!(messages[1].content.contains("Walkers' Vanilla"));
         assert!(!messages[1].content.contains("renewable"));
-        let lookup = contextual_lookup_request("Are those available in barbecue?", &history);
-        assert!(lookup.contains("Walkers' Vanilla"));
-        assert!(!lookup.contains("The best crisp flavour is vanilla"));
-        let creative = "Write a haiku about lunar eclipses.";
-        assert_eq!(contextual_lookup_request(creative, &history), creative);
     }
 
     #[test]
@@ -985,36 +1022,23 @@ mod tests {
             history: Vec::new(),
             conversation_id: "conversation".into(),
         };
-        let finding = ScholarEvidenceForAnswer {
-            id: 4,
-            source_archive_id: Some(7),
-            evidence_byte_start: Some(10),
-            evidence_byte_end: Some(30),
-            source_url: "https://example.org/mars".into(),
-            subject: "Mars".into(),
-            relation: "has moons".into(),
-            object: "two".into(),
-            attribution: None,
-            polarity: "unknown".into(),
-            modality: "unknown".into(),
-            geographic_scope: None,
-            context_scope: None,
-            evidence_text: "Mars has two moons.".into(),
-            confidence: 0.9,
-            finding_status: "needs_review".into(),
-            gate_status: "awaiting_corroboration".into(),
-            reason: "only one independent source is available".into(),
-            research_relevance: "direct".into(),
-            topic_class: "stable".into(),
-            source_kind: "reference".into(),
-            freshness: "fresh".into(),
-            currency: "current".into(),
-            direct_support: true,
-            independence_key: Some("example".into()),
-            independence_verified: false,
-            published_at: None,
-            conflicting_claims: vec!["Mars has one moon".into()],
-        };
+        let mut finding = crate::test_support::answer_evidence_fixture(
+            4,
+            "Mars",
+            "has moons",
+            "two",
+            "https://example.org/mars",
+            "Mars has two moons.",
+        );
+        finding.source_span.source_archive_id = Some(7);
+        finding.source_span.evidence_byte_start = Some(10);
+        finding.source_span.evidence_byte_end = Some(30);
+        finding.confidence = 0.9;
+        finding.gate_status = "awaiting_corroboration".into();
+        finding.reason = "only one independent source is available".into();
+        finding.independence_key = Some("example".into());
+        finding.independence_verified = false;
+        finding.conflicting_claims = vec!["Mars has one moon".into()];
         let prompt = agent.prompt_messages_with_scholar_evidence(
             "How many moons does Mars have?",
             &KnowledgeMap::default(),
@@ -1037,11 +1061,7 @@ mod tests {
 
     #[test]
     fn scholar_claim_reaches_next_prompt_without_changing_model_files() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-scholar-prompt-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-        ));
+        let directory = crate::test_support::unique_temp_path("community-scholar-prompt", "");
         std::fs::create_dir_all(&directory).unwrap();
         let database = directory.join("learning.db");
         let adapter = directory.join("adapter.safetensors");
@@ -1057,20 +1077,15 @@ mod tests {
                 "Photosynthesis",
                 "https://en.wikipedia.org/wiki/Photosynthesis",
                 "Photosynthesis converts light energy into chemical energy.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Photosynthesis".into(),
-                    relation: "converts".into(),
-                    object: "light energy into chemical energy".into(),
-                    evidence_text: "Photosynthesis converts light energy into chemical energy."
-                        .into(),
-                    confidence: 0.98,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(crate::test_support::scholar_finding(
+                    "Photosynthesis",
+                    "converts",
+                    "light energy into chemical energy",
+                    "Photosynthesis converts light energy into chemical energy.",
+                    0.98,
+                    "reference",
+                    None,
+                )),
                 None,
             )
             .unwrap();
@@ -1155,8 +1170,7 @@ mod tests {
 
     #[test]
     fn state_round_trip_and_model_boundary() {
-        let path =
-            std::env::temp_dir().join(format!("community-agent-{}.json", std::process::id()));
+        let path = crate::test_support::unique_temp_path("community-agent", "json");
         let mut agent = Agent::load(&path, "model-a").unwrap();
         agent.history.push(Message {
             role: "user".into(),
@@ -1294,6 +1308,62 @@ mod tests {
     }
 
     #[test]
+    fn answer_finalization_preserves_limit_and_only_checks_uncertain_candidates() {
+        let (answer, thinking) = finalize_answer(
+            "A useful attempt.".into(),
+            Some("draft reasoning".into()),
+            Some("I could not verify one detail.".into()),
+            None,
+            || panic!("intent should not be checked without an uncertain candidate"),
+        )
+        .unwrap();
+        assert_eq!(
+            answer,
+            "A useful attempt.\n\nI could not verify one detail."
+        );
+        assert_eq!(thinking.as_deref(), Some("draft reasoning"));
+        assert!(
+            finalize_answer("  ".into(), None, None, None, || {
+                panic!("intent should not be checked without an uncertain candidate")
+            })
+            .is_err()
+        );
+
+        let candidate = StoredCandidate {
+            id: "candidate-a".into(),
+            observation_id: "observation-a".into(),
+            subject: "the user".into(),
+            relation: "lives in".into(),
+            object: "Shifnal".into(),
+            evidence_text: "I live in Shifnal.".into(),
+            confidence: 0.0,
+            status: "needs_review".into(),
+            decision_reason: None,
+            semantic_claim_id: None,
+            valid_from: None,
+            valid_until: None,
+        };
+        let mut calls = 0;
+        let (answer, thinking) = finalize_answer(
+            "A useful attempt.".into(),
+            Some("draft reasoning".into()),
+            Some("This attempt was not source checked.".into()),
+            Some(&candidate),
+            || {
+                calls += 1;
+                Some(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            answer,
+            "Correct me if I'm wrong, but you said “I live in Shifnal.” Is that right?"
+        );
+        assert_eq!(thinking, None);
+    }
+
+    #[test]
     fn uncertain_personal_intent_gets_one_reconsideration_then_stays_unresolved() {
         let mut calls = 0;
         assert_eq!(
@@ -1379,9 +1449,7 @@ mod tests {
 
     #[test]
     fn relevant_pending_observations_are_labeled_before_latest_prompt() {
-        let path =
-            std::env::temp_dir().join(format!("community-agent-context-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = crate::test_support::unique_temp_path("community-agent-context", "db");
         let store = LearningStore::open(&path).unwrap();
         store
             .stage_observation("conversation-a", 1, "I live in Bristol.")

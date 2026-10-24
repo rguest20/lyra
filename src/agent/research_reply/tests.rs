@@ -38,7 +38,10 @@ fn source_references_and_evidenced_speakers_are_reviewed_without_phrase_guards()
             "The archive's account gives 1974 as the opening date. source_1",
         ),
     ] {
-        let evidence = vec![json!({"source":"https://example.org/report","passage":passage})];
+        let evidence = vec![single_source_evidence(
+            "https://example.org/report",
+            passage,
+        )];
         let mut calls = 0;
         let result =
             ground_research_reply("What does the source report?", draft, &evidence, |prompt| {
@@ -82,16 +85,21 @@ fn conditional_sources_cannot_become_an_outcome_or_a_denial() {
 #[test]
 fn independent_source_clauses_cannot_become_a_causal_explanation() {
     let passage = "Meridian Laboratory did not demonstrate superconductivity; its experiment measured magnetic susceptibility.";
-    let evidence = vec![json!({"source":"https://example.org/report","passage":passage})];
+    let evidence = vec![single_source_evidence(
+        "https://example.org/report",
+        passage,
+    )];
     let draft = "Meridian Laboratory did not demonstrate superconductivity because its experiment measured magnetic susceptibility instead.";
     let mut calls = 0;
     let answer = ground_research_reply("Did Meridian Laboratory demonstrate superconductivity?", draft, &evidence,
         |prompt| { calls += 1;
-            if prompt.contains("Check the ANSWER's factual assertions") {
+            if prompt.contains("tentative answer interpretation") {
+                Ok(r#"{"verdict":"unqualified","reason":"The answer presents the causal link as fact."}"#.into())
+            } else if prompt.contains("Check the ANSWER's factual assertions") {
                 Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"Both observations occur in the source."}).to_string())
             } else { Ok(passage.into()) }
         }).unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(!answer.contains("because"));
     assert!(answer.contains("did not demonstrate"));
 }
@@ -105,11 +113,13 @@ fn an_unseen_location_cannot_be_added_despite_positive_review() {
     let answer = ground_research_reply("Who founded Meridian Observatory?",
         "Ada Voss founded Meridian Observatory in 1974. Meridian Observatory is located in California.", &evidence,
         |prompt| { calls += 1;
-            if prompt.contains("Check the ANSWER's factual assertions") {
+            if prompt.contains("tentative answer interpretation") {
+                Ok(r#"{"verdict":"unqualified","reason":"The location is not supported."}"#.into())
+            } else if prompt.contains("Check the ANSWER's factual assertions") {
                 Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The source names the founder."}).to_string())
             } else { Ok("According to the source, Ada Voss founded Meridian Observatory in 1974.".into()) }
         }).unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(!answer.contains("California"));
     assert!(answer.contains("Ada Voss"));
 }
@@ -124,6 +134,152 @@ fn source_labels_resolve_case_variants_without_leaking_internal_identifiers() {
         |_| Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,"reason":"The passage states this function."}).to_string())).unwrap();
     assert!(!answer.contains("Source_1"));
     assert!(answer.contains("https://example.org/report"));
+}
+
+#[test]
+fn repeated_structural_failure_gets_one_final_repair_to_preserve_source_wording() {
+    let passage = "Mira Vale wrote Aster and Ash and Sea and Silence.";
+    let evidence = vec![single_source_evidence("https://example.org/works", passage)];
+    let split = "Mira Vale wrote Aster, Ash, Sea, and Silence.";
+    let corrected = "The source says, ‘Mira Vale wrote Aster and Ash and Sea and Silence.’ It does not show where one title ends and another begins.";
+    let mut calls = 0;
+    let answer = ground_research_reply_with_scope(
+        "What books did Mira Vale write?",
+        split,
+        &evidence,
+        None,
+        |prompt, is_answer| {
+            calls += 1;
+            if prompt.contains("tentative answer interpretation") {
+                return Ok(r#"{"verdict":"unqualified","reason":"The answer does not state uncertainty at the disputed title boundary.","uncertainty_quote":"","gap_quote":"","basis_quote":"Mira Vale wrote Aster and Ash and Sea and Silence"}"#.into());
+            }
+            if is_answer {
+                if calls == 3 {
+                    return Ok(split.into());
+                }
+                assert_eq!(calls, 6);
+                assert!(prompt.contains("first preserve its complete relevant wording verbatim"));
+                assert!(prompt.contains("A prior rewrite changed source wording"));
+                return Ok(corrected.into());
+            }
+            assert!(prompt.contains("Check the ANSWER's factual assertions"));
+            Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,
+                "reason":"The answer quotes the source wording and identifies the unresolved title boundary."}).to_string())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 7);
+    assert!(answer.starts_with(corrected));
+    assert!(answer.contains("https://example.org/works"));
+}
+
+#[test]
+fn unresolved_structural_rewrites_require_review_of_the_source_literal_partial() {
+    let passage = "Mira Vale wrote Aster and Ash and Sea and Silence.";
+    let evidence = vec![json!({
+        "source":"https://example.org/works",
+        "passage":passage
+    })];
+    let split = "Mira Vale wrote Aster, Ash, Sea, and Silence.";
+    let mut calls = 0;
+    let answer = ground_research_reply_with_scope(
+        "What books did Mira Vale write?",
+        split,
+        &evidence,
+        None,
+        |prompt, is_answer| {
+            calls += 1;
+            if prompt.contains("Assess whether this answer can be shown") {
+                assert!(!prompt.contains("https://example.org/works"));
+                return Ok(json!({"verdict":"useful","all_assertions_supported":true,
+                    "reason":"The exact passage helps answer the request while preserving the unresolved boundaries.",
+                    "contribution_quote":passage,
+                    "uncertainty_quote":"I can't reliably separate these into distinct items.",
+                    "basis_quote":passage}).to_string());
+            }
+            if is_answer {
+                Ok(split.into())
+            } else {
+                Ok(
+                    json!({"verdict":"revise","supported":false,"addresses_request":true,
+                    "reason":"The answer invents boundaries between the joined terms."})
+                    .to_string(),
+                )
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(calls, 7);
+    assert!(answer.contains(passage));
+    assert!(answer.contains("I can't reliably separate these into distinct items."));
+    assert!(answer.contains("https://example.org/works"));
+    assert!(!answer.contains("Aster, Ash, Sea, and Silence"));
+}
+
+#[test]
+fn rejected_source_literal_partial_cannot_bypass_review_after_failed_repairs() {
+    let passage = "Mira Vale wrote Aster and Ash and Sea and Silence.";
+    let evidence = vec![single_source_evidence("https://example.org/works", passage)];
+    let split = "Mira Vale wrote Aster, Ash, Sea, and Silence.";
+    for response in [
+        "not JSON",
+        r#"{"verdict":"uncertain"}"#,
+        r#"{"verdict":"not_useful","reason":"This does not answer the request."}"#,
+    ] {
+        let mut partial_reviews = 0;
+        let answer = ground_research_reply_with_scope(
+            "What books did Mira Vale write?",
+            split,
+            &evidence,
+            None,
+            |prompt, is_answer| {
+                if prompt.contains("Assess whether this answer can be shown") {
+                    partial_reviews += 1;
+                    return Ok(response.into());
+                }
+                Ok(if is_answer {
+                    split.into()
+                } else {
+                    json!({"verdict":"revise","supported":false,"addresses_request":true,
+                        "reason":"Unsupported item boundaries."})
+                    .to_string()
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(partial_reviews, 1);
+        assert_eq!(answer, missing_research_answer());
+    }
+}
+
+#[test]
+fn unsupported_shortened_name_is_repaired_through_semantic_review() {
+    let passage = "Mira Vale wrote Aster and Ash and Sea and Silence.";
+    let evidence = vec![single_source_evidence("https://example.org/works", passage)];
+    let shortened = "Mira Vale wrote a single book titled Aster and Ash.";
+    let corrected = format!(
+        "The source says ‘{passage}’ I can't determine the distinct titles from that wording."
+    );
+    let mut calls = 0;
+    let answer = ground_research_reply("What books did Mira Vale write?", shortened, &evidence,
+        |prompt| {
+            calls += 1;
+            Ok(match calls {
+                1 | 2 => json!({"verdict":"revise","supported":false,"addresses_request":true,
+                    "reason":"The passage does not establish a single book with that shortened name."}).to_string(),
+                3 => {
+                    assert!(prompt.contains(shortened));
+                    corrected.clone()
+                },
+                4 => json!({"verdict":"accept","supported":true,"addresses_request":true,
+                    "reason":"The answer preserves the source wording and withholds a split."}).to_string(),
+                _ => panic!("semantic repair must remain bounded"),
+            })
+        }).unwrap();
+    assert_eq!(calls, 4);
+    assert!(answer.starts_with(&corrected));
+    assert!(!answer.contains("single book"));
 }
 
 #[test]
@@ -148,7 +304,10 @@ fn source_conjunctions_cannot_be_split_despite_positive_model_review() {
             "The source names Dana Vale and Rowan Patel as the founders.",
         ),
     ] {
-        let evidence = vec![json!({"source":"https://example.org/reference","passage":passage})];
+        let evidence = vec![single_source_evidence(
+            "https://example.org/reference",
+            passage,
+        )];
         let mut reviews = 0;
         let result = ground_research_reply(question, broken, &evidence, |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
@@ -269,9 +428,9 @@ fn historical_selection_limits_currentness_even_when_original_gate_is_eligible()
         None,
     );
     assert!(
-        view[0]["required_qualifications"]
+        view[0]["source_guidance"]
             .to_string()
-            .contains("current_status_not_established")
+            .contains("does not establish present status")
     );
     assert!(view[0]["passage"].as_str().unwrap().contains("2012"));
 }
@@ -285,13 +444,15 @@ fn grounding_basics_rejects_invented_entity_extension_despite_positive_review() 
         "Helios Laboratory and Helios Institute share a common origin. Independent corroboration is not established.",
         &evidence, |prompt| {
             calls += 1;
-            if prompt.contains("Check the ANSWER's factual assertions") {
+            if prompt.contains("tentative answer interpretation") {
+                Ok(r#"{"verdict":"unqualified","reason":"The institute name is unsupported."}"#.into())
+            } else if prompt.contains("Check the ANSWER's factual assertions") {
                 Ok(r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Qualified provenance answer."}"#.into())
             } else {
                 Ok("Sciencewire reports the Helios Laboratory flight test in 2020. Independent corroboration is not established. source_1".into())
             }
         }).unwrap();
-    assert_eq!(calls, 3);
+    assert_eq!(calls, 4);
     assert!(!answer.contains("Helios Institute"));
     assert!(answer.contains("Helios Laboratory"));
 }
@@ -315,7 +476,10 @@ fn partial_answer_requests_are_interpreted_from_the_question_not_phrase_gates() 
             "The itinerary includes Trinidad and Tobago, Antigua and Barbuda, and Saint Lucia, but doesn't rank them.",
         ),
     ] {
-        let evidence = vec![json!({"source":"https://example.org/reference","passage":passage})];
+        let evidence = vec![single_source_evidence(
+            "https://example.org/reference",
+            passage,
+        )];
         let mut reviews = 0;
         let reply = ground_research_reply(question, "No supported ranking.", &evidence, |prompt| {
             if prompt.contains("Check the ANSWER's factual assertions") {
@@ -399,6 +563,9 @@ fn answer_generator_gets_qualification_codes_and_shared_lineage_without_internal
         "source_archive_id",
         "gate_status",
         "needs_review",
+        "source_attribution_required",
+        "current_status_not_established",
+        "reports_conflict",
         "shared-wire",
         "https://",
     ] {
@@ -426,14 +593,14 @@ fn answer_generator_gets_qualification_codes_and_shared_lineage_without_internal
     assert!(!text.contains("publication_"));
     assert!(public[0].get("source_date").is_none());
     assert!(
-        public[0]["required_qualifications"]
+        public[0]["source_guidance"]
             .to_string()
-            .contains("current_status_not_established")
+            .contains("does not establish present status")
     );
     assert!(
-        public[2]["required_qualifications"]
+        public[2]["source_guidance"]
             .to_string()
-            .contains("reports_conflict")
+            .contains("conflicting accounts")
     );
     assert!(!text.contains("Attribute this assertion to its source."));
     assert!(text.contains("Aurora Observatory opened in 2001."));
@@ -653,7 +820,7 @@ fn partial_flavour_evidence_cannot_be_presented_as_a_complete_current_catalogue(
                 let data = prompt.split("Data: ").last().unwrap();
                 assert!(!data.contains("extraction_confidence"));
                 assert!(!data.contains("awaiting_corroboration"));
-                assert!(data.contains("current_status_not_established"));
+                assert!(data.contains("does not establish present status"));
             }
             assert!(prompt.contains("Walkers range includes paprika"));
             match calls {
@@ -703,7 +870,8 @@ fn duplicate_unverified_origin_cannot_be_called_independent_corroboration() {
                     r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"The answer clearly explains the shared origin."}"#.into()
                 })
             } else {
-                assert!(prompt.contains("previous answer failed review"));
+                assert!(prompt.contains("Reconsider the prior user-facing draft independently"));
+                assert!(!prompt.contains("review_feedback"));
                 Ok("Both pages repeat the same Newswire report, so this is not independent corroboration.".into())
             }
         },
@@ -749,7 +917,8 @@ fn known_conflict_cannot_be_silently_resolved_to_one_date() {
                     r#"{"verdict":"accept","supported":true,"addresses_request":true,"reason":"Both dates are attributed and the disagreement remains unresolved."}"#.into()
                 })
             } else {
-                assert!(prompt.contains("previous answer failed review"));
+                assert!(prompt.contains("Reconsider the prior user-facing draft independently"));
+                assert!(!prompt.contains("review_feedback"));
                 Ok("The sources conflict: one gives 1998 and the other gives 2000, so the date is unresolved.".into())
             }
         },
@@ -759,6 +928,48 @@ fn known_conflict_cannot_be_silently_resolved_to_one_date() {
     assert!(answer.contains("sources conflict"));
     assert!(answer.contains("1998"));
     assert!(answer.contains("2000"));
+}
+
+#[test]
+fn useful_supported_answer_can_pass_as_partial_without_becoming_verified_knowledge() {
+    let evidence = vec![
+        json!({"source":"https://a.example/history",
+            "passage":"Example Organization began operating in 1998."}),
+        json!({"source":"https://b.example/history",
+            "passage":"Example Organization began operating in 2000."}),
+    ];
+    let draft = "The first source reports 1998; the second reports 2000. The evidence does not settle which date is correct.";
+    let mut calls = 0;
+    let answer = ground_research_reply(
+        "When did Example Organization begin operating?",
+        draft,
+        &evidence,
+        |prompt| {
+            calls += 1;
+            if prompt.contains("Assess whether this answer can be shown") {
+                return Ok(json!({
+                    "verdict":"useful",
+                    "all_assertions_supported":true,
+                    "reason":"The answer attributes both relevant dates and states that the evidence does not decide between them.",
+                    "contribution_quote":"The first source reports 1998; the second reports 2000.",
+                    "uncertainty_quote":"The evidence does not settle which date is correct.",
+                    "basis_quote":"Example Organization began operating in 1998."
+                }).to_string());
+            }
+            Ok(json!({
+                "verdict":"uncertain",
+                "supported":false,
+                "addresses_request":false,
+                "reason":"The answer does not settle which conflicting date is correct."
+            }).to_string())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(calls, 3);
+    assert!(answer.starts_with(draft));
+    assert!(answer.contains("https://a.example/history"));
+    assert!(answer.contains("https://b.example/history"));
 }
 
 #[test]
@@ -933,10 +1144,9 @@ fn research_review_does_not_publish_failed_or_malformed_reviews() {
         } else {
             r#"{"verdict":"revise","supported":false,"addresses_request":false,"reason":"Missing evidence"}"#.into()
         })
-    })
-    .unwrap();
-    assert_eq!(result, missing_research_answer());
-    assert_eq!(calls, 4);
+    });
+    assert!(result.is_err());
+    assert_eq!(calls, 3);
     for response in [
         "not JSON",
         r#"{"reason":"No verdict"}"#,

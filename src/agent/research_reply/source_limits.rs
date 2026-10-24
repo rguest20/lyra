@@ -1,5 +1,6 @@
 //! Replies whose assertions follow directly from exact excerpts and verified
 //! source-use metadata. This is a bounded fallback, not an intent classifier.
+#[cfg(test)]
 use serde_json::Value;
 
 pub(super) struct LimitedAnswer {
@@ -7,37 +8,46 @@ pub(super) struct LimitedAnswer {
     pub kind: &'static str,
 }
 
+#[cfg(test)]
 pub(super) fn source_limited_answer_with_scope(
     question: &str,
     evidence: &[Value],
     currentness: Option<bool>,
 ) -> Option<LimitedAnswer> {
+    let evidence = evidence
+        .iter()
+        .map(super::source_view::SourceUseEvidence::from_json)
+        .collect::<Vec<_>>();
+    source_limited_answer_with_source_use(
+        &evidence,
+        currentness,
+        crate::research::source_independence_request(question),
+    )
+}
+
+pub(super) fn source_limited_answer_with_source_use(
+    evidence: &[super::source_view::SourceUseEvidence<'_>],
+    currentness: Option<bool>,
+    provenance_request: bool,
+) -> Option<LimitedAnswer> {
     if evidence.is_empty()
         || evidence.len() > 3
-        || evidence.iter().any(|entry| {
-            let state = &entry["evidence_state"];
-            state["gate_status"] == "conflict"
-                || state["conflicting_claims"]
-                    .as_array()
-                    .is_some_and(|claims| !claims.is_empty())
-        })
+        || evidence
+            .iter()
+            .any(super::source_view::SourceUseEvidence::has_disagreements)
     {
         return None;
     }
-    let provenance_request = crate::research::source_independence_request(question)
+    let provenance_request = provenance_request
         || evidence
             .iter()
-            .any(|entry| entry["evidence_state"]["research_relevance"] == "provenance");
+            .any(|entry| entry.research_relevance == Some("provenance"));
     // Only a resolved contextual assessment can authorize a direct historical
     // answer. If it is unresolved and the evidence is time-scoped, route through
     // the reviewed answer path, which retains the currentness qualification.
-    let has_temporal_scope = evidence.iter().any(|entry| {
-        let state = &entry["evidence_state"];
-        state["research_relevance"] == "historical_context"
-            || state["gate_status"] == "unverified_temporal"
-            || state["freshness"] == "stale"
-            || (state["topic_class"] == "recent" && state["currency"] != "current")
-    });
+    let has_temporal_scope = evidence
+        .iter()
+        .any(super::source_view::SourceUseEvidence::has_temporal_limit);
     if currentness.is_none() && has_temporal_scope && !provenance_request {
         return None;
     }
@@ -47,38 +57,33 @@ pub(super) fn source_limited_answer_with_scope(
     // relationship even if the separate currentness classifier misses a cue.
     let historical_context = evidence
         .iter()
-        .all(|entry| entry["evidence_state"]["research_relevance"] == "historical_context");
+        .all(|entry| entry.research_relevance == Some("historical_context"));
     let temporal = (current_request
         && evidence.iter().all(|entry| {
-            let state = &entry["evidence_state"];
-            state["research_relevance"] == "historical_context"
-                || state["gate_status"] == "unverified_temporal"
+            entry.research_relevance == Some("historical_context")
+                || entry.gate_status == Some("unverified_temporal")
         }))
         || historical_context;
-    let origin = evidence[0]["evidence_state"]["independence_key"]
-        .as_str()
-        .filter(|key| !key.trim().is_empty());
+    let origin = evidence[0].verified_origin();
     let one_verified_origin = provenance_request
         && origin.is_some()
-        && evidence.iter().all(|entry| {
-            let state = &entry["evidence_state"];
-            state["independence_verified"] == true && state["independence_key"].as_str() == origin
-        });
+        && evidence
+            .iter()
+            .all(|entry| entry.verified_origin() == origin);
     // A conditional source cannot establish either an actual outcome or its
     // definite absence. Quoting it preserves the condition without generating
     // an unsupported conclusion. This changes reply wording, never promotion.
     let scoped_stance = evidence.iter().all(|entry| {
-        let state = &entry["evidence_state"];
-        state["polarity"] == "negated"
-            || matches!(state["modality"].as_str(), Some("conditional" | "possible"))
+        entry.polarity == Some("negated")
+            || matches!(entry.modality, Some("conditional" | "possible"))
     });
     if !temporal && !one_verified_origin && !scoped_stance {
         return None;
     }
     let mut reports: Vec<(&str, Vec<&str>)> = Vec::new();
     for entry in evidence {
-        let passage = entry["passage"].as_str()?.trim();
-        let source = entry["source"].as_str()?.trim();
+        let passage = entry.passage?.trim();
+        let source = entry.source?.trim();
         if passage.is_empty()
             || source.is_empty()
             || passage.chars().count() > 500
@@ -88,9 +93,9 @@ pub(super) fn source_limited_answer_with_scope(
         }
         // A shortened quote must not silently discard an explicit scope or
         // attribution carried by the stored finding. Use full review otherwise.
-        for field in ["context_scope", "geographic_scope", "attribution"] {
-            if entry["evidence_state"][field]
-                .as_str()
+        for (field, _) in super::source_view::SOURCE_SCOPE_FIELDS {
+            if entry
+                .scoped_value(field)
                 .is_some_and(|scope| !scope.trim().is_empty() && !passage.contains(scope))
             {
                 return None;

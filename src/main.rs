@@ -4,6 +4,7 @@ mod curator;
 mod curmudgeon;
 mod diagnostics;
 mod entities;
+mod errors;
 mod inference;
 mod knowledge;
 mod maintenance;
@@ -12,6 +13,8 @@ mod scholar;
 mod scout;
 mod semantic;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod web;
 
 fn main() {

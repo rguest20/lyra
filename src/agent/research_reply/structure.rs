@@ -15,7 +15,9 @@ pub(super) fn unsupported_entity_name(answer: &str, evidence: &[Value]) -> Optio
     crate::entities::literal_name_phrases(answer)
         .into_iter()
         .find(|name| {
-            if is_bracketed_url_citation_label(answer, name) {
+            if is_bracketed_url_citation_label(answer, name)
+                || is_numbered_source_reference(answer, name, evidence.len())
+            {
                 return false;
             }
             let words = normalized_words(name);
@@ -27,6 +29,26 @@ pub(super) fn unsupported_entity_name(answer: &str, evidence: &[Value]) -> Optio
                     .iter()
                     .any(|passage| passage.windows(words.len()).any(|window| window == words))
         })
+}
+
+// A generated citation such as "(Source 2)" is a reference to an evidence
+// slot, not a newly asserted named entity.
+fn is_numbered_source_reference(answer: &str, label: &str, source_count: usize) -> bool {
+    if !label.eq_ignore_ascii_case("source") {
+        return false;
+    }
+    answer.match_indices(label).any(|(start, _)| {
+        let after = answer[start + label.len()..].trim_start();
+        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        digits > 0
+            && after[..digits]
+                .parse::<usize>()
+                .is_ok_and(|number| (1..=source_count).contains(&number))
+            && after[digits..]
+                .chars()
+                .next()
+                .is_some_and(|ch| matches!(ch, ')' | ']' | '.' | ':' | ',' | ' '))
+    })
 }
 
 fn is_bracketed_url_citation_label(answer: &str, label: &str) -> bool {
@@ -51,10 +73,12 @@ fn is_bracketed_url_citation_label(answer: &str, label: &str) -> bool {
 fn phrase_is_mid_sentence(answer: &str, name: &str) -> bool {
     answer.match_indices(name).any(|(index, _)| {
         answer[..index]
-            .trim_end_matches([' ', '\t', '"', '\'', '“', '”', '‘', '’', '*', '('])
+            .trim_end_matches([
+                ' ', '\t', '"', '\'', '“', '”', '‘', '’', '*', '(', '-', '•', '–', '>',
+            ])
             .chars()
             .next_back()
-            .is_some_and(|previous| !matches!(previous, '.' | '!' | '?' | ':' | ';' | '\n'))
+            .is_some_and(|previous| !matches!(previous, '.' | '!' | '?' | ':' | ';' | '\n' | '\r'))
     })
 }
 
@@ -93,6 +117,18 @@ pub(super) fn altered_source_conjunction(answer: &str, evidence: &[Value]) -> Op
         }
     }
     None
+}
+
+pub(super) fn ambiguous_conjunction_source<'a>(
+    answer: &str,
+    evidence: &'a [Value],
+) -> Option<(&'a str, &'a str)> {
+    let phrase = altered_source_conjunction(answer, evidence)?;
+    evidence.iter().find_map(|entry| {
+        let passage = entry["passage"].as_str()?;
+        let source = entry["source"].as_str()?;
+        passage.contains(&phrase).then_some((passage, source))
+    })
 }
 
 fn list_boundary(separator: &str) -> bool {
@@ -170,6 +206,14 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_and_heading_boundaries_do_not_join_adjacent_names() {
+        let evidence =
+            vec![json!({"passage":"Mira Vale wrote Aster and Ash and Sea and Silence."})];
+        let answer = "Mira Vale wrote Aster, Ash, Sea, and Silence.\n\n**Limitations:** The boundaries are unclear.";
+        assert_eq!(unsupported_entity_name(answer, &evidence), None);
+    }
+
+    #[test]
     fn causal_join_checks_preserve_explicit_source_causes_and_evidence_limits() {
         let passage = "The laboratory closed because the building flooded.";
         assert!(unsupported_causal_join(passage, &[json!({"passage":passage})]).is_none());
@@ -194,13 +238,30 @@ mod tests {
 
     #[test]
     fn bracketed_url_citation_labels_are_not_treated_as_claim_entities() {
-        let evidence = vec![json!({"passage":"Alexander Fleming discovered penicillin in 1928."})];
+        let evidence = vec![
+            json!({"passage":"Alexander Fleming discovered penicillin in 1928."}),
+            json!({"passage":"Another source confirms the discovery date."}),
+        ];
         for citation in [
             "Alexander Fleming discovered penicillin in 1928. [Source: https://example.org/page]",
             "Alexander Fleming discovered penicillin in 1928. [Reference: https://example.org/page]",
         ] {
             assert_eq!(unsupported_entity_name(citation, &evidence), None);
         }
+        assert_eq!(
+            unsupported_entity_name(
+                "One account gives 1998 (Source 1), while another gives 2000 (Source 2).",
+                &evidence
+            ),
+            None
+        );
+        assert_eq!(
+            unsupported_entity_name(
+                "The reports conflict:\n- One source says 1998 (Source 1).\n- Another source says 2000 (Source 2).",
+                &evidence
+            ),
+            None
+        );
     }
 
     #[test]
@@ -219,8 +280,11 @@ mod tests {
     fn bullet_boundaries_and_alternative_source_punctuation() {
         let first = json!({"passage":"The works include Aster and Ash and Sea and Silence."});
         assert!(
-            altered_source_conjunction("- Aster\n- Ash\n- Sea and Silence", &[first.clone()])
-                .is_some()
+            altered_source_conjunction(
+                "- Aster\n- Ash\n- Sea and Silence",
+                std::slice::from_ref(&first)
+            )
+            .is_some()
         );
         let second = json!({"passage":"The titles are Aster, Ash, Sea, Silence."});
         assert!(altered_source_conjunction("Aster, Ash, Sea, Silence", &[first, second]).is_none());
