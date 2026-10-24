@@ -1,22 +1,26 @@
-use super::Cli;
+use super::{Cli, ensure_no_arguments};
 use crate::{curmudgeon, inference::assignments::AgentRole, maintenance, scholar, scout, storage};
 
 impl Cli {
     pub(super) fn curate_once(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_runtime("curate-once")?;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
-        if args.next().is_some() {
-            return Err("curate-once takes no arguments".into());
-        }
+        ensure_no_arguments(&args, "curate-once takes no arguments")?;
         let mode = if std::env::var("COMMUNITY_MAINTENANCE_MODE").as_deref() == Ok("serve") {
             "serve"
         } else {
             "once"
         };
-        let summary =
-            maintenance::run_pass(database_path, knowledge_path, &self.model_runtime, mode)
-                .map_err(|e| format!("maintenance failed: {e}"))?;
+        let summary = maintenance::run_pass(
+            database_path,
+            knowledge_path,
+            self.model_runtime
+                .as_ref()
+                .expect("model runtime initialized"),
+            mode,
+        )
+        .map_err(|e| format!("maintenance failed: {e}"))?;
         if mode == "serve" {
             println!(
                 "{}",
@@ -36,13 +40,15 @@ impl Cli {
     }
 
     pub(super) fn scout_once(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_runtime("scout-once")?;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
-        if args.next().is_some() {
-            return Err("scout-once takes no arguments".into());
-        }
-        let mut backend = self.model_runtime.model(AgentRole::Scout);
+        ensure_no_arguments(&args, "scout-once takes no arguments")?;
+        let mut backend = self
+            .model_runtime
+            .as_ref()
+            .expect("model runtime initialized")
+            .model(AgentRole::Scout);
         let queued = scout::process_once(database_path, knowledge_path, &mut backend)
             .map_err(|e| format!("Scout failed: {e}"))?;
         println!("Queued {queued} Scout investigation(s)");
@@ -50,11 +56,8 @@ impl Cli {
     }
 
     pub(super) fn scout(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
         let database_path = &self.database_path;
-        if args.next().is_some() {
-            return Err("scout takes no arguments".into());
-        }
+        ensure_no_arguments(&args, "scout takes no arguments")?;
         let store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         for investigation in store.scout_investigations().map_err(|e| e.to_string())? {
             println!(
@@ -86,12 +89,14 @@ impl Cli {
     }
 
     pub(super) fn scholar_once(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_runtime("scholar-once")?;
         let database_path = &self.database_path;
-        if args.next().is_some() {
-            return Err("scholar-once takes no arguments".into());
-        }
-        let mut backend = self.model_runtime.model(AgentRole::Scholar);
+        ensure_no_arguments(&args, "scholar-once takes no arguments")?;
+        let mut backend = self
+            .model_runtime
+            .as_ref()
+            .expect("model runtime initialized")
+            .model(AgentRole::Scholar);
         let processed = scholar::process_once(database_path, &mut backend)
             .map_err(|e| format!("scholar failed: {e}"))?;
         println!("Processed {processed} scholar job(s)");
@@ -99,13 +104,15 @@ impl Cli {
     }
 
     pub(super) fn curmudgeon_once(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_runtime("curmudgeon-once")?;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
-        if args.next().is_some() {
-            return Err("curmudgeon-once takes no arguments".into());
-        }
-        let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+        ensure_no_arguments(&args, "curmudgeon-once takes no arguments")?;
+        let mut backend = self
+            .model_runtime
+            .as_ref()
+            .expect("model runtime initialized")
+            .model(AgentRole::Curmudgeon);
         let processed = curmudgeon::process_once(database_path, knowledge_path, &mut backend)
             .map_err(|e| format!("Curmudgeon failed: {e}"))?;
         println!("Audited {processed} assistant reply/replies");
@@ -113,9 +120,8 @@ impl Cli {
     }
 
     pub(super) fn curmudgeon(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
         let database_path = &self.database_path;
-        let values = args.collect::<Vec<_>>();
+        let values = args;
         let store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         match values.as_slice() {
             [subcommand, text @ ..] if subcommand == "audit" && !text.is_empty() => {
@@ -148,16 +154,18 @@ impl Cli {
                         println!("  Compared with: {}", claim.evidence_refs.join(", "));
                     }
                 }
-                for (id, status, error) in store
+                for reply in store
                     .assistant_reply_attention()
                     .map_err(|e| e.to_string())?
                 {
                     println!(
-                        "Reply {id} [{status}]{}",
-                        if error.is_empty() {
+                        "Reply {} [{}]{}",
+                        reply.reply_id,
+                        reply.status,
+                        if reply.error.is_empty() {
                             String::new()
                         } else {
-                            format!(": {error}")
+                            format!(": {}", reply.error)
                         }
                     );
                 }
@@ -168,9 +176,8 @@ impl Cli {
     }
 
     pub(super) fn scholar(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
         let database_path = &self.database_path;
-        let values = args.collect::<Vec<_>>();
+        let values = args;
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         match values.as_slice() {
             [subcommand] if subcommand == "usage" => {

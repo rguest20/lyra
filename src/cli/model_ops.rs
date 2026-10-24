@@ -6,12 +6,17 @@ use std::fs;
 
 impl Cli {
     pub(super) fn model(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
+        let values = args;
+        if !matches!(
+            values.first().map(String::as_str),
+            Some("history" | "approve")
+        ) {
+            self.ensure_runtime("model")?;
+        }
         let model_dir = &self.model_dir;
         let adapter_path = &self.adapter_path;
         let cpu = self.cpu;
         let database_path = &self.database_path;
-        let values = args.collect::<Vec<_>>();
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         match values.as_slice() {
             [action] if action == "history" => {
@@ -41,7 +46,11 @@ impl Cli {
                 }
             }
             [action, title, passage] if action == "probe-baskets" => {
-                let mut backend = self.model_runtime.model(AgentRole::Scholar);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Scholar);
                 let baskets = crate::scholar::probe_baskets(title, passage, &mut backend)
                     .map_err(|error| error.to_string())?;
                 println!(
@@ -50,7 +59,11 @@ impl Cli {
                 );
             }
             [action, question, title, passage] if action == "probe-scholar" => {
-                let mut backend = self.model_runtime.model(AgentRole::Scholar);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Scholar);
                 println!(
                     "{}",
                     crate::scholar::probe_extraction(question, title, passage, &mut backend)
@@ -59,7 +72,11 @@ impl Cli {
             [action, context] if action == "probe-support" => {
                 let context: serde_json::Value =
                     serde_json::from_str(context).map_err(|error| error.to_string())?;
-                let mut backend = self.model_runtime.model(AgentRole::Scholar);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Scholar);
                 println!(
                     "{}",
                     crate::semantic::probe(&context, &mut backend)
@@ -67,7 +84,11 @@ impl Cli {
                 );
             }
             [action, subject, title, passage] if action == "probe-aliases" => {
-                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Curmudgeon);
                 let aliases = crate::entities::resolve_with(subject, title, passage, |messages| {
                     backend.chat_for_extraction(messages)
                 })
@@ -78,7 +99,11 @@ impl Cli {
                 );
             }
             [action, question, evidence] if action == "probe-lookup" => {
-                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Curmudgeon);
                 let plan = crate::research::plan_with(question, evidence, |messages| {
                     backend.chat_for_extraction(messages)
                 })
@@ -91,7 +116,11 @@ impl Cli {
             [action, context] if action == "probe-review" => {
                 let context: serde_json::Value =
                     serde_json::from_str(context).map_err(|error| error.to_string())?;
-                let mut backend = self.model_runtime.model(AgentRole::Curmudgeon);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Curmudgeon);
                 println!(
                     "{}",
                     crate::curmudgeon::probe_source_review(&context, &mut backend)
@@ -99,7 +128,11 @@ impl Cli {
                 );
             }
             [action, prompt @ ..] if action == "probe-chat" && !prompt.is_empty() => {
-                let mut backend = self.model_runtime.model(AgentRole::Interaction);
+                let mut backend = self
+                    .model_runtime
+                    .as_ref()
+                    .unwrap()
+                    .model(AgentRole::Interaction);
                 println!(
                     "{}",
                     backend
@@ -250,13 +283,10 @@ impl Cli {
                         }
                     }
                 }
-                let (tokens, loss, passes) = match result {
-                    Some(result) => result,
-                    None => {
-                        drop(backend);
-                        fs::remove_dir_all(&output_dir).map_err(|e| e.to_string())?;
-                        return Err("model did not recall the claim after 24 passes; no checkpoint was published".into());
-                    }
+                let Some((tokens, loss, passes)) = result else {
+                    drop(backend);
+                    fs::remove_dir_all(&output_dir).map_err(|e| e.to_string())?;
+                    return Err("model did not recall the claim after 24 passes; no checkpoint was published".into());
                 };
                 let output = output_dir.join("model.safetensors");
                 backend
@@ -587,14 +617,7 @@ mod tests {
 
     #[test]
     fn checkpoint_hash_detects_shard_changes_without_index_changes() {
-        let dir = std::env::temp_dir().join(format!(
-            "community-shard-hash-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::test_support::unique_temp_path("community-shard-hash", "");
         std::fs::create_dir(&dir).unwrap();
         let shard = dir.join("weights.safetensors");
         let index = dir.join("model.safetensors.index.json");

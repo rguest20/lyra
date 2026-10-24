@@ -99,11 +99,10 @@ impl MlxModel {
         )?;
         let checkpoints = checkpoint_files(checkpoint)?;
         let device_lease = acquire_model_lease(lease)?;
-        let python = std::env::var_os("COMMUNITY_MLX_PYTHON")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv-qwen35/bin/python")
-            });
+        let python = std::env::var_os("COMMUNITY_MLX_PYTHON").map_or_else(
+            || Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv-qwen35/bin/python"),
+            PathBuf::from,
+        );
         let init = serde_json::json!({"model_dir": dir, "checkpoints": checkpoints, "adapter": adapter, "context_tokens": max_context});
         let mut worker = spawn_worker(&python, &init)?;
         let ready = worker.read()?;
@@ -293,7 +292,7 @@ impl MlxModel {
                 Err(error) => {
                     crate::diagnostics::event(
                         "model.reply_recovery",
-                        serde_json::json!({"attempt":attempt+1,"reason":error.to_string(),"finish_reason":response["finish_reason"],"generated_output_excerpt":decoded.chars().take(1200).collect::<String>(),"action":if attempt==0 {"retry_without_thinking"} else {"fail_after_retry"}}),
+                        serde_json::json!({"attempt":attempt+1,"reason":error.to_string(),"finish_reason":response["finish_reason"],"generated_output_excerpt":crate::diagnostics::text_excerpt(&decoded, 1200),"action":if attempt==0 {"retry_without_thinking"} else {"fail_after_retry"}}),
                     );
                     if attempt == 2 {
                         return Err(error);
@@ -335,19 +334,7 @@ impl MlxModel {
             ],
             false,
         )?;
-        let mut targets = self
-            .tokenizer
-            .encode(answer, false)
-            .map_err(other)?
-            .get_ids()
-            .to_vec();
-        if targets.is_empty() || targets.len() > MAX_TRAIN {
-            return Err(invalid("training answer exceeds 128 tokens"));
-        }
-        targets.push(self.tokenizer.token_to_id("<|im_end|>").unwrap());
-        if ids.len() + targets.len() > self.max_context {
-            return Err(invalid("training example exceeds context limit"));
-        }
+        let targets = training_target_ids(&self.tokenizer, answer, &ids, self.max_context)?;
         let response = self.request(
             serde_json::json!({"op":"train","ids":ids,"targets":targets,"adapter":self.adapter}),
         )?;
@@ -523,14 +510,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "community-reply-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-reply-test", "");
         let worker = worker(
             "import sys,json\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n assert request['thinking'] == (attempt<2)\n if attempt==0: initial=request['thinking_budget']\n if attempt==1:\n  assert request['thinking_budget']>initial\n  assert request['ids'][-2:]==[3,4]\n if attempt==2: assert request['ids'][-5:]==[3,4,4,6,7]\n print(json.dumps({'tokens':[[3,4],[4],[5]][attempt],'thinking_tokens':initial if attempt==0 else request['thinking_budget'] if attempt==1 else 0,'finish_reason':'thinking_budget' if attempt<2 else 'stop_token'}),flush=True)",
         );
@@ -580,14 +560,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "community-cap-retry-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-cap-retry-test", "");
         let worker = worker(
             "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<2\n if attempt==0:\n  assert request['thinking']\n  previous=request['max_tokens']\n  tokens=[3,4,5,6]\n  finish='max_tokens'\n else:\n  assert not request['thinking'] and request['max_tokens']>previous\n  tokens=[7]\n  finish='stop_token'\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':finish}),flush=True)",
         );
@@ -638,14 +611,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "community-cap-stop-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-cap-stop-test", "");
         let worker = worker(
             "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n if attempt:\n  assert not request['thinking'] and request['max_tokens']>previous\n previous=request['max_tokens']\n tokens=[3,4,5,6] if attempt==0 else [6]\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':'max_tokens'}),flush=True)",
         );

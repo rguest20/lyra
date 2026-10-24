@@ -8,6 +8,18 @@ use crate::inference::assignments::{AgentRole, ModelRuntime, ModelSpec};
 use crate::{agent::Agent, knowledge::KnowledgeMap};
 use std::{env, path::PathBuf};
 
+fn configured_path(variable: &str, default: impl FnOnce() -> PathBuf) -> PathBuf {
+    env::var_os(variable).map_or_else(default, PathBuf::from)
+}
+
+fn ensure_no_arguments(args: &[String], error: &str) -> Result<(), String> {
+    if !args.is_empty() {
+        Err(error.into())
+    } else {
+        Ok(())
+    }
+}
+
 struct Cli {
     model: String,
     model_dir: PathBuf,
@@ -16,9 +28,9 @@ struct Cli {
     state_path: PathBuf,
     knowledge_path: PathBuf,
     database_path: PathBuf,
-    model_runtime: ModelRuntime,
-    agent: Agent,
-    map: KnowledgeMap,
+    model_runtime: Option<ModelRuntime>,
+    agent: Option<Agent>,
+    map: Option<KnowledgeMap>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -30,56 +42,22 @@ pub fn run() -> Result<(), String> {
         return Ok(());
     }
     let model = env::var("COMMUNITY_MODEL_ID").unwrap_or_else(|_| "Qwen/Qwen3-0.6B".into());
-    let model_dir = env::var_os("COMMUNITY_MODEL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("models/qwen3-0.6b"));
-    let adapter_path = env::var_os("COMMUNITY_ADAPTER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            if model_dir == std::path::Path::new("models/qwen3-0.6b") {
-                PathBuf::from("state/adapter.safetensors")
-            } else {
-                model_dir.join("adapter.safetensors")
-            }
-        });
-    let cpu = env::var("COMMUNITY_DEVICE").is_ok_and(|value| value == "cpu");
-    let state_path = env::var_os("COMMUNITY_STATE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("state/agent-qwen3-0.6b.json"));
-    let knowledge_path = env::var_os("COMMUNITY_KNOWLEDGE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("state/knowledge.json"));
-    let database_path = env::var_os("COMMUNITY_DB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("state/learning.db"));
-    let model_runtime = ModelRuntime::new(ModelSpec {
-        id: model.clone(),
-        directory: model_dir.clone(),
-        adapter: adapter_path.clone(),
-        cpu,
-    })
-    .map_err(|error| {
-        let reason = format!("invalid agent model configuration: {error}");
-        if command == "curate-once" {
-            let mode = if env::var("COMMUNITY_MAINTENANCE_MODE").as_deref() == Ok("serve") {
-                "serve"
-            } else {
-                "once"
-            };
-            if let Err(record_error) =
-                crate::maintenance::record_startup_failure(&database_path, mode, &reason)
-            {
-                return format!("{reason}; could not record failed pass: {record_error}");
-            }
+    let model_dir = configured_path("COMMUNITY_MODEL_DIR", || PathBuf::from("models/qwen3-0.6b"));
+    let adapter_path = configured_path("COMMUNITY_ADAPTER", || {
+        if model_dir == std::path::Path::new("models/qwen3-0.6b") {
+            PathBuf::from("state/adapter.safetensors")
+        } else {
+            model_dir.join("adapter.safetensors")
         }
-        reason
-    })?;
-    let interaction_model = model_runtime
-        .model_id(AgentRole::Interaction)
-        .map_err(|error| error.to_string())?;
-    let agent =
-        Agent::load_for_model_change(&state_path, &interaction_model).map_err(|e| e.to_string())?;
-    let map = KnowledgeMap::load(&knowledge_path).map_err(|e| e.to_string())?;
+    });
+    let cpu = env::var("COMMUNITY_DEVICE").is_ok_and(|value| value == "cpu");
+    let state_path = configured_path("COMMUNITY_STATE", || {
+        PathBuf::from("state/agent-qwen3-0.6b.json")
+    });
+    let knowledge_path = configured_path("COMMUNITY_KNOWLEDGE", || {
+        PathBuf::from("state/knowledge.json")
+    });
+    let database_path = configured_path("COMMUNITY_DB", || PathBuf::from("state/learning.db"));
     let mut cli = Cli {
         model,
         model_dir,
@@ -88,14 +66,67 @@ pub fn run() -> Result<(), String> {
         state_path,
         knowledge_path,
         database_path,
-        model_runtime,
-        agent,
-        map,
+        model_runtime: None,
+        agent: None,
+        map: None,
     };
     cli.dispatch(&command, args.collect())
 }
 
 impl Cli {
+    fn ensure_runtime(&mut self, command: &str) -> Result<(), String> {
+        if self.model_runtime.is_some() {
+            return Ok(());
+        }
+        let runtime = ModelRuntime::new(ModelSpec {
+            id: self.model.clone(),
+            directory: self.model_dir.clone(),
+            adapter: self.adapter_path.clone(),
+            cpu: self.cpu,
+        })
+        .map_err(|error| {
+            let reason = format!("invalid agent model configuration: {error}");
+            if command == "curate-once" {
+                let mode = if env::var("COMMUNITY_MAINTENANCE_MODE").as_deref() == Ok("serve") {
+                    "serve"
+                } else {
+                    "once"
+                };
+                if let Err(record_error) =
+                    crate::maintenance::record_startup_failure(&self.database_path, mode, &reason)
+                {
+                    return format!("{reason}; could not record failed pass: {record_error}");
+                }
+            }
+            reason
+        })?;
+        self.model_runtime = Some(runtime);
+        Ok(())
+    }
+
+    fn ensure_map(&mut self) -> Result<(), String> {
+        if self.map.is_none() {
+            self.map =
+                Some(KnowledgeMap::load(&self.knowledge_path).map_err(|error| error.to_string())?);
+        }
+        Ok(())
+    }
+
+    fn ensure_chat(&mut self, command: &str) -> Result<(), String> {
+        self.ensure_runtime(command)?;
+        if self.agent.is_none() {
+            let runtime = self.model_runtime.as_ref().expect("runtime initialized");
+            let interaction_model = runtime
+                .model_id(AgentRole::Interaction)
+                .map_err(|error| error.to_string())?;
+            self.agent = Some(
+                Agent::load_for_model_change(&self.state_path, &interaction_model)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        self.ensure_map()
+    }
+
     fn dispatch(&mut self, command: &str, args: Vec<String>) -> Result<(), String> {
         match command {
             "eval-fixture" => self.eval_fixture(args),

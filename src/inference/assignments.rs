@@ -76,6 +76,12 @@ pub struct RoutedModel {
     pub(super) last_thinking: Option<String>,
 }
 
+pub struct ReplyModels {
+    pub interaction: LocalModel,
+    pub research: LocalModel,
+    pub scholar: LocalModel,
+}
+
 impl ModelRuntime {
     pub fn new(default: ModelSpec) -> io::Result<Self> {
         let assignments = Assignments::from_environment(default)?;
@@ -165,6 +171,14 @@ impl ModelRuntime {
             role,
             last_thinking: None,
         })
+    }
+
+    pub fn reply_models(&self) -> ReplyModels {
+        ReplyModels {
+            interaction: self.model(AgentRole::Interaction),
+            research: self.model(AgentRole::Curmudgeon),
+            scholar: self.model(AgentRole::Scholar),
+        }
     }
 
     pub fn model_id(&self, role: AgentRole) -> io::Result<String> {
@@ -449,8 +463,10 @@ impl From<&ModelSpec> for ModelKey {
                 spec.adapter
                     .parent()
                     .and_then(|parent| parent.canonicalize().ok())
-                    .map(|parent| parent.join(spec.adapter.file_name().unwrap_or_default()))
-                    .unwrap_or_else(|| spec.adapter.clone())
+                    .map_or_else(
+                        || spec.adapter.clone(),
+                        |parent| parent.join(spec.adapter.file_name().unwrap_or_default()),
+                    )
             }),
             cpu: spec.cpu,
         }
@@ -712,16 +728,9 @@ mod tests {
         let runtime = ModelRuntime::with_assignments(
             Assignments::with_lookup(default_model(), |_| None).unwrap(),
         );
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let background_path = std::env::temp_dir().join(format!("lyra-background-{nonce}.lock"));
-        let chat_path = std::env::temp_dir().join(format!("lyra-chat-{nonce}.lock"));
+        let lease_paths = crate::test_support::unique_temp_path("lyra-request-leases", "");
+        let background_path = lease_paths.with_extension("background.lock");
+        let chat_path = lease_paths.with_extension("chat.lock");
         runtime.pool.lock().unwrap().inference_lock = background_path.clone();
         runtime.chat_pool.lock().unwrap().inference_lock = chat_path.clone();
 
@@ -783,15 +792,13 @@ mod tests {
         // Missing checkpoints exercise runtime scheduling without loading a
         // model or competing with a running application for its request lock.
         let mut spec = default_model();
-        spec.directory =
-            std::env::temp_dir().join(format!("lyra-chat-priority-absent-{}", std::process::id()));
+        spec.directory = crate::test_support::unique_temp_path("lyra-chat-priority-absent", "");
         let runtime =
             ModelRuntime::with_assignments(Assignments::with_lookup(spec, |_| None).unwrap());
-        let lock = std::env::temp_dir().join(format!(
-            "lyra-chat-priority-requests-{}.lock",
-            std::process::id()
-        ));
+        let lock = crate::test_support::unique_temp_path("lyra-chat-priority-requests", "lock");
         runtime.pool.lock().unwrap().inference_lock = lock.clone();
+        let chat_lock = lock.with_extension("chat.lock");
+        runtime.chat_pool.lock().unwrap().inference_lock = chat_lock.clone();
         let chat = runtime.for_chat();
         let LocalModel::Shared(background) = runtime.model(AgentRole::Curmudgeon) else {
             panic!("expected shared handle")
@@ -825,6 +832,7 @@ mod tests {
             .record_at(Instant::now() - CHAT_QUIET_WINDOW);
         background_thread.join().unwrap();
         let _ = std::fs::remove_file(lock);
+        let _ = std::fs::remove_file(chat_lock);
         assert!(background_paused, "upkeep started during the quiet window");
         assert!(errors[0].contains("curmudgeon model"));
         assert!(errors[1].contains("scholar model"));
@@ -833,16 +841,13 @@ mod tests {
     #[test]
     fn missing_role_checkpoint_does_not_load_a_fallback_model() {
         let mut spec = default_model();
-        spec.directory =
-            std::env::temp_dir().join(format!("lyra-absent-checkpoint-{}", std::process::id()));
+        spec.directory = crate::test_support::unique_temp_path("lyra-absent-checkpoint", "");
         let assignments = Assignments::with_lookup(spec, |_| None).unwrap();
         let runtime = ModelRuntime::with_assignments(assignments);
         // This missing-file test never performs inference. Give it its own
         // request lock so a live resident model cannot delay the assertion.
-        let request_lock = std::env::temp_dir().join(format!(
-            "lyra-missing-checkpoint-requests-{}.lock",
-            std::process::id()
-        ));
+        let request_lock =
+            crate::test_support::unique_temp_path("lyra-missing-checkpoint-requests", "lock");
         runtime.pool.lock().unwrap().inference_lock = request_lock.clone();
         let LocalModel::Shared(model) = runtime.model(AgentRole::Curmudgeon) else {
             panic!("expected shared handle")

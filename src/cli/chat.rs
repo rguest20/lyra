@@ -1,38 +1,40 @@
-use super::Cli;
-use crate::{
-    agent::ReplyServices, curator, inference::assignments::AgentRole, knowledge::KnowledgeMap,
-    storage, web,
-};
+use super::{Cli, ensure_no_arguments};
+use crate::{agent::ReplyServices, knowledge::KnowledgeMap, maintenance, storage, web};
 use std::{
     env,
     io::{self, Write},
+    path::Path,
 };
+
+fn open_learning_store(database_path: &Path) -> Result<storage::LearningStore, String> {
+    storage::LearningStore::open(database_path).map_err(|error| {
+        format!(
+            "could not open learning database {}: {error}",
+            database_path.display()
+        )
+    })
+}
 
 impl Cli {
     pub(super) fn chat(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_chat("chat")?;
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
         let state_path = &self.state_path;
-        let agent = &mut self.agent;
-        let map = &mut self.map;
-        let chat_runtime = self.model_runtime.for_chat();
-        if args.next().is_some() {
-            return Err("chat takes no arguments".into());
-        }
-        let store = storage::LearningStore::open(database_path).map_err(|e| {
-            format!(
-                "could not open learning database {}: {e}",
-                database_path.display()
-            )
-        })?;
-        let mut backend = chat_runtime.model(AgentRole::Interaction);
-        let mut research_model = chat_runtime.model(AgentRole::Curmudgeon);
-        let mut scholar_model = chat_runtime.model(AgentRole::Scholar);
-        let curator = curator::CuratorHandle::spawn(
+        let agent = self.agent.as_mut().expect("chat agent initialized");
+        let map = self.map.as_mut().expect("knowledge map initialized");
+        let runtime = self
+            .model_runtime
+            .as_ref()
+            .expect("model runtime initialized");
+        let chat_runtime = runtime.for_chat();
+        ensure_no_arguments(&args, "chat takes no arguments")?;
+        let store = open_learning_store(database_path)?;
+        let mut models = chat_runtime.reply_models();
+        let maintenance = maintenance::MaintenanceHandle::spawn(
             database_path.to_string_lossy().into_owned(),
             knowledge_path.to_string_lossy().into_owned(),
-            self.model_runtime.clone(),
+            runtime.clone(),
         );
         println!(
             "Community is ready. Type /quit to leave. Conversation: {}",
@@ -58,25 +60,22 @@ impl Cli {
                 continue;
             }
             *map = KnowledgeMap::load(knowledge_path).map_err(|e| e.to_string())?;
+            let (interaction, services) = ReplyServices::split_models(
+                &mut models,
+                &store,
+                database_path,
+                Some(&maintenance),
+                state_path,
+            );
             let reply = agent
                 .reply(
                     input,
-                    &mut backend,
+                    interaction,
                     map,
-                    ReplyServices {
-                        store: &store,
-                        database_path,
-                        research_model: &mut research_model,
-                        scholar_model: &mut scholar_model,
-                        curator: Some(&curator),
-                        state_path,
-                    },
+                    services,
                     env::var_os("COMMUNITY_DEBUG_THINKING").is_some_and(|value| value == "1"),
                 )
                 .map_err(|e| e.to_string())?;
-            if reply.new_conversation {
-                println!("[Started a fresh conversation after a topic change]");
-            }
             println!("Community: {}", reply.text);
             if reply.research_queued {
                 println!("[Scholar research requested for this question]");
@@ -85,22 +84,19 @@ impl Cli {
                 println!("[model thinking]\n{thinking}");
             }
         }
-        drop(backend);
-        drop(research_model);
-        drop(scholar_model);
+        drop(models);
         drop(chat_runtime);
-        curator.stop();
+        maintenance.stop();
         Ok(())
     }
 
     pub(super) fn serve(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_runtime("serve")?;
         let database_path = &self.database_path;
-        if args.next().is_some() {
-            return Err(
-                "serve takes no arguments; set COMMUNITY_WEB_ADDR to change the address".into(),
-            );
-        }
+        ensure_no_arguments(
+            &args,
+            "serve takes no arguments; set COMMUNITY_WEB_ADDR to change the address",
+        )?;
         let address = env::var("COMMUNITY_WEB_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".into())
             .parse()
@@ -109,52 +105,47 @@ impl Cli {
             address,
             &database_path.to_string_lossy(),
             &self.knowledge_path.to_string_lossy(),
-            self.model_runtime.clone(),
+            self.model_runtime
+                .as_ref()
+                .expect("model runtime initialized")
+                .clone(),
         )
         .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub(super) fn say(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
+        self.ensure_chat("say")?;
         let database_path = &self.database_path;
         let state_path = &self.state_path;
-        let agent = &mut self.agent;
-        let map = &mut self.map;
-        let input = args.collect::<Vec<_>>().join(" ");
+        let agent = self.agent.as_mut().expect("chat agent initialized");
+        let map = self.map.as_mut().expect("knowledge map initialized");
+        let input = args.join(" ");
         if input.trim().is_empty() {
             return Err("say needs a message".into());
         }
-        let store = storage::LearningStore::open(database_path).map_err(|e| {
-            format!(
-                "could not open learning database {}: {e}",
-                database_path.display()
-            )
-        })?;
-        let chat_runtime = self.model_runtime.for_chat();
-        let mut backend = chat_runtime.model(AgentRole::Interaction);
-        let mut research_model = chat_runtime.model(AgentRole::Curmudgeon);
-        let mut scholar_model = chat_runtime.model(AgentRole::Scholar);
+        let store = open_learning_store(database_path)?;
+        let chat_runtime = self
+            .model_runtime
+            .as_ref()
+            .expect("model runtime initialized")
+            .for_chat();
+        let mut models = chat_runtime.reply_models();
+        let (interaction, services) =
+            ReplyServices::split_models(&mut models, &store, database_path, None, state_path);
         let reply = agent
             .reply(
                 &input,
-                &mut backend,
+                interaction,
                 map,
-                ReplyServices {
-                    store: &store,
-                    database_path,
-                    research_model: &mut research_model,
-                    scholar_model: &mut scholar_model,
-                    curator: None,
-                    state_path,
-                },
+                services,
                 env::var_os("COMMUNITY_DEBUG_THINKING").is_some_and(|value| value == "1"),
             )
             .map_err(|e| e.to_string())?;
         if env::var_os("COMMUNITY_WEB_REPLY").is_some() {
             println!(
                 "{}",
-                serde_json::json!({"reply": reply.text, "thinking": reply.thinking, "new_conversation": reply.new_conversation, "research_queued": reply.research_queued})
+                serde_json::json!({"reply": reply.text, "thinking": reply.thinking, "new_conversation": false, "research_queued": reply.research_queued})
             );
         } else {
             println!("{}", reply.text);

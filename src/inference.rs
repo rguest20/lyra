@@ -31,6 +31,27 @@ const MAX_TRAIN: usize = 128;
 const RANK: usize = 8;
 const PREFILL_CHUNK: usize = 256;
 
+fn training_target_ids(
+    tokenizer: &Tokenizer,
+    answer: &str,
+    prompt_ids: &[u32],
+    max_context: usize,
+) -> io::Result<Vec<u32>> {
+    let mut targets = tokenizer
+        .encode(answer, false)
+        .map_err(other)?
+        .get_ids()
+        .to_vec();
+    if targets.is_empty() || targets.len() > MAX_TRAIN {
+        return Err(invalid("training answer exceeds 128 tokens"));
+    }
+    targets.push(tokenizer.token_to_id("<|im_end|>").unwrap());
+    if prompt_ids.len() + targets.len() > max_context {
+        return Err(invalid("training example exceeds context limit"));
+    }
+    Ok(targets)
+}
+
 pub mod assignments;
 mod mlx;
 
@@ -54,8 +75,7 @@ impl LocalModel {
     pub fn load_for_chat(dir: &Path, adapter: &Path, cpu: bool) -> io::Result<Self> {
         let shared = model_lease_path();
         let lease = std::env::var_os("COMMUNITY_CHAT_MODEL_LOCK")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| chat_lease_path(&shared));
+            .map_or_else(|| chat_lease_path(&shared), PathBuf::from);
         Self::load_checkpoint_with_lease(dir, &checkpoint_path(dir)?, adapter, cpu, &lease)
     }
 
@@ -559,19 +579,7 @@ impl CandleModel {
             .map_err(other)?
             .get_ids()
             .to_vec();
-        let mut targets = self
-            .tokenizer
-            .encode(answer, false)
-            .map_err(other)?
-            .get_ids()
-            .to_vec();
-        if targets.is_empty() || targets.len() > MAX_TRAIN {
-            return Err(invalid("training answer exceeds 128 tokens"));
-        }
-        targets.push(self.tokenizer.token_to_id("<|im_end|>").unwrap());
-        if ids.len() + targets.len() > self.max_context {
-            return Err(invalid("training example exceeds context limit"));
-        }
+        let targets = training_target_ids(&self.tokenizer, answer, &ids, self.max_context)?;
         let mut optimizer = AdamW::new(
             self.vars.all_vars(),
             ParamsAdamW {
@@ -686,9 +694,10 @@ fn write_merged_checkpoint(
 }
 
 fn model_lease_path() -> PathBuf {
-    std::env::var_os("COMMUNITY_MODEL_LOCK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("state/model-inference.lock"))
+    std::env::var_os("COMMUNITY_MODEL_LOCK").map_or_else(
+        || PathBuf::from("state/model-inference.lock"),
+        PathBuf::from,
+    )
 }
 
 fn chat_lease_path(shared: &Path) -> PathBuf {
@@ -931,14 +940,7 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     #[test]
     fn chat_lease_does_not_wait_for_maintenance() {
-        let directory = std::env::temp_dir().join(format!(
-            "community-chat-lease-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("community-chat-lease", "");
         let shared = directory.join("model-inference.lock");
         let chat = super::chat_lease_path(&shared);
         let maintenance_lease = super::acquire_model_lease(&shared).unwrap();
@@ -971,14 +973,7 @@ mod tests {
     };
     use crate::agent::Message;
     fn fixture_dir() -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "community-checkpoint-fixture-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = crate::test_support::unique_temp_path("community-checkpoint-fixture", "");
         std::fs::create_dir(&path).unwrap();
         path
     }

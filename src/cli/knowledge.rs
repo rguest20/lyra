@@ -1,12 +1,12 @@
-use super::Cli;
+use super::{Cli, ensure_no_arguments};
 use crate::{knowledge::KnowledgeMap, storage};
 
 impl Cli {
     pub(super) fn learn(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
-        let map = &mut self.map;
+        self.ensure_map()?;
+        let map = self.map.as_mut().expect("knowledge map initialized");
         let knowledge_path = &self.knowledge_path;
-        let values: Vec<_> = args.collect();
+        let values = args;
         if values.len() != 4 {
             return Err("learn needs SUBJECT RELATION OBJECT SOURCE".into());
         }
@@ -19,10 +19,10 @@ impl Cli {
     }
 
     pub(super) fn revise(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
-        let map = &mut self.map;
+        self.ensure_map()?;
+        let map = self.map.as_mut().expect("knowledge map initialized");
         let knowledge_path = &self.knowledge_path;
-        let values: Vec<_> = args.collect();
+        let values = args;
         if values.len() != 5 {
             return Err("revise needs ID SUBJECT RELATION OBJECT SOURCE".into());
         }
@@ -36,10 +36,10 @@ impl Cli {
     }
 
     pub(super) fn retract(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
-        let map = &mut self.map;
+        self.ensure_map()?;
+        let map = self.map.as_mut().expect("knowledge map initialized");
         let knowledge_path = &self.knowledge_path;
-        let values: Vec<_> = args.collect();
+        let values = args;
         if values.len() != 2 {
             return Err("retract needs ID SOURCE".into());
         }
@@ -51,10 +51,9 @@ impl Cli {
     }
 
     pub(super) fn maintenance(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
         let database_path = &self.database_path;
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
-        let values = args.collect::<Vec<_>>();
+        let values = args;
         if values.first().is_some_and(|value| value == "runs") {
             if values.len() > 2 {
                 return Err("maintenance runs accepts one optional LIMIT".into());
@@ -318,12 +317,10 @@ impl Cli {
     }
 
     pub(super) fn knowledge(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_map()?;
         let database_path = &self.database_path;
-        let map = &mut self.map;
-        if args.next().is_some() {
-            return Err("knowledge takes no arguments".into());
-        }
+        let map = self.map.as_mut().expect("knowledge map initialized");
+        ensure_no_arguments(&args, "knowledge takes no arguments")?;
         let store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         for entry in map
             .entries()
@@ -374,9 +371,8 @@ impl Cli {
     }
 
     pub(super) fn inbox(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
         let database_path = &self.database_path;
-        let values = args.collect::<Vec<_>>();
+        let values = args;
         let store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
         match values.as_slice() {
             [] => {
@@ -444,9 +440,8 @@ impl Cli {
     }
 
     pub(super) fn review(&mut self, args: Vec<String>) -> Result<(), String> {
-        let args = args.into_iter();
         let database_path = &self.database_path;
-        let values = args.collect::<Vec<_>>();
+        let values = args;
         if values.len() < 3 || !matches!(values[1].as_str(), "accept" | "reject") {
             return Err("usage: review CANDIDATE_ID accept|reject REASON".into());
         }
@@ -466,12 +461,9 @@ impl Cli {
     }
 
     pub(super) fn migrate_knowledge(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
         let database_path = &self.database_path;
         let knowledge_path = &self.knowledge_path;
-        if args.next().is_some() {
-            return Err("migrate-knowledge takes no arguments".into());
-        }
+        ensure_no_arguments(&args, "migrate-knowledge takes no arguments")?;
         let source = KnowledgeMap::load(knowledge_path).map_err(|e| {
             format!(
                 "could not read source knowledge map {}: {e}",
@@ -499,17 +491,15 @@ impl Cli {
     }
 
     pub(super) fn status(&mut self, args: Vec<String>) -> Result<(), String> {
-        let mut args = args.into_iter();
+        self.ensure_chat("status")?;
         let model = &self.model;
         let model_dir = &self.model_dir;
         let adapter_path = &self.adapter_path;
         let state_path = &self.state_path;
         let knowledge_path = &self.knowledge_path;
-        let agent = &mut self.agent;
-        let map = &mut self.map;
-        if args.next().is_some() {
-            return Err("status takes no arguments".into());
-        }
+        let agent = self.agent.as_mut().expect("chat agent initialized");
+        let map = self.map.as_mut().expect("knowledge map initialized");
+        ensure_no_arguments(&args, "status takes no arguments")?;
         println!("Model: {model}");
         println!("Model directory: {}", model_dir.display());
         for role in [
@@ -523,6 +513,8 @@ impl Cli {
                 "Agent {} model: {}",
                 role.name(),
                 self.model_runtime
+                    .as_ref()
+                    .expect("model runtime initialized")
                     .model_id(role)
                     .map_err(|error| error.to_string())?
             );
