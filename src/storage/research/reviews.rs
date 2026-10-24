@@ -1,6 +1,98 @@
 //! Scholar source assessments, provenance decisions and finding review.
 use super::*;
 
+struct ScholarFindingReview {
+    job_id: String,
+    source_url: String,
+    source_title: String,
+    evidence: FindingEvidence,
+    subject: String,
+    relation: String,
+    object: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    proposition: PropositionMetadata,
+}
+
+struct ExistingSemanticClaim {
+    subject: String,
+    relation: String,
+    scope: super::SemanticClaimScope,
+}
+
+struct FindingEvidence {
+    status: String,
+    source_excerpt: String,
+    evidence_text: String,
+}
+
+impl FindingEvidence {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            status: row.get(0)?,
+            source_excerpt: row.get(1)?,
+            evidence_text: row.get(2)?,
+        })
+    }
+
+    fn contains_quote(&self, quote: &str) -> bool {
+        self.source_excerpt.contains(quote)
+    }
+
+    fn require_pending_review(&self, error: &'static str) -> io::Result<()> {
+        if self.status == "needs_review" {
+            Ok(())
+        } else {
+            Err(invalid(error))
+        }
+    }
+
+    fn require_evidence_quote(&self) -> io::Result<()> {
+        if self.contains_quote(&self.evidence_text) {
+            Ok(())
+        } else {
+            Err(invalid(
+                "finding evidence is not present in its stored source passage",
+            ))
+        }
+    }
+}
+
+struct SourceExpertiseFinding {
+    evidence: FindingEvidence,
+    confidence: f64,
+}
+
+struct SourceAssessmentState {
+    topic_class: String,
+    direct_support: Option<i64>,
+    independence_verified: bool,
+    gate_status: String,
+}
+
+impl ScholarFindingReview {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            evidence: FindingEvidence::from_row(row)?,
+            job_id: row.get(3)?,
+            source_url: row.get(4)?,
+            subject: row.get(5)?,
+            relation: row.get(6)?,
+            object: row.get(7)?,
+            valid_from: row.get(8)?,
+            valid_until: row.get(9)?,
+            proposition: PropositionMetadata::from_storage_row(row, 10)?,
+            source_title: row.get(15)?,
+        })
+    }
+}
+
+struct SourceOriginFinding {
+    evidence: FindingEvidence,
+    source_kind: String,
+    proposition: super::ScholarPropositionScope,
+}
+
 impl LearningStore {
     pub fn review_scholar_source_expertise(
         &mut self,
@@ -50,39 +142,34 @@ impl LearningStore {
         if !matches!(source_kind, "primary" | "secondary") {
             return Err(invalid("source kind must be primary or secondary"));
         }
-        if rationale.trim().is_empty()
-            || rationale.chars().count() > 500
-            || rationale.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "source review reason must contain 1 to 500 printable characters",
-            ));
-        }
+        require_printable_field(
+            rationale,
+            500,
+            "source review reason must contain 1 to 500 printable characters",
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let finding: (String, String, f64, String) = tx
+        let finding = tx
             .query_row(
-                "SELECT evidence_text, status, confidence, source_excerpt
+                "SELECT status, source_excerpt, evidence_text, confidence
                  FROM scholar_findings WHERE id = ?1",
                 [finding_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok(SourceExpertiseFinding {
+                        evidence: FindingEvidence::from_row(row)?,
+                        confidence: row.get(3)?,
+                    })
+                },
             )
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| invalid("no scholar finding with that ID"))?;
-        let (evidence_text, finding_status, confidence, source_excerpt) = finding;
-        if finding_status != "needs_review" {
-            return Err(invalid(
-                "source expertise can only be reviewed for a finding awaiting review",
-            ));
-        }
-        if !source_excerpt.contains(&evidence_text) {
-            return Err(invalid(
-                "finding evidence is not present in its stored source passage",
-            ));
-        }
+        finding.evidence.require_pending_review(
+            "source expertise can only be reviewed for a finding awaiting review",
+        )?;
+        finding.evidence.require_evidence_quote()?;
         let published_at = if let Some(date) = published_at {
             let normalized: Option<String> = tx
                 .query_row("SELECT date(?1)", [date], |row| row.get(0))
@@ -91,18 +178,18 @@ impl LearningStore {
         } else {
             None
         };
-        let assessment: (String, Option<i64>, bool, String) = tx
+        let assessment = tx
             .query_row(
                 "SELECT topic_class, direct_support, independence_verified, gate_status
                  FROM scholar_source_assessments WHERE finding_id = ?1",
                 [finding_id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get::<_, i64>(2)? != 0,
-                        row.get(3)?,
-                    ))
+                    Ok(SourceAssessmentState {
+                        topic_class: row.get(0)?,
+                        direct_support: row.get(1)?,
+                        independence_verified: row.get::<_, i64>(2)? != 0,
+                        gate_status: row.get(3)?,
+                    })
                 },
             )
             .map_err(database_error)?;
@@ -117,7 +204,7 @@ impl LearningStore {
                 source_kind,
                 i64::from(suitable_for_topic),
                 published_at,
-                evidence_text,
+                finding.evidence.evidence_text,
                 rationale,
                 review_method,
             ],
@@ -138,41 +225,32 @@ impl LearningStore {
             ],
         )
         .map_err(database_error)?;
-        let is_recent = match published_at.as_deref() {
-            Some(date) => tx
-                .query_row(
-                    "SELECT COALESCE(date(?1) > date('now', '-12 months') AND date(?1) <= date('now'), 0)",
-                    [date],
-                    |row| row.get::<_, bool>(0),
-                )
-                .map_err(database_error)?,
-            None => false,
-        };
+        let is_recent = crate::storage::publication_date_is_recent(&tx, published_at.as_deref())?;
         let (gate_status, topical_expertise, gate_reason) = if !suitable_for_topic {
             (
                 "pending_review",
                 "reviewer_found_topic_mismatch",
                 "reviewer found the source unsuitable for this claim's topic",
             )
-        } else if assessment.1 != Some(1) {
+        } else if assessment.direct_support != Some(1) {
             (
                 "unsupported",
                 "reviewer_verified_for_claim",
                 "source suitability was reviewed, but the stored passage does not directly support this claim",
             )
-        } else if confidence < PROMOTION_CONFIDENCE {
+        } else if finding.confidence < PROMOTION_CONFIDENCE {
             (
                 "pending_review",
                 "reviewer_verified_for_claim",
                 "source suitability was reviewed, but extraction confidence remains below the threshold",
             )
-        } else if assessment.0 == "sensitive" {
+        } else if assessment.topic_class == "sensitive" {
             (
                 "pending_review",
                 "reviewer_verified_for_claim",
                 "sensitive claims still require explicit finding review",
             )
-        } else if assessment.0 == "recent" && !is_recent {
+        } else if assessment.topic_class == "recent" && !is_recent {
             (
                 "unverified_temporal",
                 "reviewer_verified_for_claim",
@@ -184,7 +262,7 @@ impl LearningStore {
                 "reviewer_verified_claim_specific_primary",
                 "reviewer verified this primary source's expertise for the claim topic and the passage directly supports the claim",
             )
-        } else if assessment.2 && assessment.3 == "eligible" {
+        } else if assessment.independence_verified && assessment.gate_status == "eligible" {
             (
                 "eligible",
                 "reviewer_verified_for_claim",
@@ -257,40 +335,21 @@ impl LearningStore {
         rationale: &str,
     ) -> io::Result<()> {
         let identity = underlying_source_id.trim();
-        if identity.is_empty()
-            || identity.chars().count() > 200
-            || identity.chars().any(char::is_control)
-            || identity.contains("<|")
-        {
+        if !crate::storage::valid_bounded_field(identity, 200) {
             return Err(invalid(
                 "underlying source identity must contain 1 to 200 printable characters",
             ));
         }
-        if rationale.trim().is_empty()
-            || rationale.chars().count() > 500
-            || rationale.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "source origin review reason must contain 1 to 500 printable characters",
-            ));
-        }
+        require_printable_field(
+            rationale,
+            500,
+            "source origin review reason must contain 1 to 500 printable characters",
+        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let finding: (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = tx
+        let finding: SourceOriginFinding = tx
             .query_row(
                 "SELECT f.status, f.source_excerpt, f.evidence_text, a.source_kind,
                     f.subject, f.relation, f.object,
@@ -300,52 +359,30 @@ impl LearningStore {
                  WHERE f.id = ?1",
                 [finding_id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                    ))
+                    Ok(SourceOriginFinding {
+                        evidence: FindingEvidence::from_row(row)?,
+                        source_kind: row.get(3)?,
+                        proposition: super::ScholarPropositionScope::from_row(row, 4)?,
+                    })
                 },
             )
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| invalid("no assessed Scholar finding with that ID"))?;
-        let (
-            status,
-            source_excerpt,
-            evidence_text,
+        let SourceOriginFinding {
+            evidence,
             source_kind,
-            subject,
-            relation,
-            object,
-            valid_from,
-            valid_until,
-            geographic_scope,
-            context_scope,
-        ) = finding;
-        if status != "needs_review" {
-            return Err(invalid(
-                "source origin can only be reviewed for a finding awaiting review",
-            ));
-        }
+            proposition,
+        } = finding;
+        evidence.require_pending_review(
+            "source origin can only be reviewed for a finding awaiting review",
+        )?;
         if source_kind != "secondary" {
             return Err(invalid(
                 "underlying publication identities apply to secondary sources",
             ));
         }
-        if !source_excerpt.contains(&evidence_text) {
-            return Err(invalid(
-                "finding evidence is not present in its stored source passage",
-            ));
-        }
+        evidence.require_evidence_quote()?;
         let latest_topic_review: Option<bool> = tx
             .query_row(
                 "SELECT suitable_for_topic FROM scholar_source_expertise_reviews
@@ -365,7 +402,12 @@ impl LearningStore {
             "INSERT INTO scholar_source_origin_reviews
                 (finding_id, underlying_source_id, evidence_text, rationale, reviewed_at)
              VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-            params![finding_id, normalized_identity, evidence_text, rationale],
+            params![
+                finding_id,
+                normalized_identity,
+                evidence.evidence_text,
+                rationale
+            ],
         )
         .map_err(database_error)?;
         tx.execute(
@@ -380,7 +422,9 @@ impl LearningStore {
                      AND valid_from IS ?4 AND valid_until IS ?5
                      AND geographic_scope IS ?6 AND context_scope IS ?7
                )",
-            params![subject, relation, object, valid_from, valid_until, geographic_scope, context_scope],
+            params![proposition.subject, proposition.relation, proposition.proposition.object,
+                proposition.proposition.valid_from, proposition.proposition.valid_until,
+                proposition.proposition.geographic_scope, proposition.proposition.context_scope],
         )
         .map_err(database_error)?;
         tx.execute(
@@ -393,37 +437,24 @@ impl LearningStore {
         .map_err(database_error)?;
 
         let qualifying: Vec<i64> = {
-            let mut statement = tx
-                .prepare(
-                    "SELECT f.id FROM scholar_findings f
-                     JOIN scholar_source_assessments a ON a.finding_id = f.id
+            let query = format!(
+                    "WITH {AUTOMATIC_PROMOTION_ELIGIBILITY_CTE}
+                     SELECT f.id FROM eligible_findings f
                      WHERE lower(trim(f.subject)) = lower(trim(?1))
                        AND lower(trim(f.relation)) = lower(trim(?2))
                        AND lower(trim(f.object)) = lower(trim(?3))
                        AND f.valid_from IS ?4 AND f.valid_until IS ?5
                        AND f.geographic_scope IS ?6 AND f.context_scope IS ?7
-                       AND f.status IN ('needs_review', 'promoted')
-                       AND f.confidence >= ?8
-                       AND a.source_kind = 'secondary'
-                       AND a.direct_support = 1 AND a.independence_verified = 1
-                       AND (SELECT suitable_for_topic FROM scholar_source_expertise_reviews er
-                            WHERE er.finding_id = f.id ORDER BY er.id DESC LIMIT 1) = 1
                        AND EXISTS (
-                         SELECT 1 FROM scholar_findings other
-                         JOIN scholar_source_assessments other_a ON other_a.finding_id = other.id
+                         SELECT 1 FROM eligible_findings other
                          WHERE lower(trim(other.subject)) = lower(trim(f.subject))
                            AND lower(trim(other.relation)) = lower(trim(f.relation))
                            AND lower(trim(other.object)) = lower(trim(f.object))
                            AND other.valid_from IS f.valid_from AND other.valid_until IS f.valid_until
                            AND other.geographic_scope IS f.geographic_scope
                            AND other.context_scope IS f.context_scope
-                           AND other.id <> f.id AND other.status IN ('needs_review', 'promoted')
-                           AND other.confidence >= ?8
-                           AND other_a.source_kind = 'secondary'
-                           AND other_a.direct_support = 1 AND other_a.independence_verified = 1
-                           AND other_a.independence_key <> a.independence_key
-                       AND (SELECT suitable_for_topic FROM scholar_source_expertise_reviews other_er
-                            WHERE other_er.finding_id = other.id ORDER BY other_er.id DESC LIMIT 1) = 1
+                           AND other.id <> f.id
+                           AND other.independence_key <> f.independence_key
                        AND NOT EXISTS (
                          SELECT 1 FROM scholar_provenance_reviews pr
                          WHERE ((pr.finding_id = f.id AND pr.related_finding_id = other.id)
@@ -432,18 +463,18 @@ impl LearningStore {
                        )
                        )
                      ORDER BY f.id",
-                )
-                .map_err(database_error)?;
+                );
+            let mut statement = tx.prepare(&query).map_err(database_error)?;
             statement
                 .query_map(
                     params![
-                        subject,
-                        relation,
-                        object,
-                        valid_from,
-                        valid_until,
-                        geographic_scope,
-                        context_scope,
+                        proposition.subject,
+                        proposition.relation,
+                        proposition.proposition.object,
+                        proposition.proposition.valid_from,
+                        proposition.proposition.valid_until,
+                        proposition.proposition.geographic_scope,
+                        proposition.proposition.context_scope,
                         automatic_promotion_confidence(),
                     ],
                     |row| row.get::<_, i64>(0),
@@ -461,16 +492,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         }
-        self_promote_verified_findings(
-            &tx,
-            &subject,
-            &relation,
-            &object,
-            valid_from.as_deref(),
-            valid_until.as_deref(),
-            geographic_scope.as_deref(),
-            context_scope.as_deref(),
-        )?;
+        self_promote_verified_findings(&tx, &proposition)?;
         tx.commit().map_err(database_error)
     }
 
@@ -563,120 +585,61 @@ impl LearningStore {
         method: &str,
         feedback: Option<(&str, &str, Option<&str>, Option<&str>)>,
     ) -> io::Result<()> {
-        if reason.trim().is_empty()
-            || reason.chars().count() > 500
-            || reason.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "review reason must contain 1 to 500 printable characters",
-            ));
-        }
+        validate_review_reason(reason)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let finding = tx
             .query_row(
-                "SELECT job_id, source_url, source_excerpt, subject, relation, object, status,
-                    valid_from, valid_until, attribution, polarity, modality,
-                    geographic_scope, context_scope
+                "SELECT status, source_excerpt, evidence_text, job_id, source_url,
+                    subject, relation, object, valid_from, valid_until, attribution,
+                    polarity, modality, geographic_scope, context_scope, source_title
              FROM scholar_findings WHERE id = ?1",
                 [finding_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, String>(10)?,
-                        row.get::<_, String>(11)?,
-                        row.get::<_, Option<String>>(12)?,
-                        row.get::<_, Option<String>>(13)?,
-                    ))
-                },
+                ScholarFindingReview::from_row,
             )
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| invalid("no scholar finding with that ID"))?;
-        let (
+        let ScholarFindingReview {
             job_id,
             source_url,
-            source_excerpt,
+            source_title,
+            evidence,
             subject,
             relation,
             object,
-            status,
             valid_from,
             valid_until,
-            attribution,
-            polarity,
-            modality,
-            geographic_scope,
-            context_scope,
-        ) = finding;
-        if status != "needs_review" {
-            return Err(invalid("scholar finding is already resolved"));
-        }
+            proposition,
+        } = finding;
+        evidence.require_pending_review("scholar finding is already resolved")?;
         if accept {
+            let evidence_quote_present = evidence.contains_quote(&evidence.evidence_text);
+            let evidence_finding = ScholarFinding {
+                semantic_support: None,
+                subject: subject.clone(),
+                relation: relation.clone(),
+                object: object.clone(),
+                evidence_text: evidence.evidence_text,
+                confidence: 0.0,
+                valid_from: valid_from.clone(),
+                valid_until: valid_until.clone(),
+                source_quality: "unknown".into(),
+                source_updated_at: None,
+                proposition: proposition.clone(),
+            };
             if matches!(canonical(&subject).as_str(), "user" | "the user") {
                 return Err(invalid(
                     "web evidence cannot establish a personal fact about the user",
                 ));
             }
-            let saved_support: Option<String> = tx
-                .query_row(
-                    "SELECT assessment_json FROM scholar_semantic_support WHERE finding_id = ?1",
-                    [finding_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(database_error)?;
+            let saved_support = super::saved_semantic_support(&tx, finding_id)?;
             if let Some(saved) = saved_support {
                 let support: crate::semantic::SemanticSupport =
                     serde_json::from_str(&saved).map_err(invalid_json)?;
-                let evidence: String = tx
-                    .query_row(
-                        "SELECT evidence_text FROM scholar_findings WHERE id = ?1",
-                        [finding_id],
-                        |row| row.get(0),
-                    )
-                    .map_err(database_error)?;
-                let bound = ScholarFinding {
-                    semantic_support: None,
-                    subject: subject.clone(),
-                    relation: relation.clone(),
-                    object: object.clone(),
-                    evidence_text: evidence,
-                    confidence: 0.0,
-                    valid_from: valid_from.clone(),
-                    valid_until: valid_until.clone(),
-                    source_quality: "unknown".into(),
-                    source_updated_at: None,
-                    proposition: PropositionMetadata {
-                        attribution: attribution.clone(),
-                        geographic_scope: geographic_scope.clone(),
-                        context_scope: context_scope.clone(),
-                        polarity: match polarity.as_str() {
-                            "asserted" => ClaimPolarity::Asserted,
-                            "negated" => ClaimPolarity::Negated,
-                            _ => ClaimPolarity::Unknown,
-                        },
-                        modality: match modality.as_str() {
-                            "factual" => ClaimModality::Factual,
-                            "possible" => ClaimModality::Possible,
-                            "necessary" => ClaimModality::Necessary,
-                            "conditional" => ClaimModality::Conditional,
-                            _ => ClaimModality::Unknown,
-                        },
-                    },
-                };
-                if !support.supports(&bound, &source_excerpt) {
+                if !support.supports(&evidence_finding, &evidence.source_excerpt) {
                     return Err(invalid(
                         "saved semantic assessment no longer supports this finding",
                     ));
@@ -699,49 +662,11 @@ impl LearningStore {
             if direct_support.is_none() {
                 // Legacy findings were backfilled as unassessed. Re-check their
                 // excerpt before a reviewer can promote them.
-                let (source_title, evidence_text): (String, String) = tx
-                    .query_row(
-                        "SELECT source_title, evidence_text FROM scholar_findings WHERE id = ?1",
-                        [finding_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .map_err(database_error)?;
-                let legacy = ScholarFinding {
-                    semantic_support: None,
-                    subject: subject.clone(),
-                    relation: relation.clone(),
-                    object: object.clone(),
-                    evidence_text: evidence_text.clone(),
-                    confidence: 0.0,
-                    valid_from: valid_from.clone(),
-                    valid_until: valid_until.clone(),
-                    source_quality: "unknown".into(),
-                    source_updated_at: None,
-                    proposition: PropositionMetadata {
-                        attribution: attribution.clone(),
-                        geographic_scope: geographic_scope.clone(),
-                        context_scope: context_scope.clone(),
-                        polarity: match polarity.as_str() {
-                            "asserted" => ClaimPolarity::Asserted,
-                            "negated" => ClaimPolarity::Negated,
-                            _ => ClaimPolarity::Unknown,
-                        },
-                        modality: match modality.as_str() {
-                            "factual" => ClaimModality::Factual,
-                            "possible" => ClaimModality::Possible,
-                            "necessary" => ClaimModality::Necessary,
-                            "conditional" => ClaimModality::Conditional,
-                            _ => ClaimModality::Unknown,
-                        },
-                    },
-                };
-                let supported = source_excerpt.contains(&evidence_text)
-                    && (evidence_supports_claim(&legacy)
-                        || (matches!(
-                            relation.as_str(),
-                            "has encyclopedia summary" | "has encyclopedia detail"
-                        ) && canonical(&subject) == canonical(&source_title)
-                            && object == evidence_text));
+                let supported = evidence_quote_present
+                    && crate::storage::direct_passage_supports_finding(
+                        &source_title,
+                        &evidence_finding,
+                    );
                 if !supported {
                     return Err(invalid("legacy finding lacks direct passage support"));
                 }
@@ -750,93 +675,101 @@ impl LearningStore {
         let semantic_id = if accept {
             let mut statement = tx
                 .prepare(
-                    "SELECT id, subject, relation, object, valid_from, valid_until, geographic_scope, context_scope
+                    "SELECT subject, relation, id, object, valid_from, valid_until, geographic_scope, context_scope
                  FROM semantic_claims WHERE retracted_by IS NULL",
                 )
                 .map_err(database_error)?;
             let current = statement
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
+                    Ok(ExistingSemanticClaim {
+                        subject: row.get(0)?,
+                        relation: row.get(1)?,
+                        scope: super::SemanticClaimScope::from_row(row, 2)?,
+                    })
                 })
                 .map_err(database_error)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(database_error)?;
             drop(statement);
-            let today: String = tx
-                .query_row("SELECT date('now')", [], |row| row.get(0))
-                .map_err(database_error)?;
+            let today = crate::storage::current_sql_date(&tx)?;
             let aliases = super::entities::EntityAliases::load(&tx)?;
             let equivalent = current
                 .iter()
-                .find(|(_, s, r, o, from, until, geo, context)| {
-                    aliases.same(s, &subject)
-                        && canonical(r) == canonical(&relation)
-                        && canonical(o) == canonical(&object)
-                        && from.as_deref() == valid_from.as_deref()
-                        && until.as_deref() == valid_until.as_deref()
-                        && geo == &geographic_scope
-                        && context == &context_scope
+                .find(|claim| {
+                    aliases.same(&claim.subject, &subject)
+                        && canonical(&claim.relation) == canonical(&relation)
+                        && canonical(&claim.scope.proposition.object) == canonical(&object)
+                        && claim.scope.proposition.valid_from.as_deref() == valid_from.as_deref()
+                        && claim.scope.proposition.valid_until.as_deref() == valid_until.as_deref()
+                        && claim
+                            .scope
+                            .proposition
+                            .same_scope(&proposition.geographic_scope, &proposition.context_scope)
                 })
-                .map(|(id, _, _, _, _, _, _, _)| *id);
+                .map(|claim| claim.scope.id);
             if let Some(id) = equivalent {
                 Some(id)
             } else {
                 let conflicting = current
                     .iter()
-                    .find(|(_, s, r, o, from, until, geo, context)| {
-                        aliases.same(s, &subject)
-                            && canonical(r) == canonical(&relation)
-                            && canonical(o) != canonical(&object)
-                            && geo == &geographic_scope
-                            && context == &context_scope
+                    .find(|claim| {
+                        aliases.same(&claim.subject, &subject)
+                            && canonical(&claim.relation) == canonical(&relation)
+                            && canonical(&claim.scope.proposition.object) != canonical(&object)
+                            && claim.scope.proposition.same_scope(
+                                &proposition.geographic_scope,
+                                &proposition.context_scope,
+                            )
                             && claim_periods_overlap(
                                 valid_from.as_deref(),
                                 valid_until.as_deref(),
-                                from.as_deref(),
-                                until.as_deref(),
+                                claim.scope.proposition.valid_from.as_deref(),
+                                claim.scope.proposition.valid_until.as_deref(),
                                 &today,
                             )
                     })
-                    .map(|(id, _, _, _, from, until, _, _)| (*id, from.clone(), until.clone()));
+                    .map(|claim| {
+                        (
+                            claim.scope.id,
+                            claim.scope.proposition.valid_from.clone(),
+                            claim.scope.proposition.valid_until.clone(),
+                        )
+                    });
                 let supersedes_id = if let Some((id, old_from, old_until)) = &conflicting {
                     if old_from.as_deref() == valid_from.as_deref()
                         && old_until.as_deref() == valid_until.as_deref()
                     {
-                        tx.execute(
-                            "UPDATE semantic_claims SET retracted_by = ?2, status = 'superseded' WHERE id = ?1",
-                            params![id, format!("superseded by reviewed scholar finding #{finding_id}: {}", reason.trim())],
-                        ).map_err(database_error)?;
+                        super::supersede_semantic_claim(
+                            &tx,
+                            *id,
+                            &format!(
+                                "superseded by reviewed scholar finding #{finding_id}: {}",
+                                reason.trim()
+                            ),
+                        )?;
                         Some(*id)
                     } else {
                         // A partial time overlap does not invalidate the old claim's
                         // entire period. Keep it active but challenged for review.
-                        tx.execute(
-                            "UPDATE semantic_claims SET status = 'challenged' WHERE id = ?1",
-                            [id],
-                        )
-                        .map_err(database_error)?;
+                        super::mark_semantic_claim_challenged(&tx, *id)?;
                         None
                     }
                 } else {
                     None
                 };
-                tx.execute(
-                    "INSERT INTO semantic_claims
-                        (subject, relation, object, source, supersedes_id, source_observation_id, created_at, valid_from, valid_until, attribution, polarity, modality, geographic_scope, context_scope)
-                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![subject, relation, object, source_url, supersedes_id, valid_from, valid_until,
-                        attribution, polarity, modality, geographic_scope, context_scope],
-                ).map_err(database_error)?;
-                Some(tx.last_insert_rowid())
+                Some(super::insert_scholar_semantic_claim(
+                    &tx,
+                    super::NewSemanticClaim {
+                        subject: &subject,
+                        relation: &relation,
+                        object: &object,
+                        source: &source_url,
+                        supersedes_id,
+                        valid_from: valid_from.as_deref(),
+                        valid_until: valid_until.as_deref(),
+                        proposition: &proposition,
+                    },
+                )?)
             }
         } else {
             None
@@ -845,26 +778,11 @@ impl LearningStore {
             "UPDATE scholar_findings SET status = ?2, semantic_claim_id = ?3, decision_reason = ?4 WHERE id = ?1",
             params![finding_id, if accept { "promoted" } else { "rejected" }, semantic_id, reason.trim()],
         ).map_err(database_error)?;
-        let proposal_id: i64 = tx.query_row(
-            "SELECT id FROM role_proposals WHERE source_type = 'scholar_finding' AND source_id = ?1 ORDER BY id DESC LIMIT 1",
-            [finding_id.to_string()], |row| row.get(0),
-        ).map_err(database_error)?;
+        let proposal_id = super::latest_scholar_finding_proposal_id(&tx, finding_id)?;
         record_policy_decision(
             &tx,
             proposal_id,
-            if accept {
-                if method == "ai" {
-                    "ai_accepted"
-                } else {
-                    "human_accepted"
-                }
-            } else {
-                if method == "ai" {
-                    "ai_rejected"
-                } else {
-                    "human_rejected"
-                }
-            },
+            review_decision_outcome(method, accept),
             reason.trim(),
             semantic_id,
             Some(if accept { "active" } else { "rejected" }),
@@ -874,11 +792,15 @@ impl LearningStore {
             params![job_id, if accept { "promoted" } else { "no_result" }],
         )
         .map_err(database_error)?;
-        tx.execute(
-            "UPDATE scholar_task_targets SET stop_reason=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=?1",
-            params![job_id, if accept { "complete" } else { "reviewer_rejected" }],
-        )
-        .map_err(database_error)?;
+        super::set_scholar_task_stop_reason(
+            &tx,
+            &job_id,
+            if accept {
+                "complete"
+            } else {
+                "reviewer_rejected"
+            },
+        )?;
         if let Some(claim_id) = semantic_id {
             link_claim_evidence(
                 &tx,
@@ -886,20 +808,10 @@ impl LearningStore {
                 "web",
                 Some(&source_url),
                 None,
-                &source_excerpt,
+                &evidence.source_excerpt,
                 "supports",
             )?;
-            tx.execute(
-                "UPDATE semantic_claims SET status = 'active',
-                     checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     last_reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                     next_review_at = CASE volatility
-                         WHEN 'fast_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 days')
-                         WHEN 'slow_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+180 days')
-                         ELSE NULL END
-                 WHERE id = ?1 AND retracted_by IS NULL",
-                [claim_id],
-            ).map_err(database_error)?;
+            super::activate_reviewed_claim(&tx, claim_id)?;
         }
         if let Some((route, guidance, exclusion_reason, suggested_evidence)) = feedback {
             feedback::queue_feedback(

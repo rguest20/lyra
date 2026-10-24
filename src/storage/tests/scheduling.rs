@@ -89,14 +89,7 @@ fn scout_question_cooldown_expires_but_old_pending_questions_still_block_new_key
 
 #[test]
 fn deferred_research_survives_reopen_and_waits_until_due() {
-    let directory = std::env::temp_dir().join(format!(
-        "lyra-research-deferral-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let directory = crate::test_support::unique_temp_path("lyra-research-deferral", "");
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("learning.db");
     let mut store = LearningStore::open(&path).unwrap();
@@ -527,19 +520,15 @@ fn expired_scholar_lease_reclaims_once_and_duplicate_finish_rolls_back() {
             "Mars",
             "https://en.wikipedia.org/wiki/Mars",
             "Mars is a planet.",
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Mars".into(),
-                relation: "is a".into(),
-                object: "planet".into(),
-                evidence_text: "Mars is a planet.".into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(scholar_finding(
+                "Mars",
+                "is a",
+                "planet",
+                "Mars is a planet.",
+                0.99,
+                "reference",
+                None,
+            )),
             None,
         )
         .unwrap();
@@ -550,19 +539,15 @@ fn expired_scholar_lease_reclaims_once_and_duplicate_finish_rolls_back() {
                 "Mars",
                 "https://en.wikipedia.org/wiki/Mars",
                 "Mars is a planet.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Mars".into(),
-                    relation: "is a".into(),
-                    object: "planet".into(),
-                    evidence_text: "Mars is a planet.".into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(scholar_finding(
+                    "Mars",
+                    "is a",
+                    "planet",
+                    "Mars is a planet.",
+                    0.99,
+                    "reference",
+                    None,
+                )),
                 None,
             )
             .is_err()

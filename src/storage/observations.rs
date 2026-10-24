@@ -1,5 +1,15 @@
 use super::*;
 
+pub(super) fn read_observation_text(connection: &Connection, id: &str) -> io::Result<String> {
+    connection
+        .query_row(
+            "SELECT raw_text FROM observations WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
 impl LearningStore {
     /// Import the JSON map without changing it. Re-running is safe: matching
     /// rows are accepted, while an ID with different content aborts the import.
@@ -187,19 +197,7 @@ impl LearningStore {
                  ORDER BY created_at, turn_number
                  LIMIT 1",
                 [&lease_modifier],
-                |row| {
-                    let turn_number: i64 = row.get(2)?;
-                    Ok(Observation {
-                        id: row.get(0)?,
-                        conversation_id: row.get(1)?,
-                        turn_number: usize::try_from(turn_number).map_err(|_| {
-                            rusqlite::Error::IntegralValueOutOfRange(2, turn_number)
-                        })?,
-                        raw_text: row.get(3)?,
-                        status: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                },
+                Observation::from_row,
             )
             .optional()
             .map_err(database_error)?;
@@ -237,24 +235,17 @@ impl LearningStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
         let mut review_reasons = Vec::new();
-        let observation_text: String = tx
-            .query_row(
-                "SELECT raw_text FROM observations WHERE id = ?1",
-                [observation_id],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let observation_text = read_observation_text(&tx, observation_id)?;
         for claim in claims {
             let mut claim = claim.clone();
             claim.subject = normalize(&claim.subject);
             claim.relation = normalize(&claim.relation);
             claim.object = normalize(&claim.object);
-            let claim_period_valid =
-                valid_claim_period(claim.valid_from.as_deref(), claim.valid_until.as_deref())
-                    && [claim.valid_from.as_deref(), claim.valid_until.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .all(|date| observation_text.contains(date));
+            let claim_period_valid = claim_period_is_stated(
+                claim.valid_from.as_deref(),
+                claim.valid_until.as_deref(),
+                &observation_text,
+            );
             let semantic_id = if claim.status == "rejected" {
                 None
             } else if !claim_period_valid {

@@ -1,18 +1,41 @@
 //! Persisted search candidates, extraction attempts and provenance review jobs.
 use super::*;
 
+impl ScholarProvenanceReview {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            finding_id: row.get(1)?,
+            related_finding_id: row.get(2)?,
+            signal: row.get(3)?,
+            source_url: row.get(4)?,
+            related_source_url: row.get(5)?,
+            source_excerpt: row.get(6)?,
+            related_source_excerpt: row.get(7)?,
+            source_metadata_json: row.get(8)?,
+            related_metadata_json: row.get(9)?,
+            status: row.get(10)?,
+            verdict: row.get(11)?,
+            rationale: row.get(12)?,
+        })
+    }
+}
+
 impl LearningStore {
     pub fn record_typed_search_candidate(
         &self,
         job_id: &str,
         provider: &str,
         query: &str,
-        result_type: &str,
-        title: &str,
-        url: &str,
-        snippet: &str,
-        structured_data_json: &str,
+        candidate: &ScholarSearchCandidateInput,
     ) -> io::Result<()> {
+        let ScholarSearchCandidateInput {
+            result_type,
+            title,
+            url,
+            snippet,
+            structured_data_json,
+        } = candidate;
         if structured_data_json.len() > 8_000
             || serde_json::from_str::<serde_json::Value>(structured_data_json).is_err()
         {
@@ -56,23 +79,18 @@ impl LearningStore {
     pub fn record_scholar_candidate_fetch_result(
         &self,
         candidate_id: i64,
-        status: &str,
-        policy_status: &str,
-        policy_reason: Option<&str>,
-        fetch_status: &str,
-        fetched_url: Option<&str>,
-        fetched_excerpt: Option<&str>,
+        review: &ScholarCandidateReview,
     ) -> io::Result<()> {
-        if !matches!(status, "policy_checked" | "fetched" | "skipped" | "failed")
-            || !matches!(
-                policy_status,
-                "allowed" | "disallowed" | "policy_ambiguous" | "unavailable"
-            )
-            || !matches!(
-                fetch_status,
-                "not_attempted" | "fetched" | "failed" | "skipped"
-            )
-        {
+        if !matches!(
+            review.status,
+            "policy_checked" | "fetched" | "skipped" | "failed"
+        ) || !matches!(
+            review.policy_status,
+            "allowed" | "disallowed" | "policy_ambiguous" | "unavailable"
+        ) || !matches!(
+            review.fetch_status,
+            "not_attempted" | "fetched" | "failed" | "skipped"
+        ) {
             return Err(invalid("invalid source page review state"));
         }
         let changed = self
@@ -85,12 +103,18 @@ impl LearningStore {
              WHERE id = ?1",
                 params![
                     candidate_id,
-                    status,
-                    policy_status,
-                    policy_reason.map(|value| value.chars().take(500).collect::<String>()),
-                    fetch_status,
-                    fetched_url,
-                    fetched_excerpt.map(|value| value.chars().take(5_000).collect::<String>()),
+                    review.status,
+                    review.policy_status,
+                    review
+                        .policy_reason
+                        .as_deref()
+                        .map(|value| value.chars().take(500).collect::<String>()),
+                    review.fetch_status,
+                    review.fetched_url.as_deref(),
+                    review
+                        .excerpt
+                        .as_deref()
+                        .map(|value| value.chars().take(5_000).collect::<String>()),
                 ],
             )
             .map_err(database_error)?;
@@ -172,23 +196,7 @@ impl LearningStore {
                  JOIN scholar_findings other ON other.id = r.related_finding_id
                  WHERE r.id = ?1",
                 [id],
-                |row| {
-                    Ok(ScholarProvenanceReview {
-                        id: row.get(0)?,
-                        finding_id: row.get(1)?,
-                        related_finding_id: row.get(2)?,
-                        signal: row.get(3)?,
-                        source_url: row.get(4)?,
-                        related_source_url: row.get(5)?,
-                        source_excerpt: row.get(6)?,
-                        related_source_excerpt: row.get(7)?,
-                        source_metadata_json: row.get(8)?,
-                        related_metadata_json: row.get(9)?,
-                        status: row.get(10)?,
-                        verdict: row.get(11)?,
-                        rationale: row.get(12)?,
-                    })
-                },
+                ScholarProvenanceReview::from_row,
             )
             .map_err(database_error)?;
         tx.commit().map_err(database_error)?;
@@ -204,9 +212,7 @@ impl LearningStore {
         if !matches!(
             verdict,
             "likely_shared_origin" | "unclear" | "possibly_distinct_reporting"
-        ) || rationale.trim().is_empty()
-            || rationale.chars().count() > 800
-            || rationale.chars().any(char::is_control)
+        ) || !crate::storage::valid_printable_field(rationale, 800)
         {
             return Err(invalid("invalid Curmudgeon provenance assessment"));
         }
@@ -284,23 +290,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([finding_id], |row| {
-                Ok(ScholarProvenanceReview {
-                    id: row.get(0)?,
-                    finding_id: row.get(1)?,
-                    related_finding_id: row.get(2)?,
-                    signal: row.get(3)?,
-                    source_url: row.get(4)?,
-                    related_source_url: row.get(5)?,
-                    source_excerpt: row.get(6)?,
-                    related_source_excerpt: row.get(7)?,
-                    source_metadata_json: row.get(8)?,
-                    related_metadata_json: row.get(9)?,
-                    status: row.get(10)?,
-                    verdict: row.get(11)?,
-                    rationale: row.get(12)?,
-                })
-            })
+            .query_map([finding_id], ScholarProvenanceReview::from_row)
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -430,27 +420,30 @@ impl LearningStore {
         result_count: Option<usize>,
         error: Option<&str>,
     ) -> io::Result<()> {
-        self.record_scholar_search_attempt_for_provider(
+        self.record_scholar_search_attempt_for_provider(ScholarSearchAttemptInput {
             job_id,
-            "wikipedia",
-            "primary",
+            provider: "wikipedia",
+            trigger_reason: "primary",
             query,
             status,
             result_count,
             error,
-        )
+        })
     }
 
     pub fn record_scholar_search_attempt_for_provider(
         &self,
-        job_id: &str,
-        provider: &str,
-        trigger_reason: &str,
-        query: &str,
-        status: &str,
-        result_count: Option<usize>,
-        error: Option<&str>,
+        attempt: ScholarSearchAttemptInput<'_>,
     ) -> io::Result<()> {
+        let ScholarSearchAttemptInput {
+            job_id,
+            provider,
+            trigger_reason,
+            query,
+            status,
+            result_count,
+            error,
+        } = attempt;
         if !matches!(status, "results" | "no_result" | "error") {
             return Err(invalid("invalid Scholar search status"));
         }

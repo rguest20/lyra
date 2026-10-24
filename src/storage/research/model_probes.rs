@@ -126,27 +126,23 @@ impl LearningStore {
         Ok(changed > 0)
     }
 
-    pub fn deferred_model_probe(
-        &self,
-    ) -> io::Result<Option<(i64, String, String, String, String)>> {
+    pub fn deferred_model_probe(&self) -> io::Result<Option<DeferredModelProbe>> {
         self.connection.query_row("SELECT id,seed,topic,question,COALESCE(raw_output,'') FROM scout_model_probes
             WHERE status='attempting' AND selection_reason LIKE 'deferred:%' AND topic IS NOT NULL AND question IS NOT NULL
-            ORDER BY id LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))
+            ORDER BY id LIMIT 1",[],|row|Ok(DeferredModelProbe {
+                id: row.get(0)?,
+                seed: row.get(1)?,
+                topic: row.get(2)?,
+                question: row.get(3)?,
+                raw_output: row.get(4)?,
+            }))
             .optional().map_err(database_error)
     }
 
     pub fn scout_queue_status(&self) -> io::Result<serde_json::Value> {
         let interval = scout_min_interval_seconds();
         let daily_limit = scout_daily_limit();
-        let daily: i64 = self
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM scout_investigations
-            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let daily = scout_investigations_last_day(&self.connection)?;
         let deferred: i64 = self
             .connection
             .query_row(

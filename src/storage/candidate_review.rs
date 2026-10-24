@@ -1,5 +1,39 @@
 use super::*;
 
+struct CandidateReview {
+    id: String,
+    observation_id: String,
+    subject: String,
+    relation: String,
+    object: String,
+    evidence: String,
+    context: String,
+    resolution: Option<String>,
+    confidence: f64,
+    status: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+}
+
+impl CandidateReview {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            observation_id: row.get(1)?,
+            subject: row.get(2)?,
+            relation: row.get(3)?,
+            object: row.get(4)?,
+            evidence: row.get(5)?,
+            context: row.get(6)?,
+            resolution: row.get(7)?,
+            confidence: row.get(8)?,
+            status: row.get(9)?,
+            valid_from: row.get(10)?,
+            valid_until: row.get(11)?,
+        })
+    }
+}
+
 impl LearningStore {
     pub fn resolve_candidate(&mut self, id: &str, accept: bool, reason: &str) -> io::Result<()> {
         self.resolve_candidate_with_method(id, accept, reason, "human")
@@ -16,14 +50,7 @@ impl LearningStore {
         reason: &str,
         method: &str,
     ) -> io::Result<()> {
-        if reason.trim().is_empty()
-            || reason.chars().count() > 500
-            || reason.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "review reason must contain 1 to 500 printable characters",
-            ));
-        }
+        validate_review_reason(reason)?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -34,28 +61,13 @@ impl LearningStore {
                     context_message_ids, resolution, confidence, status, valid_from, valid_until
              FROM candidate_claims WHERE id = ?1",
                 [id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, f64>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<String>>(11)?,
-                    ))
-                },
+                CandidateReview::from_row,
             )
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| invalid("no candidate with that ID"))?;
-        let (
-            candidate_id,
+        let CandidateReview {
+            id: candidate_id,
             observation_id,
             subject,
             relation,
@@ -67,30 +79,27 @@ impl LearningStore {
             status,
             valid_from,
             valid_until,
-        ) = candidate;
+        } = candidate;
         if status != "needs_review" && status != "proposed" {
             return Err(invalid("candidate is already resolved"));
         }
-        if accept {
-            let observation_text: String = tx
-                .query_row(
-                    "SELECT raw_text FROM observations WHERE id = ?1",
-                    [&observation_id],
-                    |row| row.get(0),
-                )
-                .map_err(database_error)?;
-            if !valid_claim_period(valid_from.as_deref(), valid_until.as_deref())
-                || [valid_from.as_deref(), valid_until.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .any(|date| !observation_text.contains(date))
-            {
+        let observation_text = if accept {
+            let observation_text =
+                super::observations::read_observation_text(&tx, &observation_id)?;
+            if !claim_period_is_stated(
+                valid_from.as_deref(),
+                valid_until.as_deref(),
+                &observation_text,
+            ) {
                 return Err(invalid(
                     "candidate dates are invalid or not present in the user observation",
                 ));
             }
-        }
-        let semantic_id = if accept {
+            Some(observation_text)
+        } else {
+            None
+        };
+        let semantic_id = if let Some(observation_text) = observation_text.as_deref() {
             let mut claim = CandidateClaim {
                 subject: normalize(&subject),
                 relation: normalize(&relation),
@@ -114,37 +123,26 @@ impl LearningStore {
                         )
                         .map_err(database_error)?;
                     let rows = statement
-                        .query_map([], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, Option<String>>(4)?,
-                                row.get::<_, Option<String>>(5)?,
-                            ))
-                        })
+                        .query_map([], ActiveSemanticClaim::from_row)
                         .map_err(database_error)?;
-                    let today: String = tx
-                        .query_row("SELECT date('now')", [], |row| row.get(0))
-                        .map_err(database_error)?;
+                    let today = crate::storage::current_sql_date(&tx)?;
                     let aliases = entities::EntityAliases::load(&tx)?;
                     let mut conflicting = None;
                     for row in rows {
-                        let (id, subject, relation, object, from, until) =
-                            row.map_err(database_error)?;
-                        if aliases.same(&subject, &claim.subject)
-                            && canonical(&relation) == canonical(&claim.relation)
-                            && canonical(&object) != canonical(&claim.object)
+                        let existing = row.map_err(database_error)?;
+                        if aliases.same(&existing.subject, &claim.subject)
+                            && canonical(&existing.relation) == canonical(&claim.relation)
+                            && canonical(&existing.object) != canonical(&claim.object)
                             && claim_periods_overlap(
                                 claim.valid_from.as_deref(),
                                 claim.valid_until.as_deref(),
-                                from.as_deref(),
-                                until.as_deref(),
+                                existing.valid_from.as_deref(),
+                                existing.valid_until.as_deref(),
                                 &today,
                             )
                         {
-                            conflicting = Some((id, from, until));
+                            conflicting =
+                                Some((existing.id, existing.valid_from, existing.valid_until));
                             break;
                         }
                     }
@@ -154,17 +152,17 @@ impl LearningStore {
                     let supersedes_id = if old_from.as_deref() == claim.valid_from.as_deref()
                         && old_until.as_deref() == claim.valid_until.as_deref()
                     {
-                        tx.execute(
-                            "UPDATE semantic_claims SET retracted_by = ?2, status = 'superseded' WHERE id = ?1",
-                            params![current_id, format!("superseded by reviewed candidate {candidate_id}: {}", reason.trim())],
-                        ).map_err(database_error)?;
+                        research::supersede_semantic_claim(
+                            &tx,
+                            current_id,
+                            &format!(
+                                "superseded by reviewed candidate {candidate_id}: {}",
+                                reason.trim()
+                            ),
+                        )?;
                         Some(current_id)
                     } else {
-                        tx.execute(
-                            "UPDATE semantic_claims SET status = 'challenged' WHERE id = ?1",
-                            [current_id],
-                        )
-                        .map_err(database_error)?;
+                        research::mark_semantic_claim_challenged(&tx, current_id)?;
                         None
                     };
                     tx.execute(
@@ -174,25 +172,17 @@ impl LearningStore {
                              (SELECT created_at FROM observations WHERE id = ?6), ?7, ?8)",
                         params![claim.subject, claim.relation, claim.object, format!("reviewed candidate {candidate_id}: {}", reason.trim()), supersedes_id, observation_id, claim.valid_from, claim.valid_until],
                     ).map_err(database_error)?;
-                    tx.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
-                        .map_err(database_error)?
+                    tx.last_insert_rowid()
                 }
             };
-            tx.execute("INSERT OR IGNORE INTO semantic_claim_sources (semantic_claim_id, candidate_id, observation_id) VALUES (?1, ?2, ?3)", params![semantic_id, candidate_id, observation_id]).map_err(database_error)?;
-            let observation_text: String = tx
-                .query_row(
-                    "SELECT raw_text FROM observations WHERE id = ?1",
-                    [&observation_id],
-                    |row| row.get(0),
-                )
-                .map_err(database_error)?;
+            link_candidate_to_semantic_claim(&tx, semantic_id, &candidate_id, &observation_id)?;
             link_claim_evidence(
                 &tx,
                 semantic_id,
                 "user_observation",
                 None,
                 Some(&observation_id),
-                &observation_text,
+                observation_text,
                 "supports",
             )?;
             Some(semantic_id)
@@ -210,19 +200,7 @@ impl LearningStore {
         record_policy_decision(
             &tx,
             proposal_id,
-            if accept {
-                if method == "ai" {
-                    "ai_accepted"
-                } else {
-                    "human_accepted"
-                }
-            } else {
-                if method == "ai" {
-                    "ai_rejected"
-                } else {
-                    "human_rejected"
-                }
-            },
+            review_decision_outcome(method, accept),
             reason.trim(),
             semantic_id,
             Some(if accept { "active" } else { "rejected" }),

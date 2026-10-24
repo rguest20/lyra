@@ -1,4 +1,31 @@
 use super::*;
+use sha2::{Digest, Sha256};
+
+pub(super) const MAX_RETAINED_SOURCE_CHARS: usize = 32_000;
+
+// Shared candidate gate only. Human origin verification, pair provenance and
+// active-claim conflicts remain enforced by their respective callers.
+pub(super) const AUTOMATIC_PROMOTION_ELIGIBILITY_CTE: &str = "eligible_findings AS (
+    SELECT f.*, a.independence_key
+    FROM scholar_findings f
+    JOIN scholar_source_assessments a ON a.finding_id = f.id
+    WHERE f.status IN ('needs_review', 'promoted')
+      AND f.confidence >= ?8
+      AND a.source_kind = 'secondary'
+      AND a.direct_support = 1
+      AND a.independence_verified = 1
+      AND (SELECT suitable_for_topic FROM scholar_source_expertise_reviews er
+           WHERE er.finding_id = f.id ORDER BY er.id DESC LIMIT 1) = 1
+)";
+
+impl ScholarAiReviewTask {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            finding_id: row.get(0)?,
+            job_id: row.get(1)?,
+        })
+    }
+}
 
 pub(super) mod baskets;
 mod corroboration;
@@ -10,6 +37,416 @@ pub(crate) mod network;
 mod promotion;
 mod reviews;
 use promotion::self_promote_verified_findings;
+
+pub(super) fn unix_time_millis() -> Result<u128, std::time::SystemTimeError> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis())
+}
+
+pub(super) fn unix_time_ms_i64(overflow_message: &str) -> io::Result<i64> {
+    super::unix_time_ms_i64_with_overflow(|_| invalid(overflow_message))
+}
+
+pub(super) fn scout_investigations_last_day(connection: &Connection) -> io::Result<i64> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM scout_investigations
+             WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+pub(super) fn new_scholar_job_id(connection: &Connection) -> io::Result<String> {
+    connection
+        .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
+        .map_err(database_error)
+}
+
+pub(super) fn sql_now_millis(connection: &Connection) -> io::Result<i64> {
+    connection
+        .query_row(
+            "SELECT CAST(strftime('%s','now') AS INTEGER)*1000",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+pub(super) fn mark_scholar_job_processing(connection: &Connection, job_id: &str) -> io::Result<()> {
+    connection
+        .execute(
+            "UPDATE scholar_jobs SET status = 'processing', claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), attempts = attempts + 1 WHERE id = ?1",
+            [job_id],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) fn mark_semantic_claim_challenged(
+    connection: &Connection,
+    claim_id: i64,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "UPDATE semantic_claims SET status = 'challenged' WHERE id = ?1",
+            [claim_id],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) fn supersede_semantic_claim(
+    connection: &Connection,
+    claim_id: i64,
+    reason: &str,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "UPDATE semantic_claims SET retracted_by = ?2, status = 'superseded' WHERE id = ?1",
+            params![claim_id, reason],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+fn enqueue_conversation_job(
+    connection: &Connection,
+    conversation_id: &str,
+    turn_number: i64,
+    question: &str,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT INTO scholar_jobs (id, conversation_id, turn_number, question, status, created_at)
+             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending',
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(conversation_id, turn_number) DO NOTHING",
+            params![conversation_id, turn_number, question],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+fn saved_semantic_support(connection: &Connection, finding_id: i64) -> io::Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT assessment_json FROM scholar_semantic_support WHERE finding_id = ?1",
+            [finding_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+pub(super) fn set_scholar_task_stop_reason(
+    connection: &Connection,
+    job_id: &str,
+    reason: &str,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "UPDATE scholar_task_targets SET stop_reason=?2,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=?1",
+            params![job_id, reason],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) fn latest_scholar_finding_proposal_id(
+    connection: &Connection,
+    finding_id: i64,
+) -> io::Result<i64> {
+    connection
+        .query_row(
+            "SELECT id FROM role_proposals WHERE source_type = 'scholar_finding'
+             AND source_id = ?1 ORDER BY id DESC LIMIT 1",
+            [finding_id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+pub(super) fn activate_reviewed_claim(connection: &Connection, claim_id: i64) -> io::Result<()> {
+    connection
+        .execute(
+            "UPDATE semantic_claims SET status = 'active',
+                checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                last_reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                next_review_at = CASE volatility
+                    WHEN 'fast_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 days')
+                    WHEN 'slow_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+180 days')
+                    ELSE NULL END
+             WHERE id = ?1 AND retracted_by IS NULL",
+            [claim_id],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) struct NewSemanticClaim<'a> {
+    pub subject: &'a str,
+    pub relation: &'a str,
+    pub object: &'a str,
+    pub source: &'a str,
+    pub supersedes_id: Option<i64>,
+    pub valid_from: Option<&'a str>,
+    pub valid_until: Option<&'a str>,
+    pub proposition: &'a PropositionMetadata,
+}
+
+pub(super) fn insert_scholar_semantic_claim(
+    tx: &Transaction<'_>,
+    claim: NewSemanticClaim<'_>,
+) -> io::Result<i64> {
+    let NewSemanticClaim {
+        subject,
+        relation,
+        object,
+        source,
+        supersedes_id,
+        valid_from,
+        valid_until,
+        proposition,
+    } = claim;
+    tx.execute(
+        "INSERT INTO semantic_claims
+            (subject, relation, object, source, supersedes_id, source_observation_id, created_at,
+             valid_from, valid_until, attribution, polarity, modality,
+             geographic_scope, context_scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            subject,
+            relation,
+            object,
+            source,
+            supersedes_id,
+            valid_from,
+            valid_until,
+            proposition.attribution.as_deref(),
+            proposition.polarity.as_str(),
+            proposition.modality.as_str(),
+            proposition.geographic_scope.as_deref(),
+            proposition.context_scope.as_deref(),
+        ],
+    )
+    .map_err(database_error)?;
+    Ok(tx.last_insert_rowid())
+}
+
+pub(super) fn promote_scholar_finding(
+    connection: &Connection,
+    finding_id: i64,
+    claim_id: i64,
+    reason: &str,
+) -> io::Result<usize> {
+    connection
+        .execute(
+            "UPDATE scholar_findings SET status = 'promoted', semantic_claim_id = ?2,
+                decision_reason = ?3 WHERE id = ?1 AND status = 'needs_review'",
+            params![finding_id, claim_id, reason],
+        )
+        .map_err(database_error)
+}
+
+pub(super) fn link_scholar_finding_claim(
+    connection: &Connection,
+    finding_id: i64,
+    claim_id: i64,
+    relation: &str,
+    rationale: &str,
+    assessment_method: &str,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO scholar_finding_claim_links
+                (finding_id,claim_id,relation,rationale,assessment_method)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![finding_id, claim_id, relation, rationale, assessment_method],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) struct NewResearchSource<'a> {
+    pub job_id: &'a str,
+    pub title: &'a str,
+    pub url: &'a str,
+    pub content_hash: &'a str,
+    pub body: &'a str,
+    pub source_scope: &'a str,
+    pub input_characters: i64,
+    pub retained_characters: i64,
+    pub truncated: bool,
+    pub provider: &'a str,
+    pub query: Option<&'a str>,
+    pub published_at: Option<&'a str>,
+    pub capture_status: &'a str,
+}
+
+pub(super) struct PreparedResearchSource {
+    pub body: String,
+    pub content_hash: String,
+    pub input_characters: i64,
+    pub retained_characters: i64,
+    pub truncated: bool,
+}
+
+pub(super) fn prepare_research_source(
+    body: &str,
+    maximum_characters: usize,
+) -> io::Result<PreparedResearchSource> {
+    let input_characters = body.chars().count();
+    let retained_body = body.chars().take(maximum_characters).collect::<String>();
+    let retained_characters = retained_body.chars().count();
+    let truncated = input_characters > retained_characters;
+    Ok(PreparedResearchSource {
+        content_hash: format!("{:x}", Sha256::digest(body.as_bytes())),
+        input_characters: i64::try_from(input_characters).map_err(io::Error::other)?,
+        retained_characters: i64::try_from(retained_characters).map_err(io::Error::other)?,
+        truncated,
+        body: retained_body,
+    })
+}
+
+pub(super) fn research_source_capture_status(source_scope: &str, truncated: bool) -> &'static str {
+    if truncated {
+        "truncated"
+    } else if source_scope.contains("excerpt") || source_scope.contains("section") {
+        "excerpted"
+    } else {
+        "complete"
+    }
+}
+
+pub(super) struct SemanticClaimScope {
+    pub id: i64,
+    pub proposition: ScopedProposition,
+}
+
+pub(super) struct ScopedProposition {
+    pub object: String,
+    pub valid_from: Option<String>,
+    pub valid_until: Option<String>,
+    pub geographic_scope: Option<String>,
+    pub context_scope: Option<String>,
+}
+
+impl ScopedProposition {
+    pub(super) fn same_scope(
+        &self,
+        geographic_scope: &Option<String>,
+        context_scope: &Option<String>,
+    ) -> bool {
+        &self.geographic_scope == geographic_scope && &self.context_scope == context_scope
+    }
+}
+
+pub(super) struct ScholarPropositionScope {
+    pub subject: String,
+    pub relation: String,
+    pub proposition: ScopedProposition,
+}
+
+impl SemanticClaimScope {
+    pub fn from_row(row: &rusqlite::Row<'_>, first_column: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(first_column)?,
+            proposition: ScopedProposition::from_row(row, first_column + 1)?,
+        })
+    }
+}
+
+impl ScopedProposition {
+    pub fn from_row(row: &rusqlite::Row<'_>, first_column: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            object: row.get(first_column)?,
+            valid_from: row.get(first_column + 1)?,
+            valid_until: row.get(first_column + 2)?,
+            geographic_scope: row.get(first_column + 3)?,
+            context_scope: row.get(first_column + 4)?,
+        })
+    }
+}
+
+impl ScholarPropositionScope {
+    pub fn from_row(row: &rusqlite::Row<'_>, first_column: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            subject: row.get(first_column)?,
+            relation: row.get(first_column + 1)?,
+            proposition: ScopedProposition::from_row(row, first_column + 2)?,
+        })
+    }
+}
+
+pub(super) fn insert_research_source(
+    connection: &Connection,
+    source: NewResearchSource<'_>,
+) -> io::Result<()> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO research_sources
+                (job_id,title,url,content_hash,body,created_at,source_scope,
+                 input_characters,retained_characters,truncated,provider,query,published_at,
+                 capture_status)
+             VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                 ?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                source.job_id,
+                source.title,
+                source.url,
+                source.content_hash,
+                source.body,
+                source.source_scope,
+                source.input_characters,
+                source.retained_characters,
+                source.truncated,
+                source.provider,
+                source.query,
+                source.published_at,
+                source.capture_status,
+            ],
+        )
+        .map_err(database_error)?;
+    Ok(())
+}
+
+pub(super) fn evidence_byte_offsets(
+    body: &str,
+    base_char_offset: usize,
+    passage: &str,
+    evidence: &str,
+) -> Option<(usize, usize)> {
+    let prefix_bytes = body
+        .chars()
+        .take(base_char_offset)
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let local_start = passage.find(evidence)?;
+    let start = prefix_bytes.checked_add(local_start)?;
+    let end = start.checked_add(evidence.len())?;
+    Some((start, end))
+}
+
+pub(super) fn evidence_byte_offsets_i64(
+    body: &str,
+    base_char_offset: usize,
+    passage: &str,
+    evidence: &str,
+) -> io::Result<Option<(i64, i64)>> {
+    evidence_byte_offsets(body, base_char_offset, passage, evidence)
+        .map(|(start, end)| {
+            Ok((
+                i64::try_from(start).map_err(io::Error::other)?,
+                i64::try_from(end).map_err(io::Error::other)?,
+            ))
+        })
+        .transpose()
+}
 
 #[derive(Debug)]
 pub(crate) enum ScoutAdmission {
@@ -45,14 +482,7 @@ fn scout_queue_block_reason(
         }
     }
     if daily_limit > 0 {
-        let daily: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM scout_investigations
-            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 day')",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let daily = scout_investigations_last_day(connection)?;
         if daily >= i64::try_from(daily_limit).unwrap_or(20) {
             return Ok(Some("Scout daily investigation budget exhausted"));
         }
@@ -63,6 +493,7 @@ fn scout_queue_block_reason(
 pub(super) use network::robots_block_key;
 
 impl LearningStore {
+    #[cfg(test)]
     pub fn scholar_task_target(&self, job_id: &str) -> io::Result<Option<ScholarTaskTarget>> {
         let raw: Option<(String, String, String, String, String, Option<String>)> = self
             .connection
@@ -168,7 +599,7 @@ impl LearningStore {
                 |row| row.get(0),
             )
             .map_err(database_error)?;
-        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+        Ok(sqlite_count(count))
     }
 
     pub fn scout_known_claims_for_subject(&self, subject: &str) -> io::Result<Vec<String>> {
@@ -202,14 +633,8 @@ impl LearningStore {
         turn_number: usize,
         question: &str,
     ) -> io::Result<()> {
-        self.connection.execute(
-            "INSERT INTO scholar_jobs (id, conversation_id, turn_number, question, status, created_at)
-             VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending',
-                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-             ON CONFLICT(conversation_id, turn_number) DO NOTHING",
-            params![conversation_id, i64::try_from(turn_number).map_err(|_| invalid("turn number too large"))?, question],
-        ).map_err(database_error)?;
-        Ok(())
+        let turn = i64::try_from(turn_number).map_err(|_| invalid("turn number too large"))?;
+        enqueue_conversation_job(&self.connection, conversation_id, turn, question)
     }
 
     pub fn enqueue_research_plan(
@@ -223,9 +648,7 @@ impl LearningStore {
             .connection
             .unchecked_transaction()
             .map_err(database_error)?;
-        tx.execute("INSERT INTO scholar_jobs (id, conversation_id, turn_number, question, status, created_at)
-            VALUES (lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            ON CONFLICT(conversation_id, turn_number) DO NOTHING", params![conversation,turn,plan.question]).map_err(database_error)?;
+        enqueue_conversation_job(&tx, conversation, turn, &plan.question)?;
         tx.execute(
             "INSERT INTO scholar_lookup_plans (job_id, queries_json)
             SELECT id, ?3 FROM scholar_jobs WHERE conversation_id = ?1 AND turn_number = ?2
@@ -306,9 +729,7 @@ impl LearningStore {
         {
             return Ok(ScoutAdmission::Deferred(reason));
         }
-        let job_id: String = tx
-            .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
-            .map_err(database_error)?;
+        let job_id = new_scholar_job_id(&tx)?;
         tx.execute(
             "INSERT INTO scholar_jobs
              (id, conversation_id, turn_number, question, status, created_at)
@@ -446,7 +867,7 @@ impl LearningStore {
             |row| Ok(ScholarJob { id: row.get(0)?, question: row.get(1)?, status: row.get(2)? }),
         ).optional().map_err(database_error)?;
         if let Some(job) = &job {
-            tx.execute("UPDATE scholar_jobs SET status = 'processing', claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), attempts = attempts + 1 WHERE id = ?1", [&job.id]).map_err(database_error)?;
+            mark_scholar_job_processing(&tx, &job.id)?;
         }
         tx.commit().map_err(database_error)?;
         Ok(job)
@@ -467,14 +888,7 @@ impl LearningStore {
     }
 
     pub fn next_research_retry_ms(&self) -> io::Result<i64> {
-        let now: i64 = self
-            .connection
-            .query_row(
-                "SELECT CAST(strftime('%s','now') AS INTEGER)*1000",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let now = sql_now_millis(&self.connection)?;
         let backoff: i64 = self
             .connection
             .query_row(
@@ -501,11 +915,7 @@ impl LearningStore {
         } else {
             "processing_failure"
         };
-        self.connection.execute(
-            "UPDATE scholar_task_targets SET stop_reason=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=?1",
-            params![job_id, stop_reason],
-        ).map_err(database_error)?;
-        Ok(())
+        set_scholar_task_stop_reason(&self.connection, job_id, stop_reason)
     }
 
     pub fn scholar_jobs(&self) -> io::Result<Vec<(ScholarJob, Option<String>)>> {
@@ -544,14 +954,10 @@ impl LearningStore {
             .query_map([job_id], |row| {
                 Ok(StoredScholarFinding {
                     id: row.get(0)?,
-                    source_archive_id: row.get(1)?,
-                    evidence_byte_start: row.get(2)?,
-                    evidence_byte_end: row.get(3)?,
-                    source_url: row.get(4)?,
+                    source_span: ScholarEvidenceSpan::from_row(row, 1, 8)?,
                     subject: row.get(5)?,
                     relation: row.get(6)?,
                     object: row.get(7)?,
-                    evidence_text: row.get(8)?,
                     confidence: row.get(9)?,
                     status: row.get(10)?,
                     decision_reason: row.get(11)?,
@@ -560,11 +966,7 @@ impl LearningStore {
                     source_quality: row.get(14)?,
                     freshness: row.get(15)?,
                     source_updated_at: row.get(16)?,
-                    attribution: row.get(17)?,
-                    polarity: row.get(18)?,
-                    modality: row.get(19)?,
-                    geographic_scope: row.get(20)?,
-                    context_scope: row.get(21)?,
+                    proposition: PropositionMetadata::from_storage_row(row, 17)?,
                 })
             })
             .map_err(database_error)?
@@ -657,15 +1059,7 @@ impl LearningStore {
             .optional()
             .map_err(database_error)?;
         if let Some(context) = context.as_mut() {
-            let support: Option<String> = self
-                .connection
-                .query_row(
-                    "SELECT assessment_json FROM scholar_semantic_support WHERE finding_id = ?1",
-                    [finding_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(database_error)?;
+            let support = saved_semantic_support(&self.connection, finding_id)?;
             context["support_method"] = if support.is_some() {
                 "ai_semantic_entailment"
             } else {
@@ -751,7 +1145,7 @@ impl LearningStore {
             .map_err(database_error)
     }
 
-    pub fn scholar_ai_review_queue(&self) -> io::Result<Vec<(i64, String)>> {
+    pub(crate) fn scholar_ai_review_queue(&self) -> io::Result<Vec<ScholarAiReviewTask>> {
         let mut statement = self
             .connection
             .prepare(
@@ -778,7 +1172,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], ScholarAiReviewTask::from_row)
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -804,7 +1198,7 @@ mod scout_admission_tests {
 
     #[test]
     fn scout_question_history_includes_questions_retained_from_matching_sources() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         store
             .enqueue_research_plan(
                 "question-history",
@@ -848,7 +1242,7 @@ mod scout_admission_tests {
 
     #[test]
     fn scout_question_history_includes_direct_conversation_questions() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         store
             .enqueue_research("lyra-frontend", 7, "Which flavours does Walkers sell?")
             .unwrap();
@@ -858,7 +1252,7 @@ mod scout_admission_tests {
 
     #[test]
     fn duplicate_lead_explains_the_no_result_cooldown() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         store
             .enqueue_research_plan(
                 "topic-cooldown",
@@ -890,7 +1284,7 @@ mod scout_admission_tests {
 
     #[test]
     fn scheduling_blocks_explain_cooldown_and_daily_limits() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         store
             .enqueue_research_plan(
                 "admission",
@@ -919,18 +1313,11 @@ mod scout_admission_tests {
 
     #[test]
     fn deferred_model_lead_survives_restart_and_reuses_its_probe() {
-        let directory = std::env::temp_dir().join(format!(
-            "lyra-deferred-scout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let directory = crate::test_support::unique_temp_path("lyra-deferred-scout", "");
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("learning.db");
         let mut store = LearningStore::open(&path).unwrap();
-        let probe = store
+        let probe_id = store
             .begin_model_probe("Inca roads", "fixture")
             .unwrap()
             .unwrap();
@@ -939,7 +1326,7 @@ mod scout_admission_tests {
         assert!(
             store
                 .defer_model_probe(
-                    probe,
+                    probe_id,
                     raw,
                     "Inca roads",
                     "What materials are used in constructing Inca roads?",
@@ -950,7 +1337,7 @@ mod scout_admission_tests {
         assert!(
             !store
                 .defer_model_probe(
-                    probe,
+                    probe_id,
                     raw,
                     "Inca roads",
                     "What materials are used in constructing Inca roads?",
@@ -961,8 +1348,13 @@ mod scout_admission_tests {
         assert!(store.recent_model_topics().unwrap().is_empty());
         drop(store);
         let mut reopened = LearningStore::open(&path).unwrap();
-        let (id, _, topic, question, raw) = reopened.deferred_model_probe().unwrap().unwrap();
-        assert_eq!(id, probe);
+        let deferred_probe = reopened.deferred_model_probe().unwrap().unwrap();
+        let id = deferred_probe.id;
+        let topic = deferred_probe.topic;
+        let question = deferred_probe.question;
+        let raw = deferred_probe.raw_output;
+        assert_eq!(id, probe_id);
+        assert_eq!(deferred_probe.seed, "Inca roads");
         let ScoutAdmission::Queued(job) = reopened
             .try_enqueue_scout_research(
                 "model_probe",
@@ -1030,12 +1422,18 @@ fn scout_question_already_attempted(connection: &Connection, question: &str) -> 
     Ok(false)
 }
 
+struct LatestScoutTopic {
+    status: String,
+    age_seconds: Option<f64>,
+    attempts: i64,
+}
+
 fn scout_topic_block_reason(
     connection: &Connection,
     trigger_kind: &str,
     topic_key: &str,
 ) -> io::Result<Option<&'static str>> {
-    let latest: Option<(String, Option<f64>, i64)> = connection
+    let latest = connection
         .query_row(
             "SELECT j.status, (julianday('now') - julianday(s.created_at)) * 86400,
                 (SELECT COUNT(*) FROM scout_investigations attempts
@@ -1044,23 +1442,29 @@ fn scout_topic_block_reason(
              WHERE s.trigger_kind = ?1 AND s.topic_key = ?2
              ORDER BY s.id DESC LIMIT 1",
             params![trigger_kind, topic_key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(LatestScoutTopic {
+                    status: row.get(0)?,
+                    age_seconds: row.get(1)?,
+                    attempts: row.get(2)?,
+                })
+            },
         )
         .optional()
         .map_err(database_error)?;
     Ok(match latest {
         None => None,
-        Some((_, _, attempts)) if attempts >= 3 => {
+        Some(latest) if latest.attempts >= 3 => {
             Some("Scout topic has reached its three-investigation attempt limit")
         }
-        Some((status, _, _)) if matches!(status.as_str(), "pending" | "processing") => {
+        Some(latest) if matches!(latest.status.as_str(), "pending" | "processing") => {
             Some("Same Scout investigation is already pending or processing")
         }
-        Some((status, _, _)) if status == "promoted" => {
+        Some(latest) if latest.status == "promoted" => {
             Some("Scout topic already has promoted research")
         }
-        Some((status, age, _)) => {
-            let (seconds, reason) = if status == "no_result" {
+        Some(latest) => {
+            let (seconds, reason) = if latest.status == "no_result" {
                 (
                     86_400.0,
                     "Previous investigation found no result; this topic has a one-day retry cooldown",
@@ -1071,7 +1475,10 @@ fn scout_topic_block_reason(
                     "Previous investigation awaits review or corroboration; this topic has a seven-day retry cooldown",
                 )
             };
-            age.is_none_or(|value| value < seconds).then_some(reason)
+            latest
+                .age_seconds
+                .is_none_or(|value| value < seconds)
+                .then_some(reason)
         }
     })
 }

@@ -1,5 +1,64 @@
 use super::*;
-use sha2::{Digest, Sha256};
+
+struct SemanticSupportFinding {
+    finding: ScholarFinding,
+    passage: String,
+    title: String,
+}
+
+struct ExistingSemanticClaim {
+    id: i64,
+    subject: String,
+    object: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+    relation: String,
+    proposition: PropositionMetadata,
+}
+
+impl ExistingSemanticClaim {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            subject: row.get(1)?,
+            object: row.get(2)?,
+            valid_from: row.get(3)?,
+            valid_until: row.get(4)?,
+            relation: row.get(10)?,
+            proposition: PropositionMetadata::from_storage_row(row, 5)?,
+        })
+    }
+}
+
+enum ExistingSemanticMatch {
+    Conflict(i64),
+    Match(i64),
+    Qualifying(i64),
+    Unresolved(i64),
+    None,
+}
+
+impl SemanticSupportFinding {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            finding: ScholarFinding {
+                semantic_support: None,
+                subject: row.get(0)?,
+                relation: row.get(1)?,
+                object: row.get(2)?,
+                evidence_text: row.get(3)?,
+                confidence: row.get(4)?,
+                valid_from: row.get(5)?,
+                valid_until: row.get(6)?,
+                source_quality: row.get(7)?,
+                source_updated_at: row.get(8)?,
+                proposition: PropositionMetadata::from_storage_row(row, 11)?,
+            },
+            passage: row.get(9)?,
+            title: row.get(10)?,
+        })
+    }
+}
 
 fn source_version_for_finding(
     tx: &Transaction<'_>,
@@ -25,66 +84,56 @@ fn source_version_for_finding(
         .map_err(database_error)?;
     drop(statement);
     for (source_id, body) in rows {
-        if let Some(start) = body.find(evidence_text) {
-            let end = start
-                .checked_add(evidence_text.len())
-                .ok_or_else(|| invalid("evidence offset overflow"))?;
-            return Ok((
-                source_id,
-                Some(i64::try_from(start).map_err(io::Error::other)?),
-                Some(i64::try_from(end).map_err(io::Error::other)?),
-            ));
+        if let Some((start, end)) =
+            super::evidence_byte_offsets_i64(&body, 0, &body, evidence_text)?
+        {
+            return Ok((source_id, Some(start), Some(end)));
         }
     }
 
-    const MAX_SOURCE_CHARS: usize = 32_000;
-    let retained = source_excerpt
-        .chars()
-        .take(MAX_SOURCE_CHARS)
-        .collect::<String>();
-    let input_characters = source_excerpt.chars().count();
-    let retained_characters = retained.chars().count();
-    let truncated = input_characters > retained_characters;
-    let content_hash = format!("{:x}", Sha256::digest(source_excerpt.as_bytes()));
-    tx.execute(
-        "INSERT OR IGNORE INTO research_sources
-            (job_id,title,url,content_hash,body,created_at,source_scope,input_characters,
-             retained_characters,truncated,provider,query,published_at,capture_status)
-         VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-             'finding_source_excerpt',?6,?7,?8,'unknown',
-             (SELECT question FROM scholar_jobs WHERE id=?1),?9,?10)",
-        params![
+    let retained =
+        super::prepare_research_source(source_excerpt, super::MAX_RETAINED_SOURCE_CHARS)?;
+    let query: Option<String> = tx
+        .query_row(
+            "SELECT question FROM scholar_jobs WHERE id=?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    super::insert_research_source(
+        tx,
+        super::NewResearchSource {
             job_id,
-            source_title,
-            source_url,
-            content_hash,
-            retained,
-            i64::try_from(input_characters).map_err(io::Error::other)?,
-            i64::try_from(retained_characters).map_err(io::Error::other)?,
-            truncated,
-            source_updated_at,
-            if truncated { "truncated" } else { "excerpted" },
-        ],
-    )
-    .map_err(database_error)?;
+            title: source_title,
+            url: source_url,
+            content_hash: &retained.content_hash,
+            body: &retained.body,
+            source_scope: "finding_source_excerpt",
+            input_characters: retained.input_characters,
+            retained_characters: retained.retained_characters,
+            truncated: retained.truncated,
+            provider: "unknown",
+            query: query.as_deref(),
+            published_at: source_updated_at,
+            capture_status: super::research_source_capture_status(
+                "finding_source_excerpt",
+                retained.truncated,
+            ),
+        },
+    )?;
     let source_id: i64 = tx
         .query_row(
             "SELECT id FROM research_sources WHERE url=?1 AND content_hash=?2",
-            params![source_url, content_hash],
+            params![source_url, retained.content_hash],
             |row| row.get(0),
         )
         .map_err(database_error)?;
-    let span = retained.find(evidence_text).and_then(|start| {
-        start
-            .checked_add(evidence_text.len())
-            .map(|end| (start, end))
-    });
+    let span = super::evidence_byte_offsets_i64(&retained.body, 0, &retained.body, evidence_text)?;
     Ok((
         source_id,
-        span.map(|(start, _)| i64::try_from(start).map_err(io::Error::other))
-            .transpose()?,
-        span.map(|(_, end)| i64::try_from(end).map_err(io::Error::other))
-            .transpose()?,
+        span.map(|(start, _)| start),
+        span.map(|(_, end)| end),
     ))
 }
 
@@ -120,12 +169,6 @@ fn grounded_scholar_finding(
     source_excerpt: &str,
     finding: &ScholarFinding,
 ) -> bool {
-    let safe_field = |value: &str| {
-        !value.trim().is_empty()
-            && value.chars().count() <= 500
-            && !value.chars().any(char::is_control)
-            && !value.contains("<|")
-    };
     let safe_evidence = !finding.evidence_text.trim().is_empty()
         && finding.evidence_text.chars().count() <= 4_500
         && !finding
@@ -140,15 +183,12 @@ fn grounded_scholar_finding(
     .into_iter()
     .flatten()
     .all(|scope| {
-        !scope.trim().is_empty()
-            && scope.chars().count() <= 240
-            && !scope.chars().any(char::is_control)
-            && finding.evidence_text.contains(scope)
+        crate::storage::valid_quoted_scope(scope, source_excerpt, &finding.evidence_text)
+            && !scope.contains("<|")
     });
-    let semantic_valid = finding
-        .semantic_support
-        .as_ref()
-        .is_none_or(|support| support.supports(finding, source_excerpt));
+    let semantic_support = finding.semantic_support.as_ref();
+    let semantic_valid =
+        semantic_support.is_none_or(|support| support.supports(finding, source_excerpt));
     semantic_valid
         // A claim-shaped sentence embedded in cookie controls or a footer is
         // still page chrome, not evidence. Keep this defense at ingestion as
@@ -156,33 +196,21 @@ fn grounded_scholar_finding(
         && !crate::scholar::passages::is_site_chrome(source_excerpt)
         && valid_scope
         && safe_evidence
-        && source_excerpt.contains(&finding.evidence_text)
-        && safe_field(&finding.subject)
-        && safe_field(&finding.relation)
-        && safe_field(&finding.object)
-        && (finding
-            .semantic_support
-            .as_ref()
-            .is_some_and(|support| support.supports(finding, source_excerpt))
-            || evidence_supports_claim(finding)
-            || (matches!(
-                finding.relation.as_str(),
-                "has encyclopedia summary" | "has encyclopedia detail"
-            ) && canonical(&finding.subject) == canonical(source_title)
-                && finding.object == finding.evidence_text))
-        && finding.confidence.is_finite()
-        && (0.0..=1.0).contains(&finding.confidence)
-        && valid_claim_period(
-            finding.valid_from.as_deref(),
-            finding.valid_until.as_deref(),
+        && crate::storage::valid_proposition_evidence(
+            &finding.subject,
+            &finding.relation,
+            &finding.object,
+            &finding.evidence_text,
+            source_excerpt,
         )
-        && [
+        && (semantic_support.is_some()
+            || crate::storage::direct_passage_supports_finding(source_title, finding))
+        && crate::storage::valid_confidence(finding.confidence)
+        && claim_period_is_stated(
             finding.valid_from.as_deref(),
             finding.valid_until.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .all(|date| source_excerpt.contains(date))
+            source_excerpt,
+        )
 }
 
 struct IngestedFinding {
@@ -195,14 +223,14 @@ fn existing_semantic_match(
     tx: &Transaction<'_>,
     finding: &ScholarFinding,
     today: &str,
-) -> io::Result<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
+) -> io::Result<ExistingSemanticMatch> {
     // Only directly reviewed, unscoped identity links can establish a shared
     // subject here. Contextual aliases require a scope-aware claim model and
     // must never silently become global equivalences.
     let aliases = super::entities::EntityAliases::load(tx)?;
     let mut statement = tx
         .prepare(
-            "SELECT id, subject, object, valid_from, valid_until, attribution, polarity, modality, relation, geographic_scope, context_scope FROM semantic_claims
+            "SELECT id, subject, object, valid_from, valid_until, attribution, polarity, modality, geographic_scope, context_scope, relation FROM semantic_claims
              WHERE retracted_by IS NULL
                AND lower(trim(relation)) = lower(trim(?2))
                AND (lower(trim(subject)) = lower(trim(?1)) OR EXISTS (
@@ -229,21 +257,7 @@ fn existing_semantic_match(
                 finding.relation,
                 finding.proposition.context_scope
             ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, Option<String>>(10)?,
-                ))
-            },
+            ExistingSemanticClaim::from_row,
         )
         .map_err(database_error)?
         .collect::<Result<Vec<_>, _>>()
@@ -252,76 +266,70 @@ fn existing_semantic_match(
     let mut conflicting_claim_id = None;
     let mut qualifying_claim_id = None;
     let mut unresolved_claim_id = None;
-    for (
-        id,
-        subject,
-        object,
-        valid_from,
-        valid_until,
-        attribution,
-        polarity,
-        modality,
-        relation,
-        geographic_scope,
-        context_scope,
-    ) in existing
-    {
-        let same_subject = aliases.same(&subject, &finding.subject)
+    for claim in existing {
+        let same_subject = aliases.same(&claim.subject, &finding.subject)
             || finding
                 .proposition
                 .context_scope
                 .as_deref()
                 .is_some_and(|scope| {
-                    context_scope
+                    claim
+                        .proposition
+                        .context_scope
                         .as_deref()
                         .is_some_and(|claim_scope| canonical(claim_scope) == canonical(scope))
-                        && aliases.same_in_scope(&subject, &finding.subject, scope)
+                        && aliases.same_in_scope(&claim.subject, &finding.subject, scope)
                 });
-        if !same_subject || canonical(&relation) != canonical(&finding.relation) {
+        if !same_subject || canonical(&claim.relation) != canonical(&finding.relation) {
             continue;
         }
         if !claim_periods_overlap(
             finding.valid_from.as_deref(),
             finding.valid_until.as_deref(),
-            valid_from.as_deref(),
-            valid_until.as_deref(),
+            claim.valid_from.as_deref(),
+            claim.valid_until.as_deref(),
             today,
         ) {
             continue;
         }
-        let object_matches = canonical(&object) == canonical(&finding.object);
-        let validity_matches = valid_from.as_deref() == finding.valid_from.as_deref()
-            && valid_until.as_deref() == finding.valid_until.as_deref();
-        let proposition_scope_matches = attribution == finding.proposition.attribution
-            && polarity == finding.proposition.polarity.as_str()
-            && modality == finding.proposition.modality.as_str();
-        let geographic_scope_matches = geographic_scope == finding.proposition.geographic_scope;
-        let context_scope_matches = context_scope == finding.proposition.context_scope;
+        let object_matches = canonical(&claim.object) == canonical(&finding.object);
+        let validity_matches = claim.valid_from.as_deref() == finding.valid_from.as_deref()
+            && claim.valid_until.as_deref() == finding.valid_until.as_deref();
+        let proposition_scope_matches = claim.proposition.attribution
+            == finding.proposition.attribution
+            && claim.proposition.polarity == finding.proposition.polarity
+            && claim.proposition.modality == finding.proposition.modality;
+        let geographic_scope_matches =
+            claim.proposition.geographic_scope == finding.proposition.geographic_scope;
+        let context_scope_matches =
+            claim.proposition.context_scope == finding.proposition.context_scope;
         if !geographic_scope_matches || !context_scope_matches {
-            unresolved_claim_id.get_or_insert(id);
+            unresolved_claim_id.get_or_insert(claim.id);
             continue;
         }
         if object_matches && validity_matches && proposition_scope_matches {
-            matching_claim_id.get_or_insert(id);
+            matching_claim_id.get_or_insert(claim.id);
             continue;
         }
         if !object_matches
             && proposition_scope_matches
             && finding.relation != "has encyclopedia detail"
         {
-            conflicting_claim_id.get_or_insert(id);
+            conflicting_claim_id.get_or_insert(claim.id);
             continue;
         }
-        qualifying_claim_id.get_or_insert(id);
+        qualifying_claim_id.get_or_insert(claim.id);
     }
     if let Some(id) = conflicting_claim_id {
-        Ok((None, Some(id), None, None))
+        Ok(ExistingSemanticMatch::Conflict(id))
     } else if let Some(id) = matching_claim_id {
-        Ok((Some(id), None, None, None))
+        Ok(ExistingSemanticMatch::Match(id))
     } else if let Some(id) = qualifying_claim_id {
-        Ok((None, None, Some(id), None))
+        Ok(ExistingSemanticMatch::Qualifying(id))
+    } else if let Some(id) = unresolved_claim_id {
+        Ok(ExistingSemanticMatch::Unresolved(id))
     } else {
-        Ok((None, None, None, unresolved_claim_id))
+        Ok(ExistingSemanticMatch::None)
     }
 }
 
@@ -389,9 +397,7 @@ fn ingest_source(
             |row| row.get(0),
         )
         .map_err(database_error)?;
-    let today: String = tx
-        .query_row("SELECT date('now')", [], |row| row.get(0))
-        .map_err(database_error)?;
+    let today = crate::storage::current_sql_date(tx)?;
     let question: String = tx
         .query_row(
             "SELECT question FROM scholar_jobs WHERE id = ?1",
@@ -408,23 +414,12 @@ fn ingest_source(
     if profile
         .verified_underlying_source_id
         .as_deref()
-        .is_some_and(|id| {
-            id.trim().is_empty() || id.chars().count() > 200 || id.chars().any(char::is_control)
-        })
+        .is_some_and(|id| !crate::storage::valid_printable_field(id, 200))
     {
         return Err(invalid("invalid verified source identity"));
     }
-    let publication_is_recent = if let Some(published_at) = &profile.published_at {
-        tx.query_row(
-            "SELECT COALESCE(date(?1) > date('now', '-12 months')
-                        AND date(?1) <= date('now'), 0)",
-            [published_at],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(database_error)?
-    } else {
-        false
-    };
+    let publication_is_recent =
+        crate::storage::publication_date_is_recent(tx, profile.published_at.as_deref())?;
     let source_id = profile
         .verified_underlying_source_id
         .as_deref()
@@ -447,42 +442,51 @@ fn ingest_source(
     let mut unresolved_claim_id = None;
     let mut finding_status = "needs_review";
     let assessment = super::evidence_policy::assess_scholar_finding_with_relevance(
-        &question,
-        source_url,
-        finding,
-        supported,
-        freshness,
-        profile,
-        publication_is_recent,
-        !corroboration.independent_sources.is_empty()
-            && corroboration.possible_copy_of.is_none()
-            && corroboration.provenance_link.is_none(),
-        research_relevance,
+        super::evidence_policy::FindingAssessmentInput {
+            question: &question,
+            source_url,
+            finding,
+            direct_support: supported,
+            freshness,
+            profile,
+            publication_is_recent,
+            has_independent_corroboration: !corroboration.independent_sources.is_empty()
+                && corroboration.possible_copy_of.is_none()
+                && corroboration.provenance_link.is_none(),
+            research_relevance,
+        },
     );
     let mut gate_status = assessment.gate_status;
     reason = Some(assessment.reason.clone());
-    if let Some((earlier_id, link_reason)) = corroboration.provenance_link.as_ref() {
+    let provenance_warning = corroboration
+        .provenance_link
+        .as_ref()
+        .map(|(earlier_id, link_reason)| {
+            (
+                *earlier_id,
+                format!(
+                    "{link_reason} with finding #{earlier_id}; review before counting as independent"
+                ),
+            )
+        })
+        .or_else(|| {
+            corroboration.possible_copy_of.map(|earlier_id| {
+                (
+                    earlier_id,
+                    format!(
+                        "passage substantially overlaps finding #{earlier_id}; independent reporting needs review"
+                    ),
+                )
+            })
+        });
+    if let Some((_, warning)) = provenance_warning {
+        // A warning blocks secondary corroboration without claiming the fact is false.
         if assessment.source_kind == "secondary"
             && (gate_status == "eligible" || gate_status == "awaiting_corroboration")
         {
             gate_status = "possible_shared_source";
         }
-        reason = Some(format!(
-            "{}; {link_reason} with finding #{earlier_id}; review before counting as independent",
-            assessment.reason
-        ));
-    } else if let Some(earlier_id) = corroboration.possible_copy_of {
-        // A warning does not claim the underlying fact is false. It
-        // only blocks counting this page as independent corroboration.
-        if assessment.source_kind == "secondary"
-            && (gate_status == "eligible" || gate_status == "awaiting_corroboration")
-        {
-            gate_status = "possible_shared_source";
-        }
-        reason = Some(format!(
-            "{}; passage substantially overlaps finding #{earlier_id}; independent reporting needs review",
-            assessment.reason
-        ));
+        reason = Some(format!("{}; {warning}", assessment.reason));
     } else if let Some(earlier_id) = corroboration.shared_source_with
         && gate_status == "awaiting_corroboration"
     {
@@ -500,12 +504,13 @@ fn ingest_source(
         && assessment.source_kind != "unknown"
         && !personal_web_claim
     {
-        (
-            semantic_id,
-            conflicting_claim_id,
-            qualifying_claim_id,
-            unresolved_claim_id,
-        ) = existing_semantic_match(tx, finding, &today)?;
+        match existing_semantic_match(tx, finding, &today)? {
+            ExistingSemanticMatch::Conflict(id) => conflicting_claim_id = Some(id),
+            ExistingSemanticMatch::Match(id) => semantic_id = Some(id),
+            ExistingSemanticMatch::Qualifying(id) => qualifying_claim_id = Some(id),
+            ExistingSemanticMatch::Unresolved(id) => unresolved_claim_id = Some(id),
+            ExistingSemanticMatch::None => {}
+        }
         if let Some(id) = conflicting_claim_id {
             reason = Some(format!("conflicts with overlapping semantic claim #{id}"));
             gate_status = "conflict";
@@ -517,16 +522,19 @@ fn ingest_source(
     }
     if gate_status == "eligible" && conflicting_claim_id.is_none() {
         if semantic_id.is_none() {
-            tx.execute(
-                        "INSERT INTO semantic_claims
-                            (subject, relation, object, source, source_observation_id, created_at, valid_from, valid_until, attribution, polarity, modality, geographic_scope, context_scope)
-                         VALUES (?1, ?2, ?3, ?4, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                        params![finding.subject.trim(), finding.relation.trim(), finding.object.trim(), source_url,
-                            finding.valid_from, finding.valid_until, finding.proposition.attribution,
-                            finding.proposition.polarity.as_str(), finding.proposition.modality.as_str(),
-                            finding.proposition.geographic_scope, finding.proposition.context_scope],
-                    ).map_err(database_error)?;
-            semantic_id = Some(tx.last_insert_rowid());
+            semantic_id = Some(super::insert_scholar_semantic_claim(
+                tx,
+                super::NewSemanticClaim {
+                    subject: finding.subject.trim(),
+                    relation: finding.relation.trim(),
+                    object: finding.object.trim(),
+                    source: source_url,
+                    supersedes_id: None,
+                    valid_from: finding.valid_from.as_deref(),
+                    valid_until: finding.valid_until.as_deref(),
+                    proposition: &finding.proposition,
+                },
+            )?);
         }
         finding_status = "promoted";
     }
@@ -554,56 +562,48 @@ fn ingest_source(
             ).map_err(database_error)?;
     let finding_id = tx.last_insert_rowid();
     if let Some(claim_id) = semantic_id {
-        tx.execute(
-            "INSERT OR IGNORE INTO scholar_finding_claim_links
-                (finding_id,claim_id,relation,rationale,assessment_method)
-             VALUES (?1,?2,'supports',?3,?4)",
-            params![
-                finding_id,
-                claim_id,
-                "finding matches the active semantic claim's subject, relation, object, and validity period",
-                if finding.semantic_support.is_some() {
-                    "reviewed_semantic_entailment_and_policy_match"
-                } else {
-                    "deterministic_exact_claim_match"
-                }
-            ],
-        )
-        .map_err(database_error)?;
+        super::link_scholar_finding_claim(
+            tx,
+            finding_id,
+            claim_id,
+            "supports",
+            "finding matches the active semantic claim's subject, relation, object, and validity period",
+            if finding.semantic_support.is_some() {
+                "reviewed_semantic_entailment_and_policy_match"
+            } else {
+                "deterministic_exact_claim_match"
+            },
+        )?;
     }
     if let Some(claim_id) = conflicting_claim_id {
-        tx.execute(
-            "INSERT OR IGNORE INTO scholar_finding_claim_links
-                (finding_id,claim_id,relation,rationale,assessment_method)
-             VALUES (?1,?2,'contradicts',?3,'deterministic_overlapping_claim_match')",
-            params![
-                finding_id,
-                claim_id,
-                "same subject and relation with a different object and overlapping validity period; scope comparison may still be required"
-            ],
-        )
-        .map_err(database_error)?;
+        super::link_scholar_finding_claim(
+            tx,
+            finding_id,
+            claim_id,
+            "contradicts",
+            "same subject and relation with a different object and overlapping validity period; scope comparison may still be required",
+            "deterministic_overlapping_claim_match",
+        )?;
     }
     if let Some(claim_id) = qualifying_claim_id {
-        tx.execute(
-            "INSERT OR IGNORE INTO scholar_finding_claim_links
-                (finding_id,claim_id,relation,rationale,assessment_method)
-             VALUES (?1,?2,'qualifies',?3,'deterministic_scope_comparison')",
-            params![
-                finding_id,
-                claim_id,
-                "same subject and relation with overlapping time, but attribution, polarity, or modality differs; retained as a qualification rather than a contradiction"
-            ],
-        ).map_err(database_error)?;
+        super::link_scholar_finding_claim(
+            tx,
+            finding_id,
+            claim_id,
+            "qualifies",
+            "same subject and relation with overlapping time, but attribution, polarity, or modality differs; retained as a qualification rather than a contradiction",
+            "deterministic_scope_comparison",
+        )?;
     }
     if let Some(claim_id) = unresolved_claim_id {
-        tx.execute(
-            "INSERT OR IGNORE INTO scholar_finding_claim_links
-                (finding_id,claim_id,relation,rationale,assessment_method)
-             VALUES (?1,?2,'unresolved',?3,'deterministic_scope_mismatch')",
-            params![finding_id, claim_id,
-                "geographic or contextual scope differs or is unknown; preserve both claims without treating either as support or contradiction"],
-        ).map_err(database_error)?;
+        super::link_scholar_finding_claim(
+            tx,
+            finding_id,
+            claim_id,
+            "unresolved",
+            "geographic or contextual scope differs or is unknown; preserve both claims without treating either as support or contradiction",
+            "deterministic_scope_mismatch",
+        )?;
     }
     {
         let mut statement = tx
@@ -627,16 +627,14 @@ fn ingest_source(
             .map_err(database_error)?;
         drop(statement);
         for claim_id in unresolved_relations {
-            tx.execute(
-                "INSERT OR IGNORE INTO scholar_finding_claim_links
-                    (finding_id,claim_id,relation,rationale,assessment_method)
-                 VALUES (?1,?2,'unresolved',?3,'relation_requires_semantic_review')",
-                params![
-                    finding_id,
-                    claim_id,
-                    "same established subject with different relation wording; semantic review must decide whether the propositions address the same property"
-                ],
-            ).map_err(database_error)?;
+            super::link_scholar_finding_claim(
+                tx,
+                finding_id,
+                claim_id,
+                "unresolved",
+                "same established subject with different relation wording; semantic review must decide whether the propositions address the same property",
+                "relation_requires_semantic_review",
+            )?;
         }
     }
     if let Some(support) = finding.semantic_support.as_ref() {
@@ -733,53 +731,44 @@ fn ingest_source(
             "supports",
         )?;
         if finding_status == "promoted" && assessment.source_kind == "secondary" {
-            for (earlier_id, earlier_job_id, corroborating_url, corroborating_excerpt) in
-                &corroboration.independent_sources
-            {
+            for earlier in &corroboration.independent_sources {
                 link_claim_evidence(
                     tx,
                     claim_id,
                     "web",
-                    Some(corroborating_url),
+                    Some(&earlier.source_url),
                     None,
-                    corroborating_excerpt,
+                    &earlier.source_excerpt,
                     "supports",
                 )?;
-                let changed = tx.execute(
-                            "UPDATE scholar_findings SET status = 'promoted', semantic_claim_id = ?2,
-                                decision_reason = 'promoted after verified independent corroboration'
-                             WHERE id = ?1 AND status = 'needs_review'",
-                            params![earlier_id, claim_id],
-                        ).map_err(database_error)?;
+                let changed = super::promote_scholar_finding(
+                    tx,
+                    earlier.finding_id,
+                    claim_id,
+                    "promoted after verified independent corroboration",
+                )?;
                 if changed == 1 {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO scholar_finding_claim_links
-                            (finding_id,claim_id,relation,rationale,assessment_method)
-                         VALUES (?1,?2,'supports',?3,'later_verified_corroboration')",
-                        params![
-                            earlier_id,
-                            claim_id,
-                            "later finding passed the independent corroboration policy for the same proposition and validity period"
-                        ],
-                    )
-                    .map_err(database_error)?;
+                    super::link_scholar_finding_claim(
+                        tx,
+                        earlier.finding_id,
+                        claim_id,
+                        "supports",
+                        "later finding passed the independent corroboration policy for the same proposition and validity period",
+                        "later_verified_corroboration",
+                    )?;
                     tx.execute(
                         "UPDATE scholar_jobs SET status = 'promoted', last_error = NULL
                                  WHERE id = ?1 AND status = 'needs_review'",
-                        [earlier_job_id],
+                        [&earlier.job_id],
                     )
                     .map_err(database_error)?;
-                    tx.execute(
-                        "UPDATE scholar_task_targets SET stop_reason='complete',updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=?1",
-                        [earlier_job_id],
-                    )
-                    .map_err(database_error)?;
+                    super::set_scholar_task_stop_reason(tx, &earlier.job_id, "complete")?;
                     let earlier_proposal: Option<i64> = tx
                         .query_row(
                             "SELECT id FROM role_proposals
                                  WHERE source_type = 'scholar_finding' AND source_id = ?1
                                  ORDER BY id DESC LIMIT 1",
-                            [earlier_id.to_string()],
+                            [earlier.finding_id.to_string()],
                             |row| row.get(0),
                         )
                         .optional()
@@ -798,17 +787,7 @@ fn ingest_source(
             }
         }
         if finding_status == "promoted" {
-            tx.execute(
-                        "UPDATE semantic_claims SET status = 'active',
-                             checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                             last_reviewed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                             next_review_at = CASE volatility
-                                 WHEN 'fast_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+30 days')
-                                 WHEN 'slow_changing' THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+180 days')
-                                 ELSE NULL END
-                         WHERE id = ?1 AND retracted_by IS NULL",
-                        [claim_id],
-                    ).map_err(database_error)?;
+            super::activate_reviewed_claim(tx, claim_id)?;
         }
     } else if let Some(claim_id) = conflicting_claim_id {
         link_claim_evidence(
@@ -845,76 +824,6 @@ fn ingest_source(
 }
 
 impl LearningStore {
-    #[cfg(test)]
-    pub fn finish_scholar_job(
-        &mut self,
-        job_id: &str,
-        source_title: &str,
-        source_url: &str,
-        source_excerpt: &str,
-        finding: Option<ScholarFinding>,
-        note: Option<&str>,
-    ) -> io::Result<()> {
-        self.finish_scholar_job_with_profile(
-            job_id,
-            source_title,
-            source_url,
-            source_excerpt,
-            finding,
-            note,
-            &ScholarSourceProfile::default(),
-        )
-    }
-
-    #[cfg(test)]
-    pub fn finish_scholar_job_with_profile(
-        &mut self,
-        job_id: &str,
-        source_title: &str,
-        source_url: &str,
-        source_excerpt: &str,
-        finding: Option<ScholarFinding>,
-        note: Option<&str>,
-        profile: &ScholarSourceProfile,
-    ) -> io::Result<()> {
-        self.finish_scholar_job_with_profile_and_relevance(
-            job_id,
-            source_title,
-            source_url,
-            source_excerpt,
-            finding,
-            note,
-            profile,
-            "unknown",
-        )
-    }
-
-    #[cfg(test)]
-    pub fn finish_scholar_job_with_profile_and_relevance(
-        &mut self,
-        job_id: &str,
-        source_title: &str,
-        source_url: &str,
-        source_excerpt: &str,
-        finding: Option<ScholarFinding>,
-        note: Option<&str>,
-        profile: &ScholarSourceProfile,
-        research_relevance: &str,
-    ) -> io::Result<()> {
-        self.finish_scholar_job_with_evidence(
-            job_id,
-            &[ScholarEvidence {
-                source_title: source_title.to_owned(),
-                source_url: source_url.to_owned(),
-                source_excerpt: source_excerpt.to_owned(),
-                finding,
-                profile: profile.clone(),
-                research_relevance: research_relevance.to_owned(),
-            }],
-            note,
-        )
-    }
-
     pub fn finish_scholar_job_with_evidence(
         &mut self,
         job_id: &str,
@@ -977,11 +886,7 @@ impl LearningStore {
             _ if sources.is_empty() => "no_source_found",
             _ => "source_found_but_insufficient",
         };
-        tx.execute(
-            "UPDATE scholar_task_targets SET stop_reason=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE job_id=?1",
-            params![job_id, stop_reason],
-        )
-        .map_err(database_error)?;
+        super::set_scholar_task_stop_reason(&tx, job_id, stop_reason)?;
         tx.commit().map_err(database_error)
     }
 }
@@ -997,15 +902,15 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let (mut finding, passage, title): (ScholarFinding, String, String) = tx.query_row(
+        let finding = tx.query_row(
             "SELECT subject, relation, object, evidence_text, confidence, valid_from, valid_until, source_quality, source_updated_at, source_excerpt, source_title, attribution, polarity, modality, geographic_scope, context_scope FROM scholar_findings WHERE id = ?1 AND status = 'needs_review'", [finding_id],
-            |row| Ok((ScholarFinding {semantic_support:None,subject:row.get(0)?,relation:row.get(1)?,object:row.get(2)?,evidence_text:row.get(3)?,confidence:row.get(4)?,valid_from:row.get(5)?,valid_until:row.get(6)?,source_quality:row.get(7)?,source_updated_at:row.get(8)?, proposition: PropositionMetadata {
-                attribution:row.get(11)?,
-                polarity: match row.get::<_, String>(12)?.as_str() {"asserted"=>ClaimPolarity::Asserted,"negated"=>ClaimPolarity::Negated,_=>ClaimPolarity::Unknown},
-                modality: match row.get::<_, String>(13)?.as_str() {"factual"=>ClaimModality::Factual,"possible"=>ClaimModality::Possible,"necessary"=>ClaimModality::Necessary,"conditional"=>ClaimModality::Conditional,_=>ClaimModality::Unknown},
-                geographic_scope:row.get(14)?,context_scope:row.get(15)?,
-            }},row.get(9)?,row.get(10)?)),
+            SemanticSupportFinding::from_row,
         ).map_err(database_error)?;
+        let SemanticSupportFinding {
+            mut finding,
+            passage,
+            title,
+        } = finding;
         if !support.matches_claim(&finding) {
             return Err(invalid("semantic assessment belongs to a different claim"));
         }

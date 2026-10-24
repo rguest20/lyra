@@ -1,5 +1,58 @@
 use super::*;
 
+const SEMANTIC_CLAIM_COLUMNS: &str = "id, subject, relation, object, source, source_observation_id,
+    status, volatility, valid_from, valid_until, observed_at, checked_at,
+    last_reviewed_at, next_review_at,
+    COALESCE((SELECT confidence FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
+             (SELECT confidence FROM candidate_claims c WHERE c.semantic_claim_id = semantic_claims.id ORDER BY rowid DESC LIMIT 1)),
+    COALESCE((SELECT source_quality FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
+             CASE WHEN source_observation_id IS NOT NULL THEN 'user_reported' END),
+    COALESCE((SELECT freshness FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
+             CASE WHEN source_observation_id IS NOT NULL THEN 'not_applicable' END)";
+const SEMANTIC_CLAIM_RELEVANCE: &str = "(SELECT a.research_relevance FROM scholar_findings f
+    JOIN scholar_source_assessments a ON a.finding_id = f.id
+    WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1)";
+
+fn stored_candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCandidate> {
+    Ok(StoredCandidate {
+        id: row.get(0)?,
+        observation_id: row.get(1)?,
+        subject: row.get(2)?,
+        relation: row.get(3)?,
+        object: row.get(4)?,
+        evidence_text: row.get(5)?,
+        confidence: row.get(6)?,
+        status: row.get(7)?,
+        decision_reason: row.get(8)?,
+        semantic_claim_id: row.get(9)?,
+        valid_from: row.get(10)?,
+        valid_until: row.get(11)?,
+    })
+}
+
+fn semantic_claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SemanticClaim> {
+    Ok(SemanticClaim {
+        id: row.get(0)?,
+        subject: row.get(1)?,
+        relation: row.get(2)?,
+        object: row.get(3)?,
+        source: row.get(4)?,
+        source_observation_id: row.get(5)?,
+        status: row.get(6)?,
+        volatility: row.get(7)?,
+        valid_from: row.get(8)?,
+        valid_until: row.get(9)?,
+        observed_at: row.get(10)?,
+        checked_at: row.get(11)?,
+        last_reviewed_at: row.get(12)?,
+        next_review_at: row.get(13)?,
+        extraction_confidence: row.get(14)?,
+        source_quality: row.get(15)?,
+        freshness: row.get(16)?,
+        research_relevance: row.get(17)?,
+    })
+}
+
 fn research_relevance_weight(relevance: Option<&str>) -> usize {
     match relevance {
         Some("direct") => 100,
@@ -7,6 +60,102 @@ fn research_relevance_weight(relevance: Option<&str>) -> usize {
         Some("tangential") => 40,
         _ => 100,
     }
+}
+
+fn rank_relevant<T>(
+    candidates: Vec<T>,
+    query_words: &std::collections::BTreeSet<String>,
+    limit: usize,
+    search_text: impl Fn(&T) -> String,
+    relevance: impl for<'a> Fn(&'a T) -> Option<&'a str>,
+    id: impl Fn(&T) -> i64,
+) -> Vec<T> {
+    let mut ranked = candidates
+        .into_iter()
+        .filter_map(|item| {
+            let words = relevant_words(&search_text(&item));
+            let score =
+                lexical_overlap(&words, query_words) * research_relevance_weight(relevance(&item));
+            (score > 0).then_some((score, id(&item), item))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_score, left_id, _), (right_score, right_id, _)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| right_id.cmp(left_id))
+    });
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, item)| item)
+        .collect()
+}
+
+#[cfg(test)]
+mod relevance_tests {
+    use super::*;
+
+    struct Finding {
+        id: i64,
+        relevance: Option<&'static str>,
+    }
+
+    #[test]
+    fn relevance_weight_precedes_id_and_unknown_relevance_keeps_the_default_weight() {
+        let candidates = vec![
+            Finding {
+                id: 1,
+                relevance: Some("direct"),
+            },
+            Finding {
+                id: 2,
+                relevance: Some("tangential"),
+            },
+            Finding {
+                id: 3,
+                relevance: Some("direct"),
+            },
+            Finding {
+                id: 4,
+                relevance: None,
+            },
+        ];
+        let ranked = rank_relevant(
+            candidates,
+            &relevant_words("quasar"),
+            4,
+            |_| "quasar".into(),
+            |finding| finding.relevance,
+            |finding| finding.id,
+        );
+        assert_eq!(
+            ranked
+                .into_iter()
+                .map(|finding| finding.id)
+                .collect::<Vec<_>>(),
+            [4, 3, 1, 2]
+        );
+    }
+}
+
+fn rank_relevant_scholar_evidence(
+    candidates: Vec<ScholarEvidenceForAnswer>,
+    query_words: &std::collections::BTreeSet<String>,
+    limit: usize,
+) -> Vec<ScholarEvidenceForAnswer> {
+    rank_relevant(
+        candidates,
+        query_words,
+        limit,
+        |finding| {
+            format!(
+                "{} {} {} {}",
+                finding.subject, finding.relation, finding.object, finding.evidence_text
+            )
+        },
+        |finding| Some(&finding.research_relevance),
+        |finding| finding.id,
+    )
 }
 
 impl LearningStore {
@@ -29,71 +178,28 @@ impl LearningStore {
         }
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, subject, relation, object, source, source_observation_id,
-                    status, volatility, valid_from, valid_until, observed_at, checked_at,
-                    last_reviewed_at, next_review_at,
-                    COALESCE((SELECT confidence FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             (SELECT confidence FROM candidate_claims c WHERE c.semantic_claim_id = semantic_claims.id ORDER BY rowid DESC LIMIT 1)),
-                    COALESCE((SELECT source_quality FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             CASE WHEN source_observation_id IS NOT NULL THEN 'user_reported' END),
-                    COALESCE((SELECT freshness FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             CASE WHEN source_observation_id IS NOT NULL THEN 'not_applicable' END),
-                    (SELECT a.research_relevance FROM scholar_findings f
-                     JOIN scholar_source_assessments a ON a.finding_id = f.id
-                     WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1)
-             FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id DESC LIMIT 1000",
-            )
+            .prepare(&format!(
+                "SELECT {SEMANTIC_CLAIM_COLUMNS}, {SEMANTIC_CLAIM_RELEVANCE}
+                 FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id DESC LIMIT 1000"
+            ))
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(SemanticClaim {
-                    id: row.get(0)?,
-                    subject: row.get(1)?,
-                    relation: row.get(2)?,
-                    object: row.get(3)?,
-                    source: row.get(4)?,
-                    source_observation_id: row.get(5)?,
-                    status: row.get(6)?,
-                    volatility: row.get(7)?,
-                    valid_from: row.get(8)?,
-                    valid_until: row.get(9)?,
-                    observed_at: row.get(10)?,
-                    checked_at: row.get(11)?,
-                    last_reviewed_at: row.get(12)?,
-                    next_review_at: row.get(13)?,
-                    extraction_confidence: row.get(14)?,
-                    source_quality: row.get(15)?,
-                    freshness: row.get(16)?,
-                    research_relevance: row.get(17)?,
-                })
-            })
+            .query_map([], semantic_claim_from_row)
             .map_err(database_error)?;
-        let mut ranked = Vec::new();
-        for row in rows {
-            let claim = row.map_err(database_error)?;
-            let words = relevant_words(&format!(
-                "{} {} {}",
-                claim.subject, claim.relation, claim.object
-            ));
-            let score = lexical_overlap(&words, &query_words)
-                * research_relevance_weight(claim.research_relevance.as_deref());
-            if score > 0 {
-                ranked.push((score, claim));
-            }
-        }
-        ranked.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        Ok(ranked
-            .into_iter()
-            .take(limit)
-            .map(|(_, claim)| claim)
-            .collect())
+        let claims = rows
+            .map(|row| row.map_err(database_error))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(rank_relevant(
+            claims,
+            &query_words,
+            limit,
+            |claim| format!("{} {} {}", claim.subject, claim.relation, claim.object),
+            |claim| claim.research_relevance.as_deref(),
+            |claim| claim.id,
+        ))
     }
 
+    #[cfg(test)]
     pub fn relevant_scholar_evidence(
         &self,
         query: &str,
@@ -103,46 +209,62 @@ impl LearningStore {
         if query_words.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let rows = self.scholar_evidence_candidates(false)?;
-        let mut ranked = Vec::new();
-        for row in rows {
-            let finding = row;
-            let words = relevant_words(&format!(
-                "{} {} {} {}",
-                finding.subject, finding.relation, finding.object, finding.evidence_text
-            ));
-            let score = lexical_overlap(&words, &query_words)
-                * research_relevance_weight(Some(&finding.research_relevance));
-            if score > 0 {
-                ranked.push((score, finding));
-            }
-        }
-        ranked.sort_by(|(left_score, left), (right_score, right)| {
-            right_score
-                .cmp(left_score)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        Ok(ranked
-            .into_iter()
-            .take(limit)
-            .map(|(_, finding)| finding)
-            .collect())
+        Ok(rank_relevant_scholar_evidence(
+            self.scholar_evidence_candidates(false)?,
+            &query_words,
+            limit,
+        ))
     }
 
+    pub(crate) fn scholar_evidence_candidate_sets(
+        &self,
+    ) -> io::Result<(Vec<ScholarEvidenceForAnswer>, Vec<ScholarEvidenceForAnswer>)> {
+        let combined = self.query_scholar_evidence_candidates(true, true)?;
+        let all = combined.iter().take(500).cloned().collect::<Vec<_>>();
+        let needs_review = combined
+            .into_iter()
+            .filter(|finding| finding.finding_status == "needs_review")
+            .collect();
+        Ok((all, needs_review))
+    }
+
+    pub(crate) fn relevant_scholar_evidence_from(
+        candidates: Vec<ScholarEvidenceForAnswer>,
+        query: &str,
+        limit: usize,
+    ) -> Vec<ScholarEvidenceForAnswer> {
+        let query_words = relevant_words(query);
+        if query_words.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        rank_relevant_scholar_evidence(candidates, &query_words, limit)
+    }
+
+    #[cfg(test)]
     pub fn scholar_evidence_candidates(
         &self,
         include_promoted: bool,
     ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
+        self.query_scholar_evidence_candidates(include_promoted, false)
+    }
+
+    fn query_scholar_evidence_candidates(
+        &self,
+        include_promoted: bool,
+        separate_status_limits: bool,
+    ) -> io::Result<Vec<ScholarEvidenceForAnswer>> {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT f.id, f.source_archive_id, f.evidence_byte_start, f.evidence_byte_end,
+                "WITH candidates AS (
+                 SELECT f.id, f.source_archive_id, f.evidence_byte_start, f.evidence_byte_end,
                     f.source_url, f.subject, f.relation, f.object,
                     f.attribution, f.polarity, f.modality, f.geographic_scope, f.context_scope,
-                    f.evidence_text, f.confidence, f.status, a.gate_status, a.reason,
+                    f.evidence_text, f.confidence, f.status AS finding_status, a.gate_status, a.reason,
                     a.research_relevance, a.topic_class, a.source_kind, f.freshness,
                     a.currency, a.direct_support, a.independence_key,
                     a.independence_verified, a.published_at,
+                    ROW_NUMBER() OVER (PARTITION BY f.status ORDER BY f.id DESC) AS status_rank,
                     COALESCE((SELECT json_group_array(subject || ' ' || relation || ' ' || object ||
                         ' [valid ' || COALESCE(valid_from, 'unknown start') || ' to ' ||
                         COALESCE(valid_until, 'unknown end') || '; geography ' || COALESCE(geographic_scope, 'unknown') ||
@@ -154,7 +276,7 @@ impl LearningStore {
                         AND lower(trim(c.object)) != lower(trim(f.object))
                         AND EXISTS (SELECT 1 FROM scholar_finding_claim_links l
                                     WHERE l.finding_id = f.id AND l.claim_id = c.id
-                                      AND l.relation = 'contradicts')), '[]')
+                                      AND l.relation = 'contradicts')), '[]') AS conflicting_claims
                  FROM scholar_findings f
                  JOIN scholar_source_assessments a ON a.finding_id = f.id
                  WHERE (f.status = 'needs_review' OR (?1 AND f.status = 'promoted' AND EXISTS(
@@ -163,43 +285,48 @@ impl LearningStore {
                    AND a.direct_support = 1
                    AND instr(f.source_excerpt, f.evidence_text) > 0
                    AND lower(trim(f.subject)) NOT IN ('user', 'the user')
-                 ORDER BY f.id DESC LIMIT 500",
+                 )
+                 SELECT id, source_archive_id, evidence_byte_start, evidence_byte_end,
+                    source_url, subject, relation, object, attribution, polarity, modality,
+                    geographic_scope, context_scope, evidence_text, confidence, finding_status,
+                    gate_status, reason, research_relevance, topic_class, source_kind, freshness,
+                    currency, direct_support, independence_key, independence_verified,
+                    published_at, conflicting_claims
+                 FROM candidates
+                 WHERE (?2 = 0 OR status_rank <= 500)
+                 ORDER BY id DESC
+                 LIMIT CASE WHEN ?2 = 1 THEN 1000 ELSE 500 END",
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map([include_promoted], |row| {
-                Ok(ScholarEvidenceForAnswer {
-                    id: row.get(0)?,
-                    source_archive_id: row.get(1)?,
-                    evidence_byte_start: row.get(2)?,
-                    evidence_byte_end: row.get(3)?,
-                    source_url: row.get(4)?,
-                    subject: row.get(5)?,
-                    relation: row.get(6)?,
-                    object: row.get(7)?,
-                    attribution: row.get(8)?,
-                    polarity: row.get(9)?,
-                    modality: row.get(10)?,
-                    geographic_scope: row.get(11)?,
-                    context_scope: row.get(12)?,
-                    evidence_text: row.get(13)?,
-                    confidence: row.get(14)?,
-                    finding_status: row.get(15)?,
-                    gate_status: row.get(16)?,
-                    reason: row.get(17)?,
-                    research_relevance: row.get(18)?,
-                    topic_class: row.get(19)?,
-                    source_kind: row.get(20)?,
-                    freshness: row.get(21)?,
-                    currency: row.get(22)?,
-                    direct_support: row.get::<_, Option<bool>>(23)?.unwrap_or(false),
-                    independence_key: row.get(24)?,
-                    independence_verified: row.get(25)?,
-                    published_at: row.get(26)?,
-                    conflicting_claims: serde_json::from_str(&row.get::<_, String>(27)?)
-                        .unwrap_or_default(),
-                })
-            })
+            .query_map(
+                rusqlite::params![include_promoted, separate_status_limits],
+                |row| {
+                    Ok(ScholarEvidenceForAnswer {
+                        id: row.get(0)?,
+                        source_span: ScholarEvidenceSpan::from_row(row, 1, 13)?,
+                        subject: row.get(5)?,
+                        relation: row.get(6)?,
+                        object: row.get(7)?,
+                        proposition: PropositionMetadata::from_storage_row(row, 8)?,
+                        confidence: row.get(14)?,
+                        finding_status: row.get(15)?,
+                        gate_status: row.get(16)?,
+                        reason: row.get(17)?,
+                        research_relevance: row.get(18)?,
+                        topic_class: row.get(19)?,
+                        source_kind: row.get(20)?,
+                        freshness: row.get(21)?,
+                        currency: row.get(22)?,
+                        direct_support: row.get::<_, Option<bool>>(23)?.unwrap_or(false),
+                        independence_key: row.get(24)?,
+                        independence_verified: row.get(25)?,
+                        published_at: row.get(26)?,
+                        conflicting_claims: serde_json::from_str(&row.get::<_, String>(27)?)
+                            .unwrap_or_default(),
+                    })
+                },
+            )
             .map_err(database_error)?;
         rows.map(|row| row.map_err(database_error)).collect()
     }
@@ -229,18 +356,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| {
-                let turn: i64 = row.get(2)?;
-                Ok(Observation {
-                    id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    turn_number: usize::try_from(turn)
-                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, turn))?,
-                    raw_text: row.get(3)?,
-                    status: row.get(4)?,
-                    created_at: row.get(5)?,
-                })
-            })
+            .query_map([], Observation::from_row)
             .map_err(database_error)?;
         let observations = rows
             .collect::<Result<Vec<_>, _>>()
@@ -261,17 +377,8 @@ impl LearningStore {
              FROM observations WHERE id = ?1",
                 [id],
                 |row| {
-                    let turn: i64 = row.get(2)?;
                     Ok((
-                        Observation {
-                            id: row.get(0)?,
-                            conversation_id: row.get(1)?,
-                            turn_number: usize::try_from(turn)
-                                .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, turn))?,
-                            raw_text: row.get(3)?,
-                            status: row.get(4)?,
-                            created_at: row.get(5)?,
-                        },
+                        Observation::from_row(row)?,
                         row.get::<_, Option<String>>(6)?,
                     ))
                 },
@@ -290,22 +397,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map([id], |row| {
-                Ok(StoredCandidate {
-                    id: row.get(0)?,
-                    observation_id: row.get(1)?,
-                    subject: row.get(2)?,
-                    relation: row.get(3)?,
-                    object: row.get(4)?,
-                    evidence_text: row.get(5)?,
-                    confidence: row.get(6)?,
-                    status: row.get(7)?,
-                    decision_reason: row.get(8)?,
-                    semantic_claim_id: row.get(9)?,
-                    valid_from: row.get(10)?,
-                    valid_until: row.get(11)?,
-                })
-            })
+            .query_map([id], stored_candidate_from_row)
             .map_err(database_error)?;
         let candidates = rows
             .collect::<Result<Vec<_>, _>>()
@@ -332,7 +424,7 @@ impl LearningStore {
             .prepare(
                 "SELECT c.id, c.observation_id, c.subject, c.relation, c.object,
                     c.evidence_text, c.confidence, c.status, c.decision_reason,
-                    c.semantic_claim_id, o.turn_number, c.valid_from, c.valid_until
+                    c.semantic_claim_id, c.valid_from, c.valid_until, o.turn_number
              FROM candidate_claims c JOIN observations o ON o.id = c.observation_id
              WHERE o.conversation_id = ?1 AND c.status IN ('proposed', 'needs_review')
              ORDER BY o.turn_number DESC LIMIT 256",
@@ -340,23 +432,7 @@ impl LearningStore {
             .map_err(database_error)?;
         let rows = statement
             .query_map([conversation_id], |row| {
-                Ok((
-                    StoredCandidate {
-                        id: row.get(0)?,
-                        observation_id: row.get(1)?,
-                        subject: row.get(2)?,
-                        relation: row.get(3)?,
-                        object: row.get(4)?,
-                        evidence_text: row.get(5)?,
-                        confidence: row.get(6)?,
-                        status: row.get(7)?,
-                        decision_reason: row.get(8)?,
-                        semantic_claim_id: row.get(9)?,
-                        valid_from: row.get(11)?,
-                        valid_until: row.get(12)?,
-                    },
-                    row.get::<_, i64>(10)?,
-                ))
+                Ok((stored_candidate_from_row(row)?, row.get::<_, i64>(12)?))
             })
             .map_err(database_error)?;
         let mut ranked = Vec::new();
@@ -386,42 +462,13 @@ impl LearningStore {
     pub fn active_semantic_claims(&self) -> io::Result<Vec<SemanticClaimDetail>> {
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, subject, relation, object, source, source_observation_id,
-                    status, volatility, valid_from, valid_until, observed_at, checked_at,
-                    last_reviewed_at, next_review_at,
-                    COALESCE((SELECT confidence FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             (SELECT confidence FROM candidate_claims c WHERE c.semantic_claim_id = semantic_claims.id ORDER BY rowid DESC LIMIT 1)),
-                    COALESCE((SELECT source_quality FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             CASE WHEN source_observation_id IS NOT NULL THEN 'user_reported' END),
-                    COALESCE((SELECT freshness FROM scholar_findings f WHERE f.semantic_claim_id = semantic_claims.id ORDER BY f.id DESC LIMIT 1),
-                             CASE WHEN source_observation_id IS NOT NULL THEN 'not_applicable' END)
-             FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id",
-            )
+            .prepare(&format!(
+                "SELECT {SEMANTIC_CLAIM_COLUMNS}, NULL AS research_relevance
+                 FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id"
+            ))
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| {
-                Ok(SemanticClaim {
-                    id: row.get(0)?,
-                    subject: row.get(1)?,
-                    relation: row.get(2)?,
-                    object: row.get(3)?,
-                    source: row.get(4)?,
-                    source_observation_id: row.get(5)?,
-                    status: row.get(6)?,
-                    volatility: row.get(7)?,
-                    valid_from: row.get(8)?,
-                    valid_until: row.get(9)?,
-                    observed_at: row.get(10)?,
-                    checked_at: row.get(11)?,
-                    last_reviewed_at: row.get(12)?,
-                    next_review_at: row.get(13)?,
-                    extraction_confidence: row.get(14)?,
-                    source_quality: row.get(15)?,
-                    freshness: row.get(16)?,
-                    research_relevance: None,
-                })
-            })
+            .query_map([], semantic_claim_from_row)
             .map_err(database_error)?;
         let claims = rows
             .collect::<Result<Vec<_>, _>>()

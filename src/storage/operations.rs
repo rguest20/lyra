@@ -119,21 +119,18 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         let mut passes = statement
-            .query_map(
-                [i64::try_from(limit.min(200)).map_err(|_| invalid("limit too large"))?],
-                |row| {
-                    let duration: Option<i64> = row.get(5)?;
-                    Ok(MaintenancePass {
-                        id: row.get(0)?,
-                        mode: row.get(1)?,
-                        status: row.get(2)?,
-                        started_at: row.get(3)?,
-                        finished_at: row.get(4)?,
-                        duration_ms: duration.and_then(|value| u64::try_from(value).ok()),
-                        roles: Vec::new(),
-                    })
-                },
-            )
+            .query_map([sqlite_limit(limit.min(200))?], |row| {
+                let duration: Option<i64> = row.get(5)?;
+                Ok(MaintenancePass {
+                    id: row.get(0)?,
+                    mode: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    finished_at: row.get(4)?,
+                    duration_ms: duration.and_then(|value| u64::try_from(value).ok()),
+                    roles: Vec::new(),
+                })
+            })
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
@@ -171,7 +168,7 @@ impl LearningStore {
                 .query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(database_error)?;
             Ok(MaintenanceQueue {
-                pending: usize::try_from(count).unwrap_or(usize::MAX),
+                pending: sqlite_count(count),
                 oldest_age_seconds: age.and_then(|value| u64::try_from(value).ok()),
             })
         };
@@ -197,14 +194,8 @@ impl LearningStore {
             "SELECT COUNT(*), CAST((julianday('now') - julianday(MIN(created_at))) * 86400 AS INTEGER)
              FROM scholar_jobs WHERE status IN ('pending', 'processing')",
         )?;
-        let scan_cursor = self
-            .connection
-            .query_row(
-                "SELECT last_claim_id FROM maintenance_scan_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let scan_cursor = super::maintenance::maintenance_scan_cursor(&self.connection)?
+            .ok_or_else(|| database_error(rusqlite::Error::QueryReturnedNoRows))?;
         let latest_scout_reason = self
             .connection
             .query_row(
@@ -251,9 +242,6 @@ impl LearningStore {
                 |row| row.get(0),
             )
             .map_err(database_error)?;
-        Ok((
-            usize::try_from(curator).unwrap_or(usize::MAX),
-            usize::try_from(scholar).unwrap_or(usize::MAX),
-        ))
+        Ok((sqlite_count(curator), sqlite_count(scholar)))
     }
 }

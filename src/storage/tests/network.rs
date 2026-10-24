@@ -44,23 +44,27 @@ fn serpapi_cooldown_and_discovery_candidates_survive_restart() {
             &job.id,
             "serpapi",
             "Chicken soup ingredients",
-            "recipe",
-            "Chicken soup",
-            "https://example.org/chicken-soup",
-            "Search result snippet is discovery only.",
-            r#"{"source":"Example Kitchen","ingredients":["chicken","carrots"],"rating":4.5}"#,
+            &scholar_search_candidate(
+                "recipe",
+                "Chicken soup",
+                "https://example.org/chicken-soup",
+                "Search result snippet is discovery only.",
+                r#"{"source":"Example Kitchen","ingredients":["chicken","carrots"],"rating":4.5}"#,
+            ),
         )
         .unwrap();
     let candidate_id = store.scholar_search_candidates(&job.id).unwrap()[0].id;
     store
         .record_scholar_candidate_fetch_result(
             candidate_id,
-            "fetched",
-            "allowed",
-            Some("robots and site policy allowed the fetch"),
-            "fetched",
-            Some("https://example.org/chicken-soup"),
-            Some("Chicken soup contains chicken and carrots."),
+            &scholar_candidate_review(
+                "fetched",
+                "allowed",
+                Some("robots and site policy allowed the fetch"),
+                "fetched",
+                Some("https://example.org/chicken-soup"),
+                Some("Chicken soup contains chicken and carrots."),
+            ),
         )
         .unwrap();
     store
@@ -303,23 +307,27 @@ fn robots_cache_migration_imports_prior_denied_candidates() {
             &job.id,
             "serpapi",
             "topic",
-            "organic_result",
-            "Private article",
-            "https://example.org/private?view=full",
-            "topic",
-            "{}",
+            &scholar_search_candidate(
+                "organic_result",
+                "Private article",
+                "https://example.org/private?view=full",
+                "topic",
+                "{}",
+            ),
         )
         .unwrap();
     let candidate = store.scholar_search_candidates(&job.id).unwrap().remove(0);
     store
         .record_scholar_candidate_fetch_result(
             candidate.id,
-            "skipped",
-            "disallowed",
-            Some("robots.txt disallows the candidate path for CommunityLabScholar"),
-            "skipped",
-            None,
-            None,
+            &scholar_candidate_review(
+                "skipped",
+                "disallowed",
+                Some("robots.txt disallows the candidate path for CommunityLabScholar"),
+                "skipped",
+                None,
+                None,
+            ),
         )
         .unwrap();
     store
@@ -425,9 +433,9 @@ fn scholar_host_retry_after_and_policy_cache_survive_restarts() {
         .cached_site_policy("https://limited.example", "external_robots_txt")
         .unwrap()
         .unwrap();
-    assert_eq!(cached.0, 200);
-    assert_eq!(cached.1, "text/plain");
-    assert!(cached.2.contains("Disallow: /private"));
+    assert_eq!(cached.status, 200);
+    assert_eq!(cached.content_type, "text/plain");
+    assert!(cached.body.contains("Disallow: /private"));
     assert!(
         store
             .cache_site_policy(

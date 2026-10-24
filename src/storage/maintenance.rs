@@ -1,5 +1,59 @@
 use super::*;
 
+impl ClaimTopic {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            subject: row.get(1)?,
+            relation: row.get(2)?,
+            object: row.get(3)?,
+        })
+    }
+}
+
+pub(super) fn maintenance_scan_cursor(connection: &Connection) -> io::Result<Option<i64>> {
+    connection
+        .query_row(
+            "SELECT last_claim_id FROM maintenance_scan_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn is_valid_review_datetime(connection: &Connection, value: &str) -> io::Result<bool> {
+    connection
+        .query_row("SELECT datetime(?1) IS NOT NULL", [value], |row| row.get(0))
+        .map_err(database_error)
+}
+
+struct ClaimProposition {
+    subject: String,
+    relation: String,
+    object: String,
+}
+
+fn active_claim_proposition(
+    tx: &Transaction<'_>,
+    claim_id: i64,
+) -> io::Result<Option<ClaimProposition>> {
+    tx.query_row(
+        "SELECT subject, relation, object FROM semantic_claims
+         WHERE id = ?1 AND retracted_by IS NULL",
+        [claim_id],
+        |row| {
+            Ok(ClaimProposition {
+                subject: row.get(0)?,
+                relation: row.get(1)?,
+                object: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(database_error)
+}
+
 impl LearningStore {
     pub fn claim_evidence(&self, claim_id: i64) -> io::Result<Vec<ClaimEvidence>> {
         let mut statement = self
@@ -44,10 +98,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map(
-                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
-                |row| row.get(0),
-            )
+            .query_map([sqlite_limit(limit)?], |row| row.get(0))
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -68,15 +119,7 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let cursor: i64 = tx
-            .query_row(
-                "SELECT last_claim_id FROM maintenance_scan_state WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)?
-            .unwrap_or(0);
+        let cursor = maintenance_scan_cursor(&tx)?.unwrap_or(0);
         let fetch = |after: i64| -> io::Result<Vec<MaintenanceReviewClaim>> {
             let mut statement = tx
                 .prepare(
@@ -100,8 +143,8 @@ impl LearningStore {
                         subject: row.get(1)?,
                         relation: row.get(2)?,
                         object: row.get(3)?,
-                        relation_count: usize::try_from(relations).unwrap_or(usize::MAX),
-                        evidence_count: usize::try_from(evidence).unwrap_or(usize::MAX),
+                        relation_count: sqlite_count(relations),
+                        evidence_count: sqlite_count(evidence),
                     })
                 })
                 .map_err(database_error)?
@@ -126,7 +169,7 @@ impl LearningStore {
         Ok(claims)
     }
 
-    pub fn due_claim_topics(&self, limit: usize) -> io::Result<Vec<(i64, String, String, String)>> {
+    pub(crate) fn due_claim_topics(&self, limit: usize) -> io::Result<Vec<ClaimTopic>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -141,19 +184,13 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map(
-                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            .query_map([sqlite_limit(limit)?], ClaimTopic::from_row)
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
     }
 
-    pub fn challenged_claim_topics(
-        &self,
-        limit: usize,
-    ) -> io::Result<Vec<(i64, String, String, String)>> {
+    pub(crate) fn challenged_claim_topics(&self, limit: usize) -> io::Result<Vec<ClaimTopic>> {
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -166,10 +203,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map(
-                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            .query_map([sqlite_limit(limit)?], ClaimTopic::from_row)
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -187,11 +221,7 @@ impl LearningStore {
             return Err(invalid("invalid review state"));
         }
         for value in [checked_at, next_review_at].into_iter().flatten() {
-            let valid: bool = self
-                .connection
-                .query_row("SELECT datetime(?1) IS NOT NULL", [value], |row| row.get(0))
-                .map_err(database_error)?;
-            if !valid {
+            if !is_valid_review_datetime(&self.connection, value)? {
                 return Err(invalid("review dates must be valid ISO date-times"));
             }
         }
@@ -294,27 +324,13 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let old = tx
-            .query_row(
-                "SELECT subject, relation, object FROM semantic_claims WHERE id = ?1 AND retracted_by IS NULL",
-                [old_claim_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            )
-            .optional()
-            .map_err(database_error)?
+        let old = active_claim_proposition(&tx, old_claim_id)?
             .ok_or_else(|| invalid("old claim is not currently active"))?;
-        let new = tx
-            .query_row(
-                "SELECT subject, relation, object FROM semantic_claims WHERE id = ?1 AND retracted_by IS NULL",
-                [new_claim_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
-            )
-            .optional()
-            .map_err(database_error)?
+        let new = active_claim_proposition(&tx, new_claim_id)?
             .ok_or_else(|| invalid("replacement claim is not currently active"))?;
-        if canonical(&old.0) != canonical(&new.0)
-            || canonical(&old.1) != canonical(&new.1)
-            || canonical(&old.2) == canonical(&new.2)
+        if canonical(&old.subject) != canonical(&new.subject)
+            || canonical(&old.relation) != canonical(&new.relation)
+            || canonical(&old.object) == canonical(&new.object)
         {
             return Err(invalid(
                 "replacement must change the object of the same subject and relation",
@@ -392,14 +408,10 @@ impl LearningStore {
                 "volatility must be stable, slow_changing, or fast_changing",
             ));
         }
-        if let Some(value) = next_review_at {
-            let valid: bool = self
-                .connection
-                .query_row("SELECT datetime(?1) IS NOT NULL", [value], |row| row.get(0))
-                .map_err(database_error)?;
-            if !valid {
-                return Err(invalid("review date must be a valid ISO date-time"));
-            }
+        if let Some(value) = next_review_at
+            && !is_valid_review_datetime(&self.connection, value)?
+        {
+            return Err(invalid("review date must be a valid ISO date-time"));
         }
         let changed = self
             .connection
@@ -458,23 +470,20 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map(
-                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
-                |row| {
-                    Ok(MaintenanceDecision {
-                        id: row.get(0)?,
-                        role: row.get(1)?,
-                        source_type: row.get(2)?,
-                        source_id: row.get(3)?,
-                        suggested_action: row.get(4)?,
-                        outcome: row.get(5)?,
-                        reason: row.get(6)?,
-                        resulting_claim_id: row.get(7)?,
-                        resulting_state: row.get(8)?,
-                        created_at: row.get(9)?,
-                    })
-                },
-            )
+            .query_map([sqlite_limit(limit)?], |row| {
+                Ok(MaintenanceDecision {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    source_type: row.get(2)?,
+                    source_id: row.get(3)?,
+                    suggested_action: row.get(4)?,
+                    outcome: row.get(5)?,
+                    reason: row.get(6)?,
+                    resulting_claim_id: row.get(7)?,
+                    resulting_state: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -543,11 +552,11 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         Ok(MaintenanceWorkCounts {
-            curator_reviews: usize::try_from(curator_reviews).unwrap_or(usize::MAX),
-            scholar_reviews: usize::try_from(scholar_reviews).unwrap_or(usize::MAX),
-            pending_research: usize::try_from(pending_research).unwrap_or(usize::MAX),
-            challenged_claims: usize::try_from(challenged_claims).unwrap_or(usize::MAX),
-            due_claims: usize::try_from(due_claims).unwrap_or(usize::MAX),
+            curator_reviews: sqlite_count(curator_reviews),
+            scholar_reviews: sqlite_count(scholar_reviews),
+            pending_research: sqlite_count(pending_research),
+            challenged_claims: sqlite_count(challenged_claims),
+            due_claims: sqlite_count(due_claims),
         })
     }
 }

@@ -1,15 +1,5 @@
 use super::*;
 
-fn now_ms() -> io::Result<i64> {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis(),
-    )
-    .map_err(|_| invalid("corroboration timestamp too large"))
-}
-
 pub(super) fn enqueue_corroboration_candidate(
     tx: &Transaction<'_>,
     finding_id: i64,
@@ -48,29 +38,12 @@ fn provider_ready(
         "tavily" => "tavily_usage",
         _ => return Err(invalid("unsupported corroboration provider")),
     };
-    let last: Option<i64> = tx
-        .query_row(
-            &format!("SELECT scheduled_at_ms FROM {table} ORDER BY id DESC LIMIT 1"),
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(database_error)?;
+    let last = super::network::latest_provider_search_ms(tx, table)?;
     if !last.is_none_or(|last| now >= last.saturating_add(interval_ms)) {
         return Ok(false);
     }
     if provider == "tavily" {
-        let (daily_calls, monthly_credits): (i64, i64) = tx
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM tavily_usage WHERE scheduled_at_ms >= ?1),
-                    (SELECT COALESCE(SUM(credits), 0) FROM tavily_usage
-                     WHERE strftime('%Y-%m', scheduled_at_ms / 1000, 'unixepoch') =
-                           strftime('%Y-%m', 'now'))",
-                [now.saturating_sub(86_400_000)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(database_error)?;
+        let (daily_calls, monthly_credits) = super::network::tavily_usage_totals(tx, now)?;
         return Ok(daily_calls < 25 && monthly_credits < 750);
     }
     Ok(true)
@@ -90,7 +63,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([i64::try_from(limit.min(100)).unwrap_or(100)], |row| {
+            .query_map([sqlite_limit(limit.min(100))?], |row| {
                 Ok(CorroborationQueueItem {
                     finding_id: row.get(0)?,
                     claim: row.get(1)?,
@@ -116,7 +89,7 @@ impl LearningStore {
         if serp_interval_ms < 1 || tavily_interval_ms < 1 {
             return Err(invalid("corroboration provider intervals must be positive"));
         }
-        let now = now_ms()?;
+        let now = super::unix_time_ms_i64("corroboration timestamp too large")?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -195,9 +168,7 @@ impl LearningStore {
             else {
                 continue;
             };
-            let job_id: String = tx
-                .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
-                .map_err(database_error)?;
+            let job_id = super::new_scholar_job_id(&tx)?;
             let question = format!("{} {} {}", subject, relation, object);
             tx.execute(
                 "INSERT INTO scholar_jobs
@@ -253,7 +224,7 @@ impl LearningStore {
         task: &CorroborationTask,
         outcome: &str,
     ) -> io::Result<()> {
-        let now = now_ms()?;
+        let now = super::unix_time_ms_i64("corroboration timestamp too large")?;
         let tx = self
             .connection
             .unchecked_transaction()

@@ -3,38 +3,52 @@ use super::*;
 
 #[test]
 fn scholar_evidence_must_support_the_relation_and_object() {
-    let claim = ScholarFinding {
-        semantic_support: None,
-        subject: "Hellenic Police".into(),
-        relation: "first editor".into(),
-        object: "Dimitrios Mallios".into(),
-        evidence_text: "Dimitrios Mallios is Chief of the Hellenic Police.".into(),
-        confidence: 0.99,
-        valid_from: None,
-        valid_until: None,
-        source_quality: "reference".into(),
-        source_updated_at: None,
-        proposition: Default::default(),
-    };
+    let claim = scholar_finding(
+        "Hellenic Police",
+        "first editor",
+        "Dimitrios Mallios",
+        "Dimitrios Mallios is Chief of the Hellenic Police.",
+        0.99,
+        "reference",
+        None,
+    );
     assert!(!evidence_supports_claim(&claim));
+}
+
+#[test]
+fn encyclopedia_summary_requires_the_matching_page_title_and_exact_text() {
+    let text = "Mars is a planet.";
+    let finding = scholar_finding(
+        "Mars",
+        "has encyclopedia summary",
+        text,
+        text,
+        0.99,
+        "reference",
+        None,
+    );
+    assert!(direct_passage_supports_finding("Mars", &finding));
+    assert!(!direct_passage_supports_finding("Mars facts", &finding));
+
+    let altered = ScholarFinding {
+        evidence_text: "Mars is a red planet.".into(),
+        ..finding
+    };
+    assert!(!direct_passage_supports_finding("Mars", &altered));
 }
 
 #[test]
 fn scholar_evidence_supports_each_item_in_a_cited_source_list() {
     let evidence_text = "Usually, the main ingredients of chicken soup are:\n* Chicken broth\n* Chicken\n* Noodles\n* Carrots";
-    let claim = ScholarFinding {
-        semantic_support: None,
-        subject: "Chicken soup".into(),
-        relation: "lists ingredients".into(),
-        object: "Chicken broth; Chicken; Noodles; Carrots".into(),
-        evidence_text: evidence_text.into(),
-        confidence: 0.99,
-        valid_from: None,
-        valid_until: None,
-        source_quality: "reference".into(),
-        source_updated_at: None,
-        proposition: Default::default(),
-    };
+    let claim = scholar_finding(
+        "Chicken soup",
+        "lists ingredients",
+        "Chicken broth; Chicken; Noodles; Carrots",
+        evidence_text,
+        0.99,
+        "reference",
+        None,
+    );
     assert!(evidence_supports_claim(&claim));
 
     let unsupported_item = ScholarFinding {
@@ -68,19 +82,15 @@ fn site_footer_text_cannot_ground_a_crisp_flavour_finding() {
             "Smith's Crisps",
             "https://www.cbinsights.com/company/cofresh",
             &source_excerpt,
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Smith's Crisps".into(),
-                relation: "is a".into(),
-                object: "potato crisps in ready salted, salt and vinegar or cheese and onion flavoured 5-pack multipacks".into(),
-                evidence_text: flavour_claim.into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(scholar_finding(
+                "Smith's Crisps",
+                "is a",
+                "potato crisps in ready salted, salt and vinegar or cheese and onion flavoured 5-pack multipacks",
+                flavour_claim,
+                0.99,
+                "reference",
+                None,
+            )),
             None,
             &ScholarSourceProfile::default(),
             "direct",
@@ -128,19 +138,15 @@ fn site_footer_text_cannot_ground_a_scientist_claim() {
             "Kepler-186 research",
             "https://www.cbinsights.com/company/astro-research",
             &source_excerpt,
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Dr. Amina Patel".into(),
-                relation: "led".into(),
-                object: "the Kepler-186 survey in 2024".into(),
-                evidence_text: evidence.into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(scholar_finding(
+                "Dr. Amina Patel",
+                "led",
+                "the Kepler-186 survey in 2024",
+                evidence,
+                0.99,
+                "reference",
+                None,
+            )),
             None,
             &ScholarSourceProfile::default(),
             "direct",
@@ -181,19 +187,15 @@ fn scholar_finding_links_to_a_versioned_source_and_exact_unicode_byte_span() {
             "Sun",
             "https://example.org/sun",
             &source_excerpt,
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Sun".into(),
-                relation: "is a".into(),
-                object: "star".into(),
-                evidence_text: quote.into(),
-                confidence: 0.9,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "unknown".into(),
-                source_updated_at: Some("2026-10-01T00:00:00Z".into()),
-                proposition: Default::default(),
-            }),
+            Some(scholar_finding(
+                "Sun",
+                "is a",
+                "star",
+                quote,
+                0.9,
+                "unknown",
+                Some("2026-10-01T00:00:00Z"),
+            )),
             None,
             &ScholarSourceProfile::default(),
             "direct",
@@ -207,10 +209,7 @@ fn scholar_finding_links_to_a_versioned_source_and_exact_unicode_byte_span() {
     let end = finding.evidence_byte_end.unwrap() as usize;
     let source = store.retained_source_detail(source_id).unwrap();
     assert_eq!(source["published_at"], "2026-10-01T00:00:00Z");
-    assert_eq!(
-        std::str::from_utf8(&source["body"].as_str().unwrap().as_bytes()[start..end]).unwrap(),
-        quote
-    );
+    assert_eq!(&source["body"].as_str().unwrap()[start..end], quote);
     drop(store);
     let _ = std::fs::remove_file(path);
 }
@@ -228,26 +227,21 @@ fn source_specific_list_is_directly_supported_but_held_for_review() {
     store
         .finish_scholar_job_with_evidence(
             &job.id,
-            &[ScholarEvidence {
-                source_title: "Simple Chicken Soup".into(),
-                source_url: "https://example.org/chicken-soup".into(),
-                source_excerpt: passage.into(),
-                finding: Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Simple Chicken Soup".into(),
-                    relation: "lists ingredients".into(),
-                    object: "Chicken breasts; Chicken stock; Carrots".into(),
-                    evidence_text: passage.into(),
-                    confidence: 0.8,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "unknown".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
-                profile: ScholarSourceProfile::default(),
-                research_relevance: "related".into(),
-            }],
+            &[ScholarEvidence::new(
+                "Simple Chicken Soup",
+                "https://example.org/chicken-soup",
+                passage,
+                Some(scholar_finding(
+                    "Simple Chicken Soup",
+                    "lists ingredients",
+                    "Chicken breasts; Chicken stock; Carrots",
+                    passage,
+                    0.8,
+                    "unknown",
+                    None,
+                )),
+                "related",
+            )],
             None,
         )
         .unwrap();

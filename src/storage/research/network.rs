@@ -3,6 +3,89 @@ use super::*;
 use sha2::{Digest, Sha256};
 pub(crate) const MEDIAWIKI_TRANSIENT_ERROR: &str = "MediaWiki API returned a retryable error";
 
+impl CachedSitePolicy {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            status: row.get(0)?,
+            content_type: row.get(1)?,
+            body: row.get(2)?,
+        })
+    }
+}
+
+impl CachedSourcePage {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            content_type: row.get(0)?,
+            body: row.get(1)?,
+        })
+    }
+}
+
+pub(super) fn tavily_usage_totals(connection: &Connection, now: i64) -> io::Result<(i64, i64)> {
+    connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM tavily_usage WHERE scheduled_at_ms >= ?1),
+                (SELECT COALESCE(SUM(credits), 0) FROM tavily_usage
+                 WHERE strftime('%Y-%m', scheduled_at_ms / 1000, 'unixepoch') =
+                       strftime('%Y-%m', 'now'))",
+            [now.saturating_sub(86_400_000)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(database_error)
+}
+
+pub(super) fn latest_provider_search_ms(
+    connection: &Connection,
+    table: &str,
+) -> io::Result<Option<i64>> {
+    connection
+        .query_row(
+            &format!("SELECT scheduled_at_ms FROM {table} ORDER BY id DESC LIMIT 1"),
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn complete_search_reservation(
+    connection: &Connection,
+    table: &str,
+    provider: &str,
+    request_id: i64,
+    response_status: Option<u16>,
+    error: Option<&str>,
+) -> io::Result<()> {
+    let completed_at_ms = super::unix_time_ms_i64("search completion timestamp too large")?;
+    let changed = connection
+        .execute(
+            &format!(
+                "UPDATE {table} SET completed_at_ms = ?2, response_status = ?3,
+                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'"
+            ),
+            params![
+                request_id,
+                completed_at_ms,
+                response_status,
+                if error.is_some() {
+                    "failed"
+                } else {
+                    "succeeded"
+                },
+                error.map(|value| value.chars().take(500).collect::<String>()),
+            ],
+        )
+        .map_err(database_error)?;
+    if changed != 1 {
+        return Err(invalid(&format!(
+            "{provider} search reservation was not pending"
+        )));
+    }
+    Ok(())
+}
+
 fn configured_limit(name: &str, default: i64, maximum: i64) -> i64 {
     std::env::var(name)
         .ok()
@@ -50,13 +133,13 @@ pub(super) fn check_wikipedia_budget(
 }
 
 impl LearningStore {
-    pub fn cached_source_page(&self, url: &str) -> io::Result<Option<(String, String)>> {
+    pub(crate) fn cached_source_page(&self, url: &str) -> io::Result<Option<CachedSourcePage>> {
         self.connection
             .query_row(
                 "SELECT content_type,body FROM research_page_cache WHERE url=?1
             AND expires_at_ms>CAST(strftime('%s','now') AS INTEGER)*1000",
                 [url],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                CachedSourcePage::from_row,
             )
             .optional()
             .map_err(database_error)
@@ -79,14 +162,7 @@ impl LearningStore {
     }
 
     pub fn research_network_usage(&self) -> io::Result<serde_json::Value> {
-        let now: i64 = self
-            .connection
-            .query_row(
-                "SELECT CAST(strftime('%s','now') AS INTEGER)*1000",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let now = super::sql_now_millis(&self.connection)?;
         let count = |window| {
             self.connection.query_row("SELECT COUNT(*) FROM host_request_log WHERE host='en.wikipedia.org' AND scheduled_at_ms>=?1",[now-window],|row|row.get::<_,i64>(0)).map_err(database_error)
         };
@@ -175,15 +251,8 @@ mod tests {
 
     #[test]
     fn page_fetches_have_no_shared_daily_cap_or_retry_delay() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
-        let now: i64 = store
-            .connection
-            .query_row(
-                "SELECT CAST(strftime('%s','now') AS INTEGER)*1000",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
+        let now = super::super::sql_now_millis(&store.connection).unwrap();
         for _ in 0..101 {
             store.connection.execute("INSERT INTO host_request_log(host,request_kind,scheduled_at_ms,completed_at_ms,outcome,lease_until_ms)
                 VALUES ('past.example','external_page_content',?1,?1,'succeeded',?1)",[now-3_600_000]).unwrap();
@@ -210,7 +279,7 @@ mod tests {
 
     #[test]
     fn jobs_deferred_by_removed_cap_resume_but_other_backoffs_remain() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let plan = crate::research::ResearchPlan {
             question: "Where is the Amazon rainforest?".into(),
             queries: vec!["Amazon rainforest".into()],
@@ -264,7 +333,7 @@ mod tests {
 
     #[test]
     fn external_page_cache_retains_full_content_and_expires() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         store
             .cache_source_page(
                 "https://example.org/page",
@@ -276,7 +345,7 @@ mod tests {
             .cached_source_page("https://example.org/page")
             .unwrap()
             .unwrap();
-        assert!(cached.1.contains("third useful detail"));
+        assert!(cached.body.contains("third useful detail"));
         store
             .connection
             .execute("UPDATE research_page_cache SET expires_at_ms=0", [])
@@ -291,7 +360,7 @@ mod tests {
 
     #[test]
     fn mediawiki_throttle_keeps_actual_http_status_and_increases_backoff() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let first = store
             .reserve_host_request_with_interval("en.wikipedia.org", "wikipedia_search", 10_000)
             .unwrap();
@@ -357,7 +426,7 @@ mod tests {
 
     #[test]
     fn api_budget_counts_searches_and_sections_not_only_page_fetches() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let tx = store.connection.transaction().unwrap();
         tx.execute(
             "INSERT INTO host_request_log(host,request_kind,scheduled_at_ms,outcome,lease_until_ms)
@@ -384,7 +453,7 @@ mod tests {
 
     #[test]
     fn cached_responses_expire_and_do_not_consume_requests() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         let response = serde_json::json!({"query":{"pages":[]}});
         store
             .cache_wikipedia_response("fixture", "wikipedia_search", &response)
@@ -424,14 +493,7 @@ impl LearningStore {
             "tavily" => "tavily_usage",
             _ => return Err(invalid("unsupported Scholar search provider")),
         };
-        self.connection
-            .query_row(
-                &format!("SELECT scheduled_at_ms FROM {table} ORDER BY id DESC LIMIT 1"),
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)
+        latest_provider_search_ms(&self.connection, table)
     }
 
     pub fn robots_blocked(&self, host: &str, path_query: &str) -> io::Result<bool> {
@@ -494,7 +556,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([i64::try_from(limit.min(100)).unwrap_or(100)], |row| {
+            .query_map([sqlite_limit(limit.min(100))?], |row| {
                 Ok(ScholarRobotsBlock {
                     host: row.get(0)?,
                     display_path: row.get(1)?,
@@ -518,11 +580,7 @@ impl LearningStore {
         if minimum_interval_ms < 1 || query.trim().is_empty() {
             return Err(invalid("SerpAPI interval must be positive"));
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let now = i64::try_from(now_ms).map_err(|_| invalid("search timestamp too large"))?;
+        let now = super::unix_time_ms_i64("search timestamp too large")?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -565,8 +623,7 @@ impl LearningStore {
             .unchecked_transaction()
             .map_err(database_error)?;
         for (domain, result_count) in domains {
-            let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-            let domain = domain.strip_prefix("www.").unwrap_or(&domain);
+            let domain = crate::storage::normalize_domain(domain);
             if domain.is_empty() || *result_count == 0 {
                 continue;
             }
@@ -601,7 +658,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([i64::try_from(limit.min(1_000)).unwrap_or(1_000)], |row| {
+            .query_map([sqlite_limit(limit.min(1_000))?], |row| {
                 Ok(SerpApiDomainObservation {
                     searched_at_ms: row.get(0)?,
                     query: row.get(1)?,
@@ -620,34 +677,14 @@ impl LearningStore {
         response_status: Option<u16>,
         error: Option<&str>,
     ) -> io::Result<()> {
-        let completed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let completed_at_ms = i64::try_from(completed_at_ms)
-            .map_err(|_| invalid("search completion timestamp too large"))?;
-        let changed = self
-            .connection
-            .execute(
-                "UPDATE serpapi_usage SET completed_at_ms = ?2, response_status = ?3,
-                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'",
-                params![
-                    request_id,
-                    completed_at_ms,
-                    response_status,
-                    if error.is_some() {
-                        "failed"
-                    } else {
-                        "succeeded"
-                    },
-                    error.map(|value| value.chars().take(500).collect::<String>()),
-                ],
-            )
-            .map_err(database_error)?;
-        if changed != 1 {
-            return Err(invalid("SerpAPI search reservation was not pending"));
-        }
-        Ok(())
+        complete_search_reservation(
+            &self.connection,
+            "serpapi_usage",
+            "SerpAPI",
+            request_id,
+            response_status,
+            error,
+        )
     }
 
     pub fn reserve_tavily_search_with_interval(
@@ -663,11 +700,7 @@ impl LearningStore {
             "advanced" => 2_i64,
             _ => return Err(invalid("unsupported Tavily search depth")),
         };
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let now = i64::try_from(now_ms).map_err(|_| invalid("search timestamp too large"))?;
+        let now = super::unix_time_ms_i64("search timestamp too large")?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -686,17 +719,7 @@ impl LearningStore {
                 "Tavily search is cooling down",
             ));
         }
-        let (daily_calls, month_credits): (i64, i64) = tx
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM tavily_usage
-                     WHERE scheduled_at_ms >= ?1),
-                    (SELECT COALESCE(SUM(credits), 0) FROM tavily_usage
-                     WHERE strftime('%Y-%m', scheduled_at_ms / 1000, 'unixepoch') = strftime('%Y-%m', 'now'))",
-                [now.saturating_sub(86_400_000)],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(database_error)?;
+        let (daily_calls, month_credits) = tavily_usage_totals(&tx, now)?;
         if daily_calls >= 25 {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -727,34 +750,14 @@ impl LearningStore {
         response_status: Option<u16>,
         error: Option<&str>,
     ) -> io::Result<()> {
-        let completed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let completed_at_ms = i64::try_from(completed_at_ms)
-            .map_err(|_| invalid("search completion timestamp too large"))?;
-        let changed = self
-            .connection
-            .execute(
-                "UPDATE tavily_usage SET completed_at_ms = ?2, response_status = ?3,
-                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'",
-                params![
-                    request_id,
-                    completed_at_ms,
-                    response_status,
-                    if error.is_some() {
-                        "failed"
-                    } else {
-                        "succeeded"
-                    },
-                    error.map(|value| value.chars().take(500).collect::<String>()),
-                ],
-            )
-            .map_err(database_error)?;
-        if changed != 1 {
-            return Err(invalid("Tavily search reservation was not pending"));
-        }
-        Ok(())
+        complete_search_reservation(
+            &self.connection,
+            "tavily_usage",
+            "Tavily",
+            request_id,
+            response_status,
+            error,
+        )
     }
 
     /// Atomically reserve a persisted host slot. Unfinished reservations count
@@ -791,11 +794,7 @@ impl LearningStore {
         {
             return Err(invalid("unsupported Scholar host request"));
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let now = i64::try_from(now_ms).map_err(|_| invalid("request timestamp too large"))?;
+        let now = super::unix_time_ms_i64("request timestamp too large")?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -827,9 +826,10 @@ impl LearningStore {
             .map_err(database_error)?;
         let minimum_next = previous.map_or(now, |(scheduled, completed)| {
             let spaced_after_reservation = scheduled.saturating_add(minimum_interval_ms);
-            let after_completion = completed
-                .map(|completed| completed.saturating_add(minimum_interval_ms))
-                .unwrap_or_else(|| scheduled.saturating_add(15_000));
+            let after_completion = completed.map_or_else(
+                || scheduled.saturating_add(15_000),
+                |completed| completed.saturating_add(minimum_interval_ms),
+            );
             spaced_after_reservation.max(after_completion)
         });
         let scheduled_at_ms = now.max(minimum_next);
@@ -893,12 +893,7 @@ impl LearningStore {
         retry_after_ms: Option<i64>,
         error: Option<&str>,
     ) -> io::Result<()> {
-        let completed_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let completed_at_ms = i64::try_from(completed_at_ms)
-            .map_err(|_| invalid("request completion timestamp too large"))?;
+        let completed_at_ms = super::unix_time_ms_i64("request completion timestamp too large")?;
         let error = error.map(|value| value.chars().take(500).collect::<String>());
         let api_throttled = error.as_deref() == Some(network::MEDIAWIKI_TRANSIENT_ERROR);
         let tx = self
@@ -966,11 +961,11 @@ impl LearningStore {
         Ok(())
     }
 
-    pub fn cached_site_policy(
+    pub(crate) fn cached_site_policy(
         &self,
         origin: &str,
         request_kind: &str,
-    ) -> io::Result<Option<(u16, String, String)>> {
+    ) -> io::Result<Option<CachedSitePolicy>> {
         let row = self
             .connection
             .query_row(
@@ -978,7 +973,7 @@ impl LearningStore {
                  WHERE origin = ?1 AND request_kind = ?2
                    AND expires_at_ms > CAST(strftime('%s', 'now') AS INTEGER) * 1000",
                 params![origin, request_kind],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                CachedSitePolicy::from_row,
             )
             .optional()
             .map_err(database_error)?;
@@ -1003,11 +998,7 @@ impl LearningStore {
         {
             return Err(invalid("invalid site-policy cache entry"));
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .as_millis();
-        let now = i64::try_from(now_ms).map_err(|_| invalid("policy timestamp too large"))?;
+        let now = super::unix_time_ms_i64("policy timestamp too large")?;
         self.connection
             .execute(
                 "INSERT INTO scholar_site_policy_cache

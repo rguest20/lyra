@@ -1,5 +1,6 @@
 //! Persistence boundaries for qualified semantic support.
 use super::*;
+use crate::test_support::ScholarJobTestHelpers;
 
 #[test]
 fn a_reviewed_identity_scope_cannot_be_removed_before_storage() {
@@ -12,7 +13,7 @@ fn a_reviewed_identity_scope_cannot_be_removed_before_storage() {
         } else { serde_json::json!({"verdict":"entailed","reason":"Identity is stated within the named universe.","evidence_text":passage}).to_string() })
     }).unwrap().pop().unwrap();
     let scope = alias.identity_scope.take();
-    let store = LearningStore::open(std::path::Path::new(":memory:")).unwrap();
+    let store = crate::test_support::in_memory_learning_store();
     assert!(
         store
             .record_entity_alias(None, "https://example.org/identity", passage, &alias)
@@ -29,14 +30,7 @@ fn a_reviewed_identity_scope_cannot_be_removed_before_storage() {
 
 #[test]
 fn qualified_findings_survive_review_context_and_support_refresh() {
-    let path = std::env::temp_dir().join(format!(
-        "lyra-qualified-review-{}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let path = crate::test_support::unique_temp_path("lyra-qualified-review", "db");
     let passage =
         "The astronomer said the crystal may not conduct electricity in Europe during the trial.";
     let proposition = PropositionMetadata {

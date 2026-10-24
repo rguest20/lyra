@@ -2,14 +2,11 @@ use super::*;
 
 impl LearningStore {
     pub fn approve_model_claim(&self, claim_id: i64, reason: &str) -> io::Result<()> {
-        if reason.trim().is_empty()
-            || reason.chars().count() > 500
-            || reason.chars().any(char::is_control)
-        {
-            return Err(invalid(
-                "model approval needs a printable reason (1 to 500 characters)",
-            ));
-        }
+        require_printable_field(
+            reason,
+            500,
+            "model approval needs a printable reason (1 to 500 characters)",
+        )?;
         if let Some(reason) = self.model_claim_training_block(claim_id)? {
             return Err(invalid(reason));
         }

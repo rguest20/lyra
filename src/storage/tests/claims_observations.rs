@@ -2,6 +2,21 @@
 use super::*;
 
 #[test]
+fn assistant_reply_attention_returns_named_pending_reply_fields() {
+    let store = crate::test_support::in_memory_learning_store();
+    store
+        .stage_assistant_reply("attention-test", 1, "A reply.")
+        .unwrap();
+
+    let replies = store.assistant_reply_attention().unwrap();
+
+    assert_eq!(replies.len(), 1);
+    assert!(!replies[0].reply_id.is_empty());
+    assert_eq!(replies[0].status, "pending");
+    assert!(replies[0].error.is_empty());
+}
+
+#[test]
 fn advisory_reply_review_preserves_text_and_uses_only_its_own_past_context() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();
@@ -138,19 +153,15 @@ fn failed_ai_review_retries_after_restart_without_blocking_other_findings() {
                 "Mars",
                 &format!("https://source{turn}.example/mars"),
                 "Mars is a planet.",
-                Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: "Mars".into(),
-                    relation: "is a".into(),
-                    object: "planet".into(),
-                    evidence_text: "Mars is a planet.".into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "unknown".into(),
-                    source_updated_at: None,
-                    proposition: Default::default(),
-                }),
+                Some(scholar_finding(
+                    "Mars",
+                    "is a",
+                    "planet",
+                    "Mars is a planet.",
+                    0.99,
+                    "unknown",
+                    None,
+                )),
                 None,
             )
             .unwrap();
@@ -164,7 +175,7 @@ fn failed_ai_review_retries_after_restart_without_blocking_other_findings() {
     let reopened = LearningStore::open(&path).unwrap();
     let ready = reopened.scholar_ai_review_queue().unwrap();
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].0, ids[1]);
+    assert_eq!(ready[0].finding_id, ids[1]);
     assert!(reopened.active_semantic_claims().unwrap().is_empty());
     reopened
         .connection
@@ -187,44 +198,41 @@ fn one_job_keeps_wikipedia_and_fetched_source_claims_with_separate_assessments()
         .unwrap();
     let job = store.claim_scholar_job().unwrap().unwrap();
     let make_finding = |quality: &str| ScholarFinding {
-        semantic_support: None,
-        subject: "Mars".into(),
-        relation: "is a".into(),
-        object: "planet".into(),
-        evidence_text: "Mars is a planet.".into(),
-        confidence: 0.99,
-        valid_from: None,
-        valid_until: None,
         source_quality: quality.into(),
-        source_updated_at: None,
         proposition: PropositionMetadata {
             attribution: Some("The source".into()),
-            geographic_scope: None,
-            context_scope: None,
             polarity: ClaimPolarity::Asserted,
             modality: ClaimModality::Factual,
+            ..PropositionMetadata::default()
         },
+        ..scholar_finding(
+            "Mars",
+            "is a",
+            "planet",
+            "Mars is a planet.",
+            0.99,
+            "reference",
+            None,
+        )
     };
     store
         .finish_scholar_job_with_evidence(
             &job.id,
             &[
-                ScholarEvidence {
-                    source_title: "Mars".into(),
-                    source_url: "https://en.wikipedia.org/wiki/Mars".into(),
-                    source_excerpt: "Mars is a planet.".into(),
-                    finding: Some(make_finding("reference")),
-                    profile: ScholarSourceProfile::default(),
-                    research_relevance: "direct".into(),
-                },
-                ScholarEvidence {
-                    source_title: "Mars overview".into(),
-                    source_url: "https://en.wikipedia.org/wiki/Mars#overview".into(),
-                    source_excerpt: "Mars is a planet.".into(),
-                    finding: Some(make_finding("unknown")),
-                    profile: ScholarSourceProfile::default(),
-                    research_relevance: "direct".into(),
-                },
+                ScholarEvidence::new(
+                    "Mars",
+                    "https://en.wikipedia.org/wiki/Mars",
+                    "Mars is a planet.",
+                    Some(make_finding("reference")),
+                    "direct",
+                ),
+                ScholarEvidence::new(
+                    "Mars overview",
+                    "https://en.wikipedia.org/wiki/Mars#overview",
+                    "Mars is a planet.",
+                    Some(make_finding("unknown")),
+                    "direct",
+                ),
             ],
             None,
         )
@@ -232,9 +240,12 @@ fn one_job_keeps_wikipedia_and_fetched_source_claims_with_separate_assessments()
     let findings = store.scholar_findings(&job.id).unwrap();
     assert_eq!(findings.len(), 2);
     assert_eq!(findings[0].status, "needs_review");
-    assert_eq!(findings[0].attribution.as_deref(), Some("The source"));
-    assert_eq!(findings[0].polarity, "asserted");
-    assert_eq!(findings[0].modality, "factual");
+    assert_eq!(
+        findings[0].proposition.attribution.as_deref(),
+        Some("The source")
+    );
+    assert_eq!(findings[0].proposition.polarity, ClaimPolarity::Asserted);
+    assert_eq!(findings[0].proposition.modality, ClaimModality::Factual);
     assert_eq!(
         findings[1].source_url,
         "https://en.wikipedia.org/wiki/Mars#overview"
@@ -423,19 +434,7 @@ fn candidate_insert_and_observation_status_commit_together() {
         .stage_observation("conversation-a", 1, "I live in Bristol.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let claim = CandidateClaim {
-        subject: "the user".into(),
-        relation: "lives in".into(),
-        object: "Bristol".into(),
-        evidence_text: "I live in Bristol".into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.92,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
-    };
+    let claim = candidate_claim("the user", "lives in", "Bristol", "I live in Bristol", 0.92);
     store.finish_extraction(&id, &[claim], None).unwrap();
     let observation_status: String = store
         .connection
@@ -472,19 +471,13 @@ fn ai_review_resolves_a_held_candidate_and_records_no_human_hold() {
         .stage_observation("conversation-ai-review", 1, "I live in Bristol.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let claim = CandidateClaim {
-        subject: "the user".into(),
-        relation: "lives in".into(),
-        object: "Bristol".into(),
-        evidence_text: "I live in Bristol.".into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.92,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
-    };
+    let claim = candidate_claim(
+        "the user",
+        "lives in",
+        "Bristol",
+        "I live in Bristol.",
+        0.92,
+    );
     store
         .finish_extraction(&observation_id, &[claim], None)
         .unwrap();
@@ -533,18 +526,14 @@ fn high_confidence_claims_promote_and_equivalent_evidence_attaches() {
         .stage_observation("conversation-a", 1, "I live in Bristol.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let make_claim = || CandidateClaim {
-        subject: " the   user ".into(),
-        relation: "lives in".into(),
-        object: "Bristol".into(),
-        evidence_text: "I live in Bristol.".into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.97,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
+    let make_claim = || {
+        candidate_claim(
+            " the   user ",
+            "lives in",
+            "Bristol",
+            "I live in Bristol.",
+            0.97,
+        )
     };
     store
         .finish_extraction(&first_id, &[make_claim()], None)
@@ -617,19 +606,13 @@ fn confirmation_promotes_a_matching_review_candidate_and_keeps_both_sources() {
     store
         .finish_extraction(
             &first_id,
-            &[CandidateClaim {
-                subject: "the user".into(),
-                relation: "lives in".into(),
-                object: "Shifnal".into(),
-                evidence_text: "I live in Shifnal.".into(),
-                context_message_ids: Vec::new(),
-                resolution: None,
-                confidence: 0.0,
-                status: "needs_review".into(),
-                decision_reason: Some("extractor confidence was missing".into()),
-                valid_from: None,
-                valid_until: None,
-            }],
+            &[review_candidate_claim(
+                "the user",
+                "lives in",
+                "Shifnal",
+                "I live in Shifnal.",
+                "extractor confidence was missing",
+            )],
             None,
         )
         .unwrap();
@@ -642,17 +625,15 @@ fn confirmation_promotes_a_matching_review_candidate_and_keeps_both_sources() {
         .finish_extraction(
             &confirmation_id,
             &[CandidateClaim {
-                subject: "the user".into(),
-                relation: "lives in".into(),
-                object: "Shifnal".into(),
-                evidence_text: "Yes, that's right.".into(),
                 context_message_ids: vec!["turn:1:user".into(), "turn:1:assistant".into()],
                 resolution: Some("The user confirms the location stated earlier.".into()),
-                confidence: 0.99,
-                status: "proposed".into(),
-                decision_reason: None,
-                valid_from: None,
-                valid_until: None,
+                ..candidate_claim(
+                    "the user",
+                    "lives in",
+                    "Shifnal",
+                    "Yes, that's right.",
+                    0.99,
+                )
             }],
             None,
         )
@@ -689,19 +670,7 @@ fn self_referential_name_question_finds_a_curated_user_claim() {
         .stage_observation("conversation-a", 1, "I am Ryan.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let claim = CandidateClaim {
-        subject: "the user".into(),
-        relation: "is named".into(),
-        object: "Ryan".into(),
-        evidence_text: "I am Ryan.".into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.98,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
-    };
+    let claim = candidate_claim("the user", "is named", "Ryan", "I am Ryan.", 0.98);
     store.finish_extraction(&id, &[claim], None).unwrap();
     let matches = store
         .relevant_semantic_claims("Do you know my name?", 5)
@@ -723,19 +692,13 @@ fn personal_questions_retrieve_unreviewed_candidate_interpretations() {
         .stage_observation("conversation-a", 1, "I am Ryan.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let claim = CandidateClaim {
-        subject: "the user".into(),
-        relation: "is named".into(),
-        object: "Ryan".into(),
-        evidence_text: "I am Ryan.".into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.0,
-        status: "needs_review".into(),
-        decision_reason: Some("missing confidence".into()),
-        valid_from: None,
-        valid_until: None,
-    };
+    let claim = review_candidate_claim(
+        "the user",
+        "is named",
+        "Ryan",
+        "I am Ryan.",
+        "missing confidence",
+    );
     store.finish_extraction(&id, &[claim], None).unwrap();
     let matches = store
         .relevant_review_candidates("conversation-a", "Do you know my name?", 5)
@@ -857,19 +820,13 @@ fn personal_claim_retrieval_does_not_surface_a_different_user_fact() {
             store
                 .finish_extraction(
                     &id,
-                    &[CandidateClaim {
-                        subject: "the user".into(),
-                        relation: relation.into(),
-                        object: object.into(),
-                        evidence_text: text.into(),
-                        context_message_ids: Vec::new(),
-                        resolution: None,
-                        confidence: 0.0,
-                        status: "needs_review".into(),
-                        decision_reason: Some("missing confidence".into()),
-                        valid_from: None,
-                        valid_until: None,
-                    }],
+                    &[review_candidate_claim(
+                        "the user",
+                        relation,
+                        object,
+                        text,
+                        "missing confidence",
+                    )],
                     None,
                 )
                 .unwrap();
@@ -905,18 +862,8 @@ fn contradictory_high_confidence_claim_stays_for_review() {
         .stage_observation("conversation-a", 1, "I live in Bristol.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let claim = |object: &str, evidence: &str| CandidateClaim {
-        subject: "the user".into(),
-        relation: "lives in".into(),
-        object: object.into(),
-        evidence_text: evidence.into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence: 0.98,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
+    let claim = |object: &str, evidence: &str| {
+        candidate_claim("the user", "lives in", object, evidence, 0.98)
     };
     store
         .finish_extraction(&first_id, &[claim("Bristol", "I live in Bristol.")], None)
@@ -958,18 +905,8 @@ fn inbox_details_and_review_acceptance_preserve_conflict_history() {
         .stage_observation("conversation-a", 1, "I live in Bristol.")
         .unwrap();
     store.claim_next_observation(600).unwrap().unwrap();
-    let candidate = |object: &str, text: &str, confidence| CandidateClaim {
-        subject: "the user".into(),
-        relation: "lives in".into(),
-        object: object.into(),
-        evidence_text: text.into(),
-        context_message_ids: Vec::new(),
-        resolution: None,
-        confidence,
-        status: "proposed".into(),
-        decision_reason: None,
-        valid_from: None,
-        valid_until: None,
+    let candidate = |object: &str, text: &str, confidence| {
+        candidate_claim("the user", "lives in", object, text, confidence)
     };
     store
         .finish_extraction(

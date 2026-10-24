@@ -4,10 +4,30 @@
 use super::*;
 
 pub(super) struct CorroborationCheck {
-    pub independent_sources: Vec<(i64, String, String, String)>,
+    pub independent_sources: Vec<IndependentSource>,
     pub possible_copy_of: Option<i64>,
     pub shared_source_with: Option<i64>,
     pub provenance_link: Option<(i64, String)>,
+}
+
+pub(super) struct IndependentSource {
+    pub finding_id: i64,
+    pub job_id: String,
+    pub source_url: String,
+    pub source_excerpt: String,
+}
+
+struct ExistingFinding {
+    id: i64,
+    job_id: String,
+    source_url: String,
+    source_excerpt: String,
+    independence_key: Option<String>,
+    independence_verified: bool,
+    source_kind: String,
+    direct_support: bool,
+    confidence: f64,
+    page_provenance: Option<String>,
 }
 
 pub(super) fn check_corroboration(
@@ -47,18 +67,18 @@ pub(super) fn check_corroboration(
                 finding.valid_until,
             ],
             |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i64>(5)? != 0,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<i64>>(7)? == Some(1),
-                    row.get::<_, f64>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                ))
+                Ok(ExistingFinding {
+                    id: row.get(0)?,
+                    job_id: row.get(1)?,
+                    source_url: row.get(2)?,
+                    source_excerpt: row.get(3)?,
+                    independence_key: row.get(4)?,
+                    independence_verified: row.get::<_, i64>(5)? != 0,
+                    source_kind: row.get(6)?,
+                    direct_support: row.get::<_, Option<i64>>(7)? == Some(1),
+                    confidence: row.get(8)?,
+                    page_provenance: row.get(9)?,
+                })
             },
         )
         .map_err(database_error)?
@@ -70,48 +90,39 @@ pub(super) fn check_corroboration(
         shared_source_with: None,
         provenance_link: None,
     };
-    for (
-        id,
-        job_id,
-        url,
-        earlier_excerpt,
-        earlier_key,
-        verified,
-        kind,
-        direct,
-        confidence,
-        earlier_provenance_json,
-    ) in rows
-    {
-        if url == source_url
-            || current_source_id.is_some_and(|key| earlier_key.as_deref() == Some(key))
+    for earlier in rows {
+        if earlier.source_url == source_url
+            || current_source_id.is_some_and(|key| earlier.independence_key.as_deref() == Some(key))
         {
-            check.shared_source_with.get_or_insert(id);
+            check.shared_source_with.get_or_insert(earlier.id);
             continue;
         }
-        let earlier_provenance = parse_page_provenance(earlier_provenance_json.as_deref());
+        let earlier_provenance = parse_page_provenance(earlier.page_provenance.as_deref());
         if let Some(reason) = provenance_link(
             source_url,
             current_provenance.as_ref(),
-            &url,
+            &earlier.source_url,
             earlier_provenance.as_ref(),
         ) {
-            check.provenance_link.get_or_insert((id, reason));
+            check.provenance_link.get_or_insert((earlier.id, reason));
             continue;
         }
-        if substantial_passage_overlap(source_excerpt, &earlier_excerpt) {
-            check.possible_copy_of.get_or_insert(id);
+        if substantial_passage_overlap(source_excerpt, &earlier.source_excerpt) {
+            check.possible_copy_of.get_or_insert(earlier.id);
             continue;
         }
         if current_source_id.is_some()
-            && verified
-            && kind == "secondary"
-            && direct
-            && confidence >= PROMOTION_CONFIDENCE
+            && earlier.independence_verified
+            && earlier.source_kind == "secondary"
+            && earlier.direct_support
+            && earlier.confidence >= PROMOTION_CONFIDENCE
         {
-            check
-                .independent_sources
-                .push((id, job_id, url, earlier_excerpt));
+            check.independent_sources.push(IndependentSource {
+                finding_id: earlier.id,
+                job_id: earlier.job_id,
+                source_url: earlier.source_url,
+                source_excerpt: earlier.source_excerpt,
+            });
         }
     }
     Ok(check)
@@ -190,12 +201,14 @@ fn provenance_link(
     }
     let current_citations = declared_citations(current);
     let earlier_citations = declared_citations(earlier);
-    let current_identity = current_canonical
-        .map(normalized_provenance_url)
-        .unwrap_or_else(|| normalized_provenance_url(current_url));
-    let earlier_identity = earlier_canonical
-        .map(normalized_provenance_url)
-        .unwrap_or_else(|| normalized_provenance_url(earlier_url));
+    let current_identity = current_canonical.map_or_else(
+        || normalized_provenance_url(current_url),
+        normalized_provenance_url,
+    );
+    let earlier_identity = earlier_canonical.map_or_else(
+        || normalized_provenance_url(earlier_url),
+        normalized_provenance_url,
+    );
     if current_citations.contains(&earlier_identity)
         || earlier_citations.contains(&current_identity)
     {
@@ -314,6 +327,18 @@ pub(super) struct Assessment {
     pub research_relevance: String,
 }
 
+pub(super) struct FindingAssessmentInput<'a> {
+    pub question: &'a str,
+    pub source_url: &'a str,
+    pub finding: &'a ScholarFinding,
+    pub direct_support: bool,
+    pub freshness: &'static str,
+    pub profile: &'a ScholarSourceProfile,
+    pub publication_is_recent: bool,
+    pub has_independent_corroboration: bool,
+    pub research_relevance: &'a str,
+}
+
 #[cfg(test)]
 pub(super) fn assess_scholar_finding(
     question: &str,
@@ -322,10 +347,25 @@ pub(super) fn assess_scholar_finding(
     direct_support: bool,
     freshness: &'static str,
     profile: &ScholarSourceProfile,
-    publication_is_recent: bool,
     has_independent_corroboration: bool,
 ) -> Assessment {
-    assess_scholar_finding_with_relevance(
+    assess_scholar_finding_with_relevance(FindingAssessmentInput {
+        question,
+        source_url,
+        finding,
+        direct_support,
+        freshness,
+        profile,
+        publication_is_recent: false,
+        has_independent_corroboration,
+        research_relevance: "unknown",
+    })
+}
+
+pub(super) fn assess_scholar_finding_with_relevance(
+    input: FindingAssessmentInput<'_>,
+) -> Assessment {
+    let FindingAssessmentInput {
         question,
         source_url,
         finding,
@@ -334,21 +374,8 @@ pub(super) fn assess_scholar_finding(
         profile,
         publication_is_recent,
         has_independent_corroboration,
-        "unknown",
-    )
-}
-
-pub(super) fn assess_scholar_finding_with_relevance(
-    question: &str,
-    source_url: &str,
-    finding: &ScholarFinding,
-    direct_support: bool,
-    freshness: &'static str,
-    profile: &ScholarSourceProfile,
-    publication_is_recent: bool,
-    has_independent_corroboration: bool,
-    research_relevance: &str,
-) -> Assessment {
+        research_relevance,
+    } = input;
     let research_relevance = match research_relevance {
         "direct" | "related" | "tangential" => research_relevance,
         _ => "unknown",
@@ -633,7 +660,6 @@ mod tests {
             "not_time_sensitive",
             &ScholarSourceProfile::default(),
             false,
-            false,
         );
         assert_eq!(stable.topic_class, "historical_scientific");
         assert_eq!(stable.source_kind, "secondary");
@@ -648,7 +674,6 @@ mod tests {
             "fresh",
             &ScholarSourceProfile::default(),
             false,
-            false,
         );
         assert_eq!(recent.topic_class, "recent");
         assert_eq!(recent.gate_status, "unverified_temporal");
@@ -660,7 +685,6 @@ mod tests {
             "fresh",
             &ScholarSourceProfile::default(),
             false,
-            false,
         );
         assert_eq!(gpu.topic_class, "recent");
 
@@ -671,7 +695,6 @@ mod tests {
             true,
             "not_time_sensitive",
             &ScholarSourceProfile::default(),
-            false,
             false,
         );
         assert_eq!(sensitive.topic_class, "sensitive");
@@ -690,7 +713,6 @@ mod tests {
                 ..Default::default()
             },
             false,
-            false,
         );
         assert_eq!(primary.source_kind, "primary");
         assert_eq!(primary.gate_status, "eligible");
@@ -701,7 +723,6 @@ mod tests {
             true,
             "not_time_sensitive",
             &ScholarSourceProfile::default(),
-            false,
             false,
         );
         assert_eq!(unverified_primary.gate_status, "pending_review");
@@ -731,7 +752,6 @@ mod tests {
             true,
             "not_time_sensitive",
             &ScholarSourceProfile::default(),
-            false,
             false,
         );
         assert_eq!(assessment.topic_class, "historical_scientific");

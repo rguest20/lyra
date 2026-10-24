@@ -1,5 +1,26 @@
 use super::*;
 
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> io::Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+            rusqlite::params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+fn table_definition(connection: &Connection, table: &str) -> io::Result<Option<String>> {
+    connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [table],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)
+}
+
 impl LearningStore {
     pub(super) fn migrate_recent(&mut self, version: i64) -> io::Result<()> {
         if version < 25 {
@@ -841,13 +862,7 @@ impl LearningStore {
                 ("research_question_sources", "evidence_byte_start"),
                 ("research_question_sources", "evidence_byte_end"),
             ] {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                        rusqlite::params![table, column],
-                        |row| row.get(0),
-                    )
-                    .map_err(database_error)?;
+                let exists = table_has_column(&tx, table, column)?;
                 if !exists {
                     tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER;"))
                         .map_err(database_error)?;
@@ -939,13 +954,7 @@ impl LearningStore {
                     "TEXT NOT NULL DEFAULT 'unknown' CHECK (modality IN ('factual','possible','necessary','conditional','unknown'))",
                 ),
             ] {
-                let exists: bool = tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-                        rusqlite::params![table, column],
-                        |row| row.get(0),
-                    )
-                    .map_err(database_error)?;
+                let exists = table_has_column(&tx, table, column)?;
                 if !exists {
                     tx.execute_batch(&format!(
                         "ALTER TABLE {table} ADD COLUMN {column} {definition};"
@@ -962,14 +971,7 @@ impl LearningStore {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(database_error)?;
-            let definition: Option<String> = tx
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='scholar_finding_claim_links'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(database_error)?;
+            let definition = table_definition(&tx, "scholar_finding_claim_links")?;
             if !definition.is_some_and(|sql| sql.contains("'qualifies'")) {
                 tx.execute_batch(
                     "CREATE TABLE scholar_finding_claim_links_v55 (
@@ -1077,13 +1079,7 @@ impl LearningStore {
                 .map_err(database_error)?;
             for table in ["semantic_claims", "scholar_findings"] {
                 for column in ["geographic_scope", "context_scope"] {
-                    let exists: bool = tx
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
-                            rusqlite::params![table, column],
-                            |row| row.get(0),
-                        )
-                        .map_err(database_error)?;
+                    let exists = table_has_column(&tx, table, column)?;
                     if !exists {
                         tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))
                             .map_err(database_error)?;
@@ -1099,14 +1095,7 @@ impl LearningStore {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(database_error)?;
-            let definition: Option<String> = tx
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='scholar_finding_claim_links'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(database_error)?;
+            let definition = table_definition(&tx, "scholar_finding_claim_links")?;
             if !definition.is_some_and(|sql| sql.contains("'unresolved'")) {
                 tx.execute_batch(
                     "CREATE TABLE scholar_finding_claim_links_v59 (

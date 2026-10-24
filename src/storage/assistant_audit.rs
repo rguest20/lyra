@@ -1,6 +1,16 @@
 use super::*;
 use serde_json::Value;
 
+impl AssistantReplyAttention {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            reply_id: row.get(0)?,
+            status: row.get(1)?,
+            error: row.get(2)?,
+        })
+    }
+}
+
 impl LearningStore {
     pub fn stage_assistant_reply(
         &self,
@@ -259,15 +269,12 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         let rows = statement
-            .query_map(
-                [i64::try_from(limit).map_err(|_| invalid("limit too large"))?],
-                read_assistant_claim,
-            )
+            .query_map([sqlite_limit(limit)?], read_assistant_claim)
             .map_err(database_error)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(database_error)
     }
 
-    pub fn assistant_reply_attention(&self) -> io::Result<Vec<(String, String, String)>> {
+    pub(crate) fn assistant_reply_attention(&self) -> io::Result<Vec<AssistantReplyAttention>> {
         let mut statement = self
             .connection
             .prepare(
@@ -277,7 +284,7 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .query_map([], AssistantReplyAttention::from_row)
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)
@@ -341,9 +348,7 @@ impl LearningStore {
     }
 
     pub fn utc_date(&self) -> io::Result<String> {
-        self.connection
-            .query_row("SELECT date('now')", [], |row| row.get(0))
-            .map_err(database_error)
+        current_sql_date(&self.connection)
     }
 
     pub fn latest_reply_challenges(

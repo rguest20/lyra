@@ -1,23 +1,6 @@
 use super::*;
-use sha2::{Digest, Sha256};
 
-const MAX_RETAINED_SOURCE_CHARS: usize = 32_000;
 const RESEARCH_HARVEST_CHUNK_CHARS: usize = 1_000;
-
-fn evidence_byte_span(
-    body: &str,
-    source_cursor: i64,
-    passage: &str,
-    evidence: &str,
-) -> Option<(i64, i64)> {
-    let cursor = usize::try_from(source_cursor).ok()?;
-    let prefix_bytes = body.chars().take(cursor).map(char::len_utf8).sum::<usize>();
-    let local_start = passage.find(evidence)?;
-    let start = i64::try_from(prefix_bytes.checked_add(local_start)?).ok()?;
-    let end =
-        i64::try_from(prefix_bytes.checked_add(local_start.checked_add(evidence.len())?)?).ok()?;
-    Some((start, end))
-}
 
 #[derive(Debug)]
 pub struct ResearchSource {
@@ -27,6 +10,33 @@ pub struct ResearchSource {
     pub passage: String,
     pub cursor: i64,
     pub next_cursor: i64,
+}
+
+struct RetainedSourceImport {
+    job_id: String,
+    title: String,
+    url: String,
+    body: String,
+}
+
+struct ClaimableResearchSource {
+    id: i64,
+    title: String,
+    url: String,
+    body: String,
+    cursor: i64,
+}
+
+struct ResearchSourceHarvestState {
+    body: String,
+    job_id: String,
+    cursor: i64,
+}
+
+struct ResearchSourceCandidateContext {
+    job_id: String,
+    provider: String,
+    query: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,6 +49,12 @@ pub struct RetainedClaim {
     pub qualifications: String,
     #[serde(default, alias = "confidence")]
     pub extraction_confidence: f64,
+}
+
+struct RetainedResearchQuestion {
+    id: i64,
+    source_id: i64,
+    question: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -62,18 +78,22 @@ pub struct ClaimPair {
     pub right: serde_json::Value,
 }
 
-fn now_ms() -> io::Result<i64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(io::Error::other)
-        .and_then(|duration| i64::try_from(duration.as_millis()).map_err(io::Error::other))
+struct RetainedClaimEvidence {
+    subject: String,
+    relation: String,
+    object: String,
+    quotation: String,
+    qualifications: String,
+    confidence: f64,
+    source_url: String,
+    source_id: i64,
+    byte_start: Option<i64>,
+    byte_end: Option<i64>,
+    content_hash: String,
 }
 
-fn bounded_field(value: &str, maximum: usize) -> bool {
-    !value.trim().is_empty()
-        && value.chars().count() <= maximum
-        && !value.chars().any(char::is_control)
-        && !value.contains("<|")
+fn now_ms() -> io::Result<i64> {
+    crate::storage::unix_time_ms_i64_with_overflow(io::Error::other)
 }
 
 fn semantic_subject_terms(subject: &str) -> Vec<String> {
@@ -128,19 +148,19 @@ impl LearningStore {
         ).map_err(database_error)?;
         let rows = statement
             .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
+                Ok(RetainedSourceImport {
+                    job_id: row.get(0)?,
+                    title: row.get(1)?,
+                    url: row.get(2)?,
+                    body: row.get(3)?,
+                })
             })
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
         drop(statement);
-        for (job, title, url, body) in rows {
-            self.retain_research_source(&job, &title, &url, &body)?;
+        for source in rows {
+            self.retain_research_source(&source.job_id, &source.title, &source.url, &source.body)?;
         }
         let after: i64 = self
             .connection
@@ -158,24 +178,30 @@ impl LearningStore {
         url: &str,
         body: &str,
     ) -> io::Result<()> {
-        let (job, provider, query): (String, String, String) = self
+        let source_context = self
             .connection
             .query_row(
                 "SELECT job_id,provider,query FROM scholar_search_candidates WHERE id=?1",
                 [candidate],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(ResearchSourceCandidateContext {
+                        job_id: row.get(0)?,
+                        provider: row.get(1)?,
+                        query: row.get(2)?,
+                    })
+                },
             )
             .map_err(database_error)?;
-        self.retain_research_source_with_metadata(
-            &job,
+        self.retain_research_source_with_metadata(super::super::ResearchSourceInput {
+            job_id: &source_context.job_id,
             title,
             url,
             body,
-            &provider,
-            "fetched_page_excerpt",
-            Some(&query),
-            None,
-        )
+            provider: &source_context.provider,
+            source_scope: "fetched_page_excerpt",
+            query: Some(&source_context.query),
+            published_at: None,
+        })
     }
 
     pub fn retain_research_source(
@@ -185,79 +211,51 @@ impl LearningStore {
         url: &str,
         body: &str,
     ) -> io::Result<()> {
-        self.retain_research_source_with_metadata(
-            job,
+        self.retain_research_source_with_metadata(super::super::ResearchSourceInput {
+            job_id: job,
             title,
             url,
             body,
-            "unknown",
-            "provided_excerpt",
-            None,
-            None,
-        )
+            provider: "unknown",
+            source_scope: "provided_excerpt",
+            query: None,
+            published_at: None,
+        })
     }
 
     pub fn retain_research_source_with_metadata(
         &self,
-        job: &str,
-        title: &str,
-        url: &str,
-        body: &str,
-        provider: &str,
-        source_scope: &str,
-        query: Option<&str>,
-        published_at: Option<&str>,
+        source: super::super::ResearchSourceInput<'_>,
     ) -> io::Result<()> {
-        let parsed = url::Url::parse(url).map_err(|_| invalid("invalid research source URL"))?;
+        let parsed =
+            url::Url::parse(source.url).map_err(|_| invalid("invalid research source URL"))?;
         if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
             return Err(invalid("invalid research source URL"));
         }
-        if body.trim().is_empty() {
+        if source.body.trim().is_empty() {
             return Ok(());
         }
-        let input_characters = body.chars().count();
-        let retained_body = body
-            .chars()
-            .take(MAX_RETAINED_SOURCE_CHARS)
-            .collect::<String>();
-        let retained_characters = retained_body.chars().count();
-        let truncated = input_characters > retained_characters;
-        let input_characters = i64::try_from(input_characters).map_err(io::Error::other)?;
-        let retained_characters = i64::try_from(retained_characters).map_err(io::Error::other)?;
-        let capture_status = if truncated {
-            "truncated"
-        } else if source_scope.contains("excerpt") || source_scope.contains("section") {
-            "excerpted"
-        } else {
-            "complete"
-        };
-        let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
-        self.connection
-            .execute(
-                "INSERT OR IGNORE INTO research_sources
-                (job_id,title,url,content_hash,body,created_at,source_scope,
-                 input_characters,retained_characters,truncated,provider,query,published_at,
-                 capture_status)
-             VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-                 ?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![
-                    job,
-                    title,
-                    url,
-                    hash,
-                    retained_body,
-                    source_scope,
-                    input_characters,
-                    retained_characters,
-                    truncated,
-                    provider,
-                    query,
-                    published_at,
-                    capture_status
-                ],
-            )
-            .map_err(database_error)?;
-        Ok(())
+        let retained = super::prepare_research_source(source.body, MAX_RETAINED_SOURCE_CHARS)?;
+        let capture_status =
+            super::research_source_capture_status(source.source_scope, retained.truncated);
+        super::insert_research_source(
+            &self.connection,
+            super::NewResearchSource {
+                job_id: source.job_id,
+                title: source.title,
+                url: source.url,
+                content_hash: &retained.content_hash,
+                body: &retained.body,
+                source_scope: source.source_scope,
+                input_characters: retained.input_characters,
+                retained_characters: retained.retained_characters,
+                truncated: retained.truncated,
+                provider: source.provider,
+                query: source.query,
+                published_at: source.published_at,
+                capture_status,
+            },
+        )
     }
 
     pub fn claim_research_source(&mut self) -> io::Result<Option<ResearchSource>> {
@@ -266,12 +264,33 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let row: Option<(i64,String,String,String,i64)> = tx.query_row(
-            "SELECT id,title,url,body,harvest_cursor FROM research_sources
-             WHERE harvest_cursor < length(body) AND claimed_until_ms <= ?1 AND next_attempt_at_ms <= ?1
-             ORDER BY id LIMIT 1",[now],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
-        ).optional().map_err(database_error)?;
-        let Some((id, title, url, body, cursor)) = row else {
+        let source = tx
+            .query_row(
+                "SELECT id, title, url, body, harvest_cursor FROM research_sources
+                 WHERE harvest_cursor < length(body)
+                   AND claimed_until_ms <= ?1 AND next_attempt_at_ms <= ?1
+                 ORDER BY id LIMIT 1",
+                [now],
+                |row| {
+                    Ok(ClaimableResearchSource {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        url: row.get(2)?,
+                        body: row.get(3)?,
+                        cursor: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some(ClaimableResearchSource {
+            id,
+            title,
+            url,
+            body,
+            cursor,
+        }) = source
+        else {
             return Ok(None);
         };
         let offset =
@@ -281,13 +300,12 @@ impl LearningStore {
             .skip(offset)
             .take(RESEARCH_HARVEST_CHUNK_CHARS)
             .collect::<String>();
-        if body.chars().count() > offset + passage.chars().count() {
-            if let Some(end) = passage
+        if body.chars().count() > offset + passage.chars().count()
+            && let Some(end) = passage
                 .rfind('\n')
                 .filter(|end| *end > RESEARCH_HARVEST_CHUNK_CHARS / 2)
-            {
-                passage.truncate(end + 1);
-            }
+        {
+            passage.truncate(end + 1);
         }
         let next_cursor =
             cursor + i64::try_from(passage.chars().count()).map_err(io::Error::other)?;
@@ -316,20 +334,27 @@ impl LearningStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(database_error)?;
-        let (body, job, cursor): (String, String, i64) = tx
+        let harvest_state = tx
             .query_row(
                 "SELECT body,job_id,harvest_cursor FROM research_sources WHERE id=?1",
                 [source.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok(ResearchSourceHarvestState {
+                        body: row.get(0)?,
+                        job_id: row.get(1)?,
+                        cursor: row.get(2)?,
+                    })
+                },
             )
             .map_err(database_error)?;
-        let offset =
-            usize::try_from(cursor).map_err(|_| invalid("invalid research source cursor"))?;
-        if cursor != source.cursor
+        let offset = usize::try_from(harvest_state.cursor)
+            .map_err(|_| invalid("invalid research source cursor"))?;
+        if harvest_state.cursor != source.cursor
             || source.next_cursor
                 != source.cursor
                     + i64::try_from(source.passage.chars().count()).map_err(io::Error::other)?
-            || body
+            || harvest_state
+                .body
                 .chars()
                 .skip(offset)
                 .take(source.passage.chars().count())
@@ -341,21 +366,26 @@ impl LearningStore {
         let mut claims = 0;
         let mut skipped_claims = 0;
         for claim in &baskets.claims {
-            if ![&claim.subject, &claim.relation, &claim.object]
-                .iter()
-                .all(|field| bounded_field(field, 500))
-                || claim.qualifications.chars().count() > 500
-                || claim.evidence_text.trim().is_empty()
-                || !source.passage.contains(&claim.evidence_text)
-                || !claim.extraction_confidence.is_finite()
-                || !(0.0..=1.0).contains(&claim.extraction_confidence)
+            if !crate::storage::valid_proposition_evidence(
+                &claim.subject,
+                &claim.relation,
+                &claim.object,
+                &claim.evidence_text,
+                &source.passage,
+            ) || claim.qualifications.chars().count() > 500
+                || !crate::storage::valid_confidence(claim.extraction_confidence)
             {
                 skipped_claims += 1;
                 continue;
             }
-            let Some((evidence_byte_start, evidence_byte_end)) =
-                evidence_byte_span(&body, source.cursor, &source.passage, &claim.evidence_text)
-            else {
+            let Some((evidence_byte_start, evidence_byte_end)) = super::evidence_byte_offsets_i64(
+                &harvest_state.body,
+                offset,
+                &source.passage,
+                &claim.evidence_text,
+            )
+            .ok()
+            .flatten() else {
                 skipped_claims += 1;
                 continue;
             };
@@ -366,16 +396,15 @@ impl LearningStore {
         let depth: i64 = tx
             .query_row(
                 "SELECT COALESCE(MAX(depth),0)+1 FROM research_questions WHERE scholar_job_id=?1",
-                [&job],
+                [&harvest_state.job_id],
                 |row| row.get(0),
             )
             .map_err(database_error)?;
         let mut questions = 0;
         let mut skipped_questions = 0;
         for question in &baskets.questions {
-            if !bounded_field(&question.question, 300)
-                || question.evidence_text.trim().is_empty()
-                || !source.passage.contains(&question.evidence_text)
+            if !crate::storage::valid_bounded_field(&question.question, 300)
+                || !crate::storage::valid_source_quote(&question.evidence_text, &source.passage)
             {
                 skipped_questions += 1;
                 continue;
@@ -387,12 +416,14 @@ impl LearningStore {
                 continue;
             }
             let key = canonical(&question.question);
-            let Some((evidence_byte_start, evidence_byte_end)) = evidence_byte_span(
-                &body,
-                source.cursor,
+            let Some((evidence_byte_start, evidence_byte_end)) = super::evidence_byte_offsets_i64(
+                &harvest_state.body,
+                offset,
                 &source.passage,
                 &question.evidence_text,
-            ) else {
+            )
+            .ok()
+            .flatten() else {
                 skipped_questions += 1;
                 continue;
             };
@@ -446,15 +477,35 @@ impl LearningStore {
         if queued >= 20 {
             return Ok(false);
         }
-        let question: Option<(i64,i64,String)> = self.connection.query_row("SELECT id,source_id,question FROM research_questions WHERE status='pending' ORDER BY id LIMIT 1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional().map_err(database_error)?;
-        let Some((id, source, question)) = question else {
+        let question = self
+            .connection
+            .query_row(
+                "SELECT id, source_id, question FROM research_questions
+                 WHERE status = 'pending' ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(RetainedResearchQuestion {
+                        id: row.get(0)?,
+                        source_id: row.get(1)?,
+                        question: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some(RetainedResearchQuestion {
+            id,
+            source_id,
+            question,
+        }) = question
+        else {
             return Ok(false);
         };
         let key = format!("source-question:{id}");
         if !self.enqueue_scout_research_with_reason(
             "expansion",
             &key,
-            &format!("source:{source}"),
+            &format!("source:{source_id}"),
             &question,
             "Retained source passage raises a grounded follow-up question",
         )? {
@@ -463,7 +514,7 @@ impl LearningStore {
         self.connection.execute("UPDATE research_questions SET status='queued',scholar_job_id=(SELECT scholar_job_id FROM scout_investigations WHERE trigger_kind='expansion' AND topic_key=?2 ORDER BY id DESC LIMIT 1) WHERE id=?1",params![id,key]).map_err(database_error)?;
         crate::diagnostics::event(
             "research.question_queued",
-            serde_json::json!({"question_id":id,"source_id":source}),
+            serde_json::json!({"question_id":id,"source_id":source_id}),
         );
         Ok(true)
     }
@@ -572,7 +623,7 @@ impl LearningStore {
         if !matches!(
             relation,
             "supports" | "contradicts" | "qualifies" | "unrelated" | "insufficient"
-        ) || !bounded_field(rationale, 500)
+        ) || !crate::storage::valid_bounded_field(rationale, 500)
         {
             return Err(invalid("invalid research evidence relationship"));
         }
@@ -591,8 +642,8 @@ impl LearningStore {
         reviewer: &str,
     ) -> io::Result<()> {
         if !matches!(relation, "same_subject" | "related_facts")
-            || !bounded_field(rationale, 500)
-            || !bounded_field(reviewer, 200)
+            || !crate::storage::valid_bounded_field(rationale, 500)
+            || !crate::storage::valid_bounded_field(reviewer, 200)
             || pair.left_id >= pair.right_id
         {
             return Err(invalid("invalid semantic claim relationship"));
@@ -621,14 +672,31 @@ impl LearningStore {
     }
 
     pub fn retained_claim_evidence(&self, id: i64) -> io::Result<serde_json::Value> {
-        let (subject,relation,object,quote,qualifications,confidence,url,source_id,start,end,hash): (String,String,String,String,String,f64,String,i64,Option<i64>,Option<i64>,String) = self.connection.query_row(
+        let claim = self.connection.query_row(
             "SELECT c.subject,c.relation,c.object,c.evidence_text,c.qualifications,c.extraction_confidence,s.url,s.id,c.evidence_byte_start,c.evidence_byte_end,s.content_hash
              FROM research_claims c JOIN research_sources s ON s.id=c.source_id WHERE c.id=?1",[id],
-            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,row.get(10)?)),
+            |row|Ok(RetainedClaimEvidence {
+                subject: row.get(0)?,
+                relation: row.get(1)?,
+                object: row.get(2)?,
+                quotation: row.get(3)?,
+                qualifications: row.get(4)?,
+                confidence: row.get(5)?,
+                source_url: row.get(6)?,
+                source_id: row.get(7)?,
+                byte_start: row.get(8)?,
+                byte_end: row.get(9)?,
+                content_hash: row.get(10)?,
+            }),
         ).map_err(database_error)?;
-        let mut statement = self.connection.prepare("SELECT l.relation,l.rationale,s.url,l.reviewer_model_id FROM research_evidence_links l
+        let mut statement = self.connection.prepare("SELECT l.relation,l.rationale,s.url,l.reviewer_model_id,1 FROM research_evidence_links l
             JOIN research_claims other ON other.id=CASE WHEN l.left_claim_id=?1 THEN l.right_claim_id ELSE l.left_claim_id END
-            JOIN research_sources s ON s.id=other.source_id WHERE (l.left_claim_id=?1 OR l.right_claim_id=?1) AND l.next_attempt_at_ms=0").map_err(database_error)?;
+            JOIN research_sources s ON s.id=other.source_id WHERE (l.left_claim_id=?1 OR l.right_claim_id=?1) AND l.next_attempt_at_ms=0
+            UNION ALL
+            SELECT r.relation,r.rationale,s.url,r.reviewer_model_id,0 FROM research_claim_relations r
+            JOIN research_claims other ON other.id=CASE WHEN r.left_claim_id=?1 THEN r.right_claim_id ELSE r.left_claim_id END
+            JOIN research_sources s ON s.id=other.source_id WHERE r.left_claim_id=?1 OR r.right_claim_id=?1
+            ORDER BY 5 DESC").map_err(database_error)?;
         let links = statement
             .query_map([id], |row| {
                 Ok((
@@ -636,6 +704,7 @@ impl LearningStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)? != 0,
                 ))
             })
             .map_err(database_error)?
@@ -648,40 +717,20 @@ impl LearningStore {
                 .unwrap_or_else(|| url.to_owned())
         };
         let mut groups = std::collections::HashMap::<String, u8>::new();
-        groups.insert(group(&url), 1);
+        groups.insert(group(&claim.source_url), 1);
         let mut relationships = Vec::new();
-        for (kind, rationale, url, reviewer) in links {
-            let bit = match kind.as_str() {
-                "supports" => 1,
-                "contradicts" => 2,
-                "qualifies" => 4,
-                _ => 0,
-            };
-            if bit > 0 {
-                *groups.entry(group(&url)).or_default() |= bit;
+        for (kind, rationale, url, reviewer, counts_toward_host_groups) in links {
+            if counts_toward_host_groups {
+                let bit = match kind.as_str() {
+                    "supports" => 1,
+                    "contradicts" => 2,
+                    "qualifies" => 4,
+                    _ => 0,
+                };
+                if bit > 0 {
+                    *groups.entry(group(&url)).or_default() |= bit;
+                }
             }
-            relationships.push(serde_json::json!({"relation":kind,"rationale":rationale,"source_url":url,"reviewer_model_id":reviewer}));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT r.relation,r.rationale,s.url,r.reviewer_model_id
-             FROM research_claim_relations r
-             JOIN research_claims other ON other.id=CASE WHEN r.left_claim_id=?1 THEN r.right_claim_id ELSE r.left_claim_id END
-             JOIN research_sources s ON s.id=other.source_id
-             WHERE r.left_claim_id=?1 OR r.right_claim_id=?1",
-        ).map_err(database_error)?;
-        let semantic_links = statement
-            .query_map([id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .map_err(database_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)?;
-        for (kind, rationale, url, reviewer) in semantic_links {
             relationships.push(serde_json::json!({"relation":kind,"rationale":rationale,"source_url":url,"reviewer_model_id":reviewer}));
         }
         let supporting = groups
@@ -697,10 +746,10 @@ impl LearningStore {
         let support_score =
             supporting as f64 / (supporting + contradicting + disputed + qualified + 2) as f64;
         Ok(
-            serde_json::json!({"id":id,"subject":subject,"relation":relation,"object":object,"evidence_text":quote,
-            "qualifications":qualifications,"extraction_confidence":confidence,"source_url":url,
-            "status":"unverified","source_archive_id":source_id,"source_content_hash":hash,
-            "evidence_byte_start":start,"evidence_byte_end":end,
+            serde_json::json!({"id":id,"subject":claim.subject,"relation":claim.relation,"object":claim.object,"evidence_text":claim.quotation,
+            "qualifications":claim.qualifications,"extraction_confidence":claim.confidence,"source_url":claim.source_url,
+            "status":"unverified","source_archive_id":claim.source_id,"source_content_hash":claim.content_hash,
+            "evidence_byte_start":claim.byte_start,"evidence_byte_end":claim.byte_end,
             "supporting_host_groups":supporting,"contradicting_host_groups":contradicting,
             "disputed_host_groups":disputed,"qualifying_host_groups":qualified,"provisional_support_score":support_score,
             "independence_verified":false,"relationships":relationships}),
@@ -751,9 +800,76 @@ impl LearningStore {
 mod tests {
     use super::*;
 
+    fn retained_claim(
+        subject: impl Into<String>,
+        relation: impl Into<String>,
+        object: impl Into<String>,
+        evidence_text: impl Into<String>,
+        extraction_confidence: f64,
+    ) -> RetainedClaim {
+        RetainedClaim {
+            subject: subject.into(),
+            relation: relation.into(),
+            object: object.into(),
+            evidence_text: evidence_text.into(),
+            qualifications: String::new(),
+            extraction_confidence,
+        }
+    }
+
+    fn retained_question(
+        question: impl Into<String>,
+        evidence_text: impl Into<String>,
+    ) -> RetainedQuestion {
+        RetainedQuestion {
+            question: question.into(),
+            evidence_text: evidence_text.into(),
+        }
+    }
+
+    fn claim_pair_ids(left_id: i64, right_id: i64) -> ClaimPair {
+        ClaimPair {
+            left_id,
+            right_id,
+            left: serde_json::Value::Null,
+            right: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn research_source_capture_status_preserves_scope_and_truncation() {
+        assert_eq!(
+            super::super::research_source_capture_status("full_page", false),
+            "complete"
+        );
+        assert_eq!(
+            super::super::research_source_capture_status("selected_section", false),
+            "excerpted"
+        );
+        assert_eq!(
+            super::super::research_source_capture_status("finding_source_excerpt", false),
+            "excerpted"
+        );
+        assert_eq!(
+            super::super::research_source_capture_status("full_page", true),
+            "truncated"
+        );
+    }
+
+    fn first_research_claim_span(store: &LearningStore) -> (i64, i64) {
+        store
+            .connection
+            .query_row(
+                "SELECT evidence_byte_start,evidence_byte_end FROM research_claims",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
     #[test]
     fn existing_excerpts_import_without_refetching_or_changing_review_status() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let plan = crate::research::ResearchPlan {
             question: "Where is the Amazon rainforest?".into(),
             queries: vec!["Amazon rainforest".into()],
@@ -784,7 +900,7 @@ mod tests {
 
     #[test]
     fn source_archive_records_truncation_unicode_counts_and_full_input_hash() {
-        let store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let store = crate::test_support::in_memory_learning_store();
         let plan = crate::research::ResearchPlan {
             question: "Describe the article".into(),
             queries: vec!["article".into()],
@@ -796,16 +912,16 @@ mod tests {
             .unwrap();
         let body = format!("{}tail-one", "🌱".repeat(MAX_RETAINED_SOURCE_CHARS));
         store
-            .retain_research_source_with_metadata(
-                &job,
-                "Article",
-                "https://example.org/article",
-                &body,
-                "wikipedia",
-                "selected_section",
-                Some("article query"),
-                Some("2026-09-30T00:00:00Z"),
-            )
+            .retain_research_source_with_metadata(super::super::ResearchSourceInput {
+                job_id: &job,
+                title: "Article",
+                url: "https://example.org/article",
+                body: &body,
+                provider: "wikipedia",
+                source_scope: "selected_section",
+                query: Some("article query"),
+                published_at: Some("2026-09-30T00:00:00Z"),
+            })
             .unwrap();
         let source_id: i64 = store
             .connection
@@ -827,16 +943,16 @@ mod tests {
 
         let changed_tail = format!("{}tail-two", "🌱".repeat(MAX_RETAINED_SOURCE_CHARS));
         store
-            .retain_research_source_with_metadata(
-                &job,
-                "Article",
-                "https://example.org/article",
-                &changed_tail,
-                "wikipedia",
-                "selected_section",
-                Some("article query"),
-                Some("2026-09-30T00:00:00Z"),
-            )
+            .retain_research_source_with_metadata(super::super::ResearchSourceInput {
+                job_id: &job,
+                title: "Article",
+                url: "https://example.org/article",
+                body: &changed_tail,
+                provider: "wikipedia",
+                source_scope: "selected_section",
+                query: Some("article query"),
+                published_at: Some("2026-09-30T00:00:00Z"),
+            })
             .unwrap();
         let versions: i64 = store
             .connection
@@ -874,7 +990,7 @@ mod tests {
 
     #[test]
     fn exhausted_source_is_preserved_and_only_resumes_after_explicit_retry() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let passage = "The observatory opened in 1974.";
         let source = source(&mut store, "https://example.org/observatory", passage);
         store
@@ -893,25 +1009,24 @@ mod tests {
 
     #[test]
     fn fact_shaped_false_assertions_are_retained_without_promotion() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let source = source(
             &mut store,
             "https://example.org/article",
             "The Amazon rainforest is made of chocolate.",
         );
         let baskets = ResearchBaskets {
-            claims: vec![RetainedClaim {
-                subject: "Amazon rainforest".into(),
-                relation: "is made of".into(),
-                object: "chocolate".into(),
-                evidence_text: source.passage.clone(),
-                qualifications: String::new(),
-                extraction_confidence: 0.9,
-            }],
-            questions: vec![RetainedQuestion {
-                question: "What materials form the Amazon rainforest?".into(),
-                evidence_text: source.passage.clone(),
-            }],
+            claims: vec![retained_claim(
+                "Amazon rainforest",
+                "is made of",
+                "chocolate",
+                source.passage.clone(),
+                0.9,
+            )],
+            questions: vec![retained_question(
+                "What materials form the Amazon rainforest?",
+                source.passage.clone(),
+            )],
         };
         assert_eq!(
             store.finish_research_baskets(&source, &baskets).unwrap(),
@@ -937,34 +1052,23 @@ mod tests {
 
     #[test]
     fn harvested_claim_and_question_offsets_point_to_exact_unicode_source_bytes() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let quote = "The Amazon rainforest is made of chocolate.";
         let body = format!("🌱🌱\n{quote}\nA second sentence.");
         let source = source(&mut store, "https://example.org/unicode", &body);
         let baskets = ResearchBaskets {
-            claims: vec![RetainedClaim {
-                subject: "Amazon rainforest".into(),
-                relation: "is made of".into(),
-                object: "chocolate".into(),
-                evidence_text: quote.into(),
-                qualifications: String::new(),
-                extraction_confidence: 0.9,
-            }],
-            questions: vec![RetainedQuestion {
-                question: "What material is named?".into(),
-                evidence_text: quote.into(),
-            }],
+            claims: vec![retained_claim(
+                "Amazon rainforest",
+                "is made of",
+                "chocolate",
+                quote,
+                0.9,
+            )],
+            questions: vec![retained_question("What material is named?", quote)],
         };
         store.finish_research_baskets(&source, &baskets).unwrap();
         let expected_start = i64::try_from("🌱🌱\n".len()).unwrap();
-        let (claim_start, claim_end): (i64, i64) = store
-            .connection
-            .query_row(
-                "SELECT evidence_byte_start,evidence_byte_end FROM research_claims",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let (claim_start, claim_end) = first_research_claim_span(&store);
         let (question_start, question_end): (i64, i64) = store
             .connection
             .query_row(
@@ -985,7 +1089,7 @@ mod tests {
 
     #[test]
     fn harvested_evidence_offsets_survive_a_source_chunk_boundary() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let fact = "The Amazon rainforest is in South America.";
         let body = format!("{}\n{fact}\nMore source text.", "x".repeat(990));
         let source = source(&mut store, "https://example.org/chunked", &body);
@@ -996,25 +1100,17 @@ mod tests {
         let next = store.claim_research_source().unwrap().unwrap();
         assert!(next.passage.contains(fact));
         let baskets = ResearchBaskets {
-            claims: vec![RetainedClaim {
-                subject: "Amazon rainforest".into(),
-                relation: "is in".into(),
-                object: "South America".into(),
-                evidence_text: fact.into(),
-                qualifications: String::new(),
-                extraction_confidence: 0.95,
-            }],
+            claims: vec![retained_claim(
+                "Amazon rainforest",
+                "is in",
+                "South America",
+                fact,
+                0.95,
+            )],
             questions: vec![],
         };
         store.finish_research_baskets(&next, &baskets).unwrap();
-        let (start, end): (i64, i64) = store
-            .connection
-            .query_row(
-                "SELECT evidence_byte_start,evidence_byte_end FROM research_claims",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let (start, end) = first_research_claim_span(&store);
         assert_eq!(
             &body.as_bytes()[start as usize..end as usize],
             fact.as_bytes()
@@ -1023,25 +1119,21 @@ mod tests {
 
     #[test]
     fn invalid_item_is_skipped_without_losing_valid_items_or_blocking_the_cursor() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let source = source(
             &mut store,
             "https://example.org/article",
             "The Amazon rainforest is in South America.",
         );
         let baskets = ResearchBaskets {
-            claims: vec![RetainedClaim {
-                subject: "Amazon rainforest".into(),
-                relation: "is in".into(),
-                object: "South America".into(),
-                evidence_text: source.passage.clone(),
-                qualifications: String::new(),
-                extraction_confidence: 0.9,
-            }],
-            questions: vec![RetainedQuestion {
-                question: "Why is it diverse?".into(),
-                evidence_text: "invented evidence".into(),
-            }],
+            claims: vec![retained_claim(
+                "Amazon rainforest",
+                "is in",
+                "South America",
+                source.passage.clone(),
+                0.9,
+            )],
+            questions: vec![retained_question("Why is it diverse?", "invented evidence")],
         };
         assert_eq!(
             store.finish_research_baskets(&source, &baskets).unwrap(),
@@ -1065,7 +1157,7 @@ mod tests {
 
     #[test]
     fn retained_content_is_idempotent_and_processed_in_bounded_chunks() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let passage = "A sourced assertion.\n".repeat(200);
         let first = source(&mut store, "https://example.org/article", &passage);
         assert!(first.passage.chars().count() <= RESEARCH_HARVEST_CHUNK_CHARS);
@@ -1080,15 +1172,15 @@ mod tests {
 
     #[test]
     fn retained_questions_deduplicate_and_respect_user_priority() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let text = "The Amazon rainforest is in South America.";
         let first = source(&mut store, "https://one.example/article", text);
         let baskets = ResearchBaskets {
             claims: vec![],
-            questions: vec![RetainedQuestion {
-                question: "Why is the Amazon rainforest biodiverse?".into(),
-                evidence_text: text.into(),
-            }],
+            questions: vec![retained_question(
+                "Why is the Amazon rainforest biodiverse?",
+                text,
+            )],
         };
         store.finish_research_baskets(&first, &baskets).unwrap();
         let second = source(&mut store, "https://two.example/article", text);
@@ -1127,7 +1219,7 @@ mod tests {
 
     #[test]
     fn research_priority_is_conversation_then_source_question_then_scout() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let text = "The Amazon rainforest is in South America.";
         let source = source(&mut store, "https://example.org/amazon", text);
         store
@@ -1135,10 +1227,10 @@ mod tests {
                 &source,
                 &ResearchBaskets {
                     claims: vec![],
-                    questions: vec![RetainedQuestion {
-                        question: "Why is the Amazon rainforest biodiverse?".into(),
-                        evidence_text: text.into(),
-                    }],
+                    questions: vec![retained_question(
+                        "Why is the Amazon rainforest biodiverse?",
+                        text,
+                    )],
                 },
             )
             .unwrap();
@@ -1200,7 +1292,7 @@ mod tests {
 
     #[test]
     fn overlapping_subjects_are_review_candidates_without_merging_claims() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         for (passage, subject, relation, object) in [
             (
                 "The Amazon rainforest is in South America.",
@@ -1220,14 +1312,7 @@ mod tests {
                 .finish_research_baskets(
                     &source,
                     &ResearchBaskets {
-                        claims: vec![RetainedClaim {
-                            subject: subject.into(),
-                            relation: relation.into(),
-                            object: object.into(),
-                            evidence_text: passage.into(),
-                            qualifications: String::new(),
-                            extraction_confidence: 0.9,
-                        }],
+                        claims: vec![retained_claim(subject, relation, object, passage, 0.9)],
                         questions: vec![],
                     },
                 )
@@ -1248,7 +1333,7 @@ mod tests {
 
     #[test]
     fn source_asserted_aliases_create_candidates_without_auto_merging_entities() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         for (passage, subject, relation, object) in [
             (
                 "Clark Kent is also known as Superman.",
@@ -1268,14 +1353,7 @@ mod tests {
                 .finish_research_baskets(
                     &source,
                     &ResearchBaskets {
-                        claims: vec![RetainedClaim {
-                            subject: subject.into(),
-                            relation: relation.into(),
-                            object: object.into(),
-                            evidence_text: passage.into(),
-                            qualifications: String::new(),
-                            extraction_confidence: 0.9,
-                        }],
+                        claims: vec![retained_claim(subject, relation, object, passage, 0.9)],
                         questions: vec![],
                     },
                 )
@@ -1297,7 +1375,7 @@ mod tests {
 
     #[test]
     fn support_counts_hosts_once_and_contradictions_lower_the_score() {
-        let mut store = LearningStore::open(Path::new(":memory:")).unwrap();
+        let mut store = crate::test_support::in_memory_learning_store();
         let mut ids = Vec::new();
         for (url, object) in [
             ("https://one.example/a", "South America"),
@@ -1308,14 +1386,13 @@ mod tests {
             let text = format!("The Amazon rainforest is in {object}.");
             let source = source(&mut store, url, &text);
             let baskets = ResearchBaskets {
-                claims: vec![RetainedClaim {
-                    subject: "Amazon rainforest".into(),
-                    relation: "is in".into(),
-                    object: object.into(),
-                    evidence_text: text,
-                    qualifications: String::new(),
-                    extraction_confidence: 0.98,
-                }],
+                claims: vec![retained_claim(
+                    "Amazon rainforest",
+                    "is in",
+                    object,
+                    text,
+                    0.98,
+                )],
                 questions: vec![],
             };
             store.finish_research_baskets(&source, &baskets).unwrap();
@@ -1330,12 +1407,7 @@ mod tests {
             ids.push(id);
         }
         for other in [ids[1], ids[2]] {
-            let pair = ClaimPair {
-                left_id: ids[0],
-                right_id: other,
-                left: serde_json::Value::Null,
-                right: serde_json::Value::Null,
-            };
+            let pair = claim_pair_ids(ids[0], other);
             store
                 .record_research_evidence_link(
                     &pair,
@@ -1350,12 +1422,7 @@ mod tests {
         assert_eq!(before["supporting_host_groups"], 2);
         store
             .record_research_claim_relation(
-                &ClaimPair {
-                    left_id: ids[0],
-                    right_id: ids[2],
-                    left: serde_json::Value::Null,
-                    right: serde_json::Value::Null,
-                },
+                &claim_pair_ids(ids[0], ids[2]),
                 "same_subject",
                 "Both claims identify the Amazon rainforest.",
                 "mock-reviewer",
@@ -1370,12 +1437,7 @@ mod tests {
                 .iter()
                 .any(|edge| edge["relation"] == "same_subject")
         );
-        let pair = ClaimPair {
-            left_id: ids[0],
-            right_id: ids[3],
-            left: serde_json::Value::Null,
-            right: serde_json::Value::Null,
-        };
+        let pair = claim_pair_ids(ids[0], ids[3]);
         store
             .record_research_evidence_link(
                 &pair,

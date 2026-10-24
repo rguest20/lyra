@@ -33,19 +33,15 @@ fn scope_mismatch_qualifies_an_overlapping_claim_without_challenging_it() {
             "Mars moons",
             "https://example.org/mars-moons",
             passage,
-            Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Mars".into(),
-                relation: "has moons".into(),
-                object: "two".into(),
-                evidence_text: passage.into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
-            }),
+            Some(scholar_finding(
+                "Mars",
+                "has moons",
+                "two",
+                passage,
+                0.99,
+                "reference",
+                None,
+            )),
             None,
             &ScholarSourceProfile::default(),
             "direct",
@@ -117,17 +113,17 @@ fn scholar_conflicts_depend_on_overlapping_claim_periods() {
             "https://en.wikipedia.org/wiki/Alex",
             excerpt,
             Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Alex".into(),
-                relation: "served as mayor in".into(),
-                object: "Town B".into(),
-                evidence_text: excerpt.into(),
-                confidence: 0.99,
                 valid_from: Some("2015-01-01".into()),
                 valid_until: Some("2020-01-01".into()),
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
+                ..scholar_finding(
+                    "Alex",
+                    "served as mayor in",
+                    "Town B",
+                    excerpt,
+                    0.99,
+                    "reference",
+                    None,
+                )
             }),
             None,
         )
@@ -161,17 +157,17 @@ fn scholar_conflicts_depend_on_overlapping_claim_periods() {
             "https://en.wikipedia.org/wiki/Alex#later",
             excerpt,
             Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Alex".into(),
-                relation: "served as mayor in".into(),
-                object: "Town C".into(),
-                evidence_text: excerpt.into(),
-                confidence: 0.99,
                 valid_from: Some("2019-01-01".into()),
                 valid_until: Some("2025-01-01".into()),
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
+                ..scholar_finding(
+                    "Alex",
+                    "served as mayor in",
+                    "Town C",
+                    excerpt,
+                    0.99,
+                    "reference",
+                    None,
+                )
             }),
             None,
         )
@@ -218,24 +214,11 @@ fn user_claims_with_disjoint_validity_periods_can_coexist() {
             .stage_observation("conversation-a", turn, text)
             .unwrap();
         store.claim_next_observation(600).unwrap().unwrap();
+        let mut candidate = candidate_claim("the user", "worked at", employer, text, 0.99);
+        candidate.valid_from = Some(valid_from.into());
+        candidate.valid_until = Some(valid_until.into());
         store
-            .finish_extraction(
-                &observation_id,
-                &[CandidateClaim {
-                    subject: "the user".into(),
-                    relation: "worked at".into(),
-                    object: employer.into(),
-                    evidence_text: text.into(),
-                    context_message_ids: Vec::new(),
-                    resolution: None,
-                    confidence: 0.99,
-                    status: "proposed".into(),
-                    decision_reason: None,
-                    valid_from: Some(valid_from.into()),
-                    valid_until: Some(valid_until.into()),
-                }],
-                None,
-            )
+            .finish_extraction(&observation_id, &[candidate], None)
             .unwrap();
     }
     let path = temp_path();
@@ -337,19 +320,7 @@ fn reviewed_entity_aliases_share_claim_sources_and_detect_conflicts_after_restar
         store
             .finish_extraction(
                 &id,
-                &[CandidateClaim {
-                    subject: subject.into(),
-                    relation: "is based in".into(),
-                    object: object.into(),
-                    evidence_text: text,
-                    context_message_ids: Vec::new(),
-                    resolution: None,
-                    confidence: 0.98,
-                    status: "proposed".into(),
-                    decision_reason: None,
-                    valid_from: None,
-                    valid_until: None,
-                }],
+                &[candidate_claim(subject, "is based in", object, &text, 0.98)],
                 None,
             )
             .unwrap();
@@ -400,17 +371,9 @@ fn non_overlapping_claim_periods_are_not_linked_as_contradictions() {
             "https://example.org/mars-2022",
             passage,
             Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Mars".into(),
-                relation: "has moons".into(),
-                object: "two".into(),
-                evidence_text: passage.into(),
-                confidence: 0.99,
                 valid_from: Some("2022-01-01".into()),
                 valid_until: Some("2022-12-31".into()),
-                source_quality: "reference".into(),
-                source_updated_at: None,
-                proposition: Default::default(),
+                ..scholar_finding("Mars", "has moons", "two", passage, 0.99, "reference", None)
             }),
             None,
             &ScholarSourceProfile::default(),
@@ -483,21 +446,12 @@ fn geographic_and_context_scope_mismatches_are_recorded_as_unresolved() {
                 &format!("https://example.org/scoped-{index}"),
                 passage,
                 Some(ScholarFinding {
-                    semantic_support: None,
-                    subject: subject.into(),
-                    relation: relation.into(),
-                    object: object.into(),
-                    evidence_text: passage.into(),
-                    confidence: 0.99,
-                    valid_from: None,
-                    valid_until: None,
-                    source_quality: "reference".into(),
-                    source_updated_at: None,
                     proposition: PropositionMetadata {
                         geographic_scope: geo.map(str::to_owned),
                         context_scope: context.map(str::to_owned),
                         ..PropositionMetadata::default()
                     },
+                    ..scholar_finding(subject, relation, object, passage, 0.99, "reference", None)
                 }),
                 None,
                 &ScholarSourceProfile::default(),
@@ -506,8 +460,8 @@ fn geographic_and_context_scope_mismatches_are_recorded_as_unresolved() {
             .unwrap();
         let finding_id = store.scholar_findings(&job.id).unwrap()[0].id;
         let stored_finding = store.scholar_findings(&job.id).unwrap().remove(0);
-        assert_eq!(stored_finding.geographic_scope.as_deref(), geo);
-        assert_eq!(stored_finding.context_scope.as_deref(), context);
+        assert_eq!(stored_finding.proposition.geographic_scope.as_deref(), geo);
+        assert_eq!(stored_finding.proposition.context_scope.as_deref(), context);
         let links: Vec<(String, String)> = store
             .connection
             .prepare(
@@ -585,20 +539,19 @@ fn scoped_identity_links_match_claims_only_within_their_exact_context() {
             "https://example.org/earth-one-birthplace",
             passage,
             Some(ScholarFinding {
-                semantic_support: None,
-                subject: "Superman".into(),
-                relation: "was born on".into(),
-                object: "Krypton".into(),
-                evidence_text: passage.into(),
-                confidence: 0.99,
-                valid_from: None,
-                valid_until: None,
-                source_quality: "reference".into(),
-                source_updated_at: None,
                 proposition: PropositionMetadata {
                     context_scope: Some("Earth-One universe".into()),
                     ..PropositionMetadata::default()
                 },
+                ..scholar_finding(
+                    "Superman",
+                    "was born on",
+                    "Krypton",
+                    passage,
+                    0.99,
+                    "reference",
+                    None,
+                )
             }),
             None,
             &ScholarSourceProfile::default(),

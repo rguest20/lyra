@@ -2,6 +2,82 @@
 
 use super::*;
 
+struct FeedbackSessionState {
+    attempts: i64,
+    status: String,
+    last_reason: String,
+}
+
+struct FeedbackTaskSummary {
+    id: i64,
+    route: String,
+    exclusion_reason: Option<String>,
+}
+
+impl FeedbackTaskSummary {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            route: row.get(1)?,
+            exclusion_reason: row.get(2)?,
+        })
+    }
+}
+
+impl FeedbackSessionState {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            attempts: row.get(0)?,
+            status: row.get(1)?,
+            last_reason: row.get(2)?,
+        })
+    }
+}
+
+fn feedback_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScholarFeedbackTask> {
+    Ok(ScholarFeedbackTask {
+        id: row.get(0)?,
+        finding_id: row.get(1)?,
+        root_finding_id: row.get(2)?,
+        attempt: row.get(3)?,
+        guidance: row.get(4)?,
+        job_id: row.get(5)?,
+        question: row.get(6)?,
+        source_title: row.get(7)?,
+        source_url: row.get(8)?,
+        source_excerpt: row.get(9)?,
+        source_quality: row.get(10)?,
+        source_updated_at: row.get(11)?,
+        rejected_claim: row.get(12)?,
+        suggested_evidence: row.get(13)?,
+        exclusion_reason: row.get(14)?,
+    })
+}
+
+fn root_finding_id(connection: &Connection, finding_id: i64) -> io::Result<i64> {
+    connection
+        .query_row(
+            "SELECT coalesce((SELECT root_finding_id FROM scholar_research_feedback WHERE scholar_job_id = f.job_id), f.id)
+             FROM scholar_findings f WHERE f.id = ?1",
+            [finding_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+fn feedback_session_state(
+    connection: &Connection,
+    root_finding_id: i64,
+) -> io::Result<FeedbackSessionState> {
+    connection
+        .query_row(
+            "SELECT attempts, status, last_reason FROM scholar_feedback_sessions WHERE root_finding_id = ?1",
+            [root_finding_id],
+            FeedbackSessionState::from_row,
+        )
+        .map_err(database_error)
+}
+
 pub(super) fn queue_feedback(
     tx: &Transaction<'_>,
     finding_id: i64,
@@ -30,10 +106,7 @@ pub(super) fn queue_feedback(
                 |row| row.get(0),
             )
             .map_err(database_error)?;
-        if evidence.trim().is_empty()
-            || evidence.chars().count() > 1500
-            || !passage.contains(evidence)
-        {
+        if !crate::storage::valid_exact_quote(evidence, &passage, 1500) {
             return Err(invalid(
                 "suggested evidence must be an exact span of 1–1500 characters from the source passage",
             ));
@@ -49,26 +122,17 @@ pub(super) fn queue_feedback(
     {
         return Ok(());
     }
-    let root: i64 = tx.query_row(
-        "SELECT coalesce((SELECT root_finding_id FROM scholar_research_feedback WHERE scholar_job_id = f.job_id), f.id)
-         FROM scholar_findings f WHERE f.id = ?1", [finding_id], |row| row.get(0),
-    ).map_err(database_error)?;
+    let root = root_finding_id(tx, finding_id)?;
     tx.execute(
         "INSERT OR IGNORE INTO scholar_feedback_sessions VALUES (?1, 1, 'active', ?2)",
         params![root, guidance],
     )
     .map_err(database_error)?;
-    let (attempts, status): (i64, String) = tx
-        .query_row(
-            "SELECT attempts, status FROM scholar_feedback_sessions WHERE root_finding_id = ?1",
-            [root],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(database_error)?;
-    if status != "active" {
+    let session = feedback_session_state(tx, root)?;
+    if session.status != "active" {
         return Ok(());
     }
-    if attempts >= 3 {
+    if session.attempts >= 3 {
         tx.execute("UPDATE scholar_feedback_sessions SET status = 'exhausted', last_reason = ?2 WHERE root_finding_id = ?1", params![root, guidance]).map_err(database_error)?;
         return Ok(());
     }
@@ -76,32 +140,28 @@ pub(super) fn queue_feedback(
     tx.execute(
         "INSERT INTO scholar_research_feedback (trigger_key, finding_id, root_finding_id, attempt, route, guidance, status, created_at, exclusion_reason, suggested_evidence)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?7, ?8)",
-        params![trigger_key, finding_id, root, attempts + 1, route, guidance, exclusion_reason, suggested_evidence],
+        params![trigger_key, finding_id, root, session.attempts + 1, route, guidance, exclusion_reason, suggested_evidence],
     ).map_err(database_error)?;
     Ok(())
 }
 
 impl LearningStore {
     pub fn log_scholar_feedback(&self, finding_id: i64) -> io::Result<()> {
-        let root: i64 = self.connection.query_row(
-            "SELECT coalesce((SELECT root_finding_id FROM scholar_research_feedback WHERE scholar_job_id = f.job_id), f.id) FROM scholar_findings f WHERE f.id = ?1",
-            [finding_id], |row| row.get(0),
-        ).map_err(database_error)?;
-        let (attempts, status, guidance): (i64, String, String) = self.connection.query_row(
-            "SELECT attempts, status, last_reason FROM scholar_feedback_sessions WHERE root_finding_id = ?1", [root], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).map_err(database_error)?;
-        let task: Option<(i64, String, Option<String>)> = self.connection.query_row(
+        let root = root_finding_id(&self.connection, finding_id)?;
+        let session = feedback_session_state(&self.connection, root)?;
+        let task: Option<FeedbackTaskSummary> = self.connection.query_row(
             "SELECT id, route, exclusion_reason FROM scholar_research_feedback WHERE root_finding_id = ?1 ORDER BY attempt DESC LIMIT 1", [root],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            FeedbackTaskSummary::from_row,
         ).optional().map_err(database_error)?;
         crate::diagnostics::event(
             "scholar.research_feedback",
             serde_json::json!({
-                "finding_id": finding_id, "root_finding_id": root, "attempt": attempts,
-                "max_attempts": 3, "status": status, "guidance": guidance,
-                "feedback_id": task.as_ref().map(|task| task.0), "route": task.as_ref().map(|task| task.1.as_str()),
-                "exclusion_reason": task.as_ref().and_then(|task| task.2.as_deref()),
-                "outcome": if status == "exhausted" { "attempt_budget_exhausted" } else { "feedback_queued" },
+                "finding_id": finding_id, "root_finding_id": root, "attempt": session.attempts,
+                "max_attempts": 3, "status": session.status, "guidance": session.last_reason,
+                "feedback_id": task.as_ref().map(|task| task.id),
+                "route": task.as_ref().map(|task| task.route.as_str()),
+                "exclusion_reason": task.as_ref().and_then(|task| task.exclusion_reason.as_deref()),
+                "outcome": if session.status == "exhausted" { "attempt_budget_exhausted" } else { "feedback_queued" },
             }),
         );
         Ok(())
@@ -126,9 +186,7 @@ impl LearningStore {
         let job_id = match existing_job {
             Some(job) => job,
             None => {
-                let job: String = tx
-                    .query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))
-                    .map_err(database_error)?;
+                let job = super::new_scholar_job_id(&tx)?;
                 tx.execute(
                     "INSERT INTO scholar_jobs (id, conversation_id, turn_number, question, status, created_at)
                      SELECT ?2, 'feedback:' || ?2, 0, j.question, 'pending', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -140,7 +198,7 @@ impl LearningStore {
         };
         tx.execute("UPDATE scholar_research_feedback SET status = ?2, scholar_job_id = ?3, claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1", params![id, if route == "repair" { "processing" } else { "queued" }, job_id]).map_err(database_error)?;
         if route == "repair" {
-            tx.execute("UPDATE scholar_jobs SET status = 'processing', claimed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), attempts = attempts + 1 WHERE id = ?1", [&job_id]).map_err(database_error)?;
+            mark_scholar_job_processing(&tx, &job_id)?;
         }
         tx.commit().map_err(database_error)?;
         self.scholar_feedback_for_job(&job_id)
@@ -156,7 +214,7 @@ impl LearningStore {
                     f.subject || ' ' || f.relation || ' ' || f.object, r.suggested_evidence, r.exclusion_reason
              FROM scholar_research_feedback r JOIN scholar_findings f ON f.id = r.finding_id
              JOIN scholar_jobs j ON j.id = r.scholar_job_id WHERE r.scholar_job_id = ?1", [job_id],
-            |row| Ok(ScholarFeedbackTask { id: row.get(0)?, finding_id: row.get(1)?, root_finding_id: row.get(2)?, attempt: row.get(3)?, guidance: row.get(4)?, job_id: row.get(5)?, question: row.get(6)?, source_title: row.get(7)?, source_url: row.get(8)?, source_excerpt: row.get(9)?, source_quality: row.get(10)?, source_updated_at: row.get(11)?, rejected_claim: row.get(12)?, suggested_evidence: row.get(13)?, exclusion_reason: row.get(14)? }),
+            feedback_task_from_row,
         ).optional().map_err(database_error)
     }
 
@@ -221,15 +279,15 @@ impl LearningStore {
              WHERE r.status IN ('processing', 'queued') AND j.status NOT IN ('pending', 'processing') ORDER BY r.id LIMIT 1",
             [], |row| row.get(0),
         ).optional().map_err(database_error)?;
-        if let Some(job) = job {
-            if let Some(task) = self.scholar_feedback_for_job(&job)? {
-                let found = !self.scholar_findings(&job)?.is_empty();
-                self.finish_scholar_feedback(
-                    &task,
-                    found,
-                    "recovered completed research after interruption",
-                )?;
-            }
+        if let Some(job) = job
+            && let Some(task) = self.scholar_feedback_for_job(&job)?
+        {
+            let found = !self.scholar_findings(&job)?.is_empty();
+            self.finish_scholar_feedback(
+                &task,
+                found,
+                "recovered completed research after interruption",
+            )?;
         }
         Ok(())
     }

@@ -90,11 +90,7 @@ impl LearningStore {
             return Err(invalid("invalid entity identity link"));
         }
         if alias.identity_scope.as_deref().is_some_and(|scope| {
-            scope.trim().is_empty()
-                || scope.chars().count() > 240
-                || scope.chars().any(char::is_control)
-                || !passage.contains(scope)
-                || !finding.evidence_text.contains(scope)
+            !crate::storage::valid_quoted_scope(scope, passage, &finding.evidence_text)
         }) {
             return Err(invalid("identity scope must be an exact source quotation"));
         }
