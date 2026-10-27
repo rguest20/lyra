@@ -1,5 +1,52 @@
 //! Storage regressions for source review.
 use super::*;
+use crate::storage::ScholarReviewCaveat;
+
+#[test]
+fn accepted_review_caveats_survive_retrieval_with_source_and_question_binding() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research("caveated-review", 1, "Is the device used in Norway?")
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    let passage = "The device is used in Norway.";
+    store
+        .finish_scholar_job(
+            &job.id,
+            "Device report",
+            "https://example.org/device",
+            passage,
+            Some(scholar_finding(
+                "The device",
+                "is used in",
+                "Norway",
+                passage,
+                0.99,
+                "unknown",
+                None,
+            )),
+            None,
+        )
+        .unwrap();
+    let finding_id = store.scholar_findings(&job.id).unwrap()[0].id;
+    let caveat = ScholarReviewCaveat {
+        statement:
+            "The question's Norway-specific scope is not independently confirmed by another source."
+                .into(),
+        applies_to: "Norway".into(),
+        basis: "question_scope".into(),
+        evidence_text: None,
+    };
+    store
+        .record_scholar_review_caveats(finding_id, std::slice::from_ref(&caveat))
+        .unwrap();
+    let candidates = store.scholar_evidence_candidates(false).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].review_caveats, vec![caveat]);
+    assert!(store.active_semantic_claims().unwrap().is_empty());
+    let _ = std::fs::remove_file(path);
+}
 
 #[test]
 fn scholar_task_target_keeps_search_history_and_a_bounded_stop_reason() {

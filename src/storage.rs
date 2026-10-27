@@ -834,6 +834,15 @@ pub struct ScholarEvidenceForAnswer {
     pub independence_verified: bool,
     pub published_at: Option<String>,
     pub conflicting_claims: Vec<String>,
+    pub review_caveats: Vec<ScholarReviewCaveat>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ScholarReviewCaveat {
+    pub statement: String,
+    pub applies_to: String,
+    pub basis: String,
+    pub evidence_text: Option<String>,
 }
 
 impl std::ops::Deref for StoredScholarFinding {
@@ -1393,6 +1402,40 @@ pub(crate) fn valid_quoted_field(value: &str, evidence_text: &str, maximum_chars
 
 pub(crate) fn valid_exact_quote(quote: &str, source_text: &str, maximum_chars: usize) -> bool {
     valid_source_quote(quote, source_text) && quote.chars().count() <= maximum_chars
+}
+
+pub(crate) fn validate_scholar_review_caveats(
+    caveats: &[ScholarReviewCaveat],
+    question: &str,
+    source_text: &str,
+) -> io::Result<()> {
+    if caveats.len() > 4 {
+        return Err(invalid("at most four material review caveats are allowed"));
+    }
+    for caveat in caveats {
+        if !valid_bounded_field(&caveat.statement, 300)
+            || !valid_bounded_field(&caveat.applies_to, 200)
+        {
+            return Err(invalid(
+                "review caveat statement and scope must be bounded printable text",
+            ));
+        }
+        match caveat.basis.as_str() {
+            "source_quote"
+                if caveat
+                    .evidence_text
+                    .as_deref()
+                    .is_some_and(|quote| valid_exact_quote(quote, source_text, 1500)) => {}
+            "question_scope"
+                if caveat.evidence_text.is_none() && question.contains(&caveat.applies_to) => {}
+            _ => {
+                return Err(invalid(
+                    "review caveat needs an exact source quote or an open scope named in the question",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn valid_source_quote(quote: &str, source_text: &str) -> bool {

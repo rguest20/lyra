@@ -532,6 +532,51 @@ fn grounding_rewrites_metadata_even_when_fact_reviewer_accepts_the_draft() {
 }
 
 #[test]
+fn reviewed_caveats_reach_answer_generation_and_are_kept_beside_the_claim() {
+    let caveat = json!({
+        "statement":"Operation outside Norway remains unknown.",
+        "applies_to":"Finland",
+        "basis":"question_scope",
+        "evidence_text":null
+    });
+    let evidence = vec![json!({
+        "source":"https://example.org/device",
+        "passage":"The device is used in Norway.",
+        "evidence_state":{
+            "finding_status":"needs_review",
+            "gate_status":"awaiting_corroboration",
+            "review_caveats":[caveat]
+        }
+    })];
+    let view = model_answer_evidence("Does the device work in Finland?", &evidence, None);
+    assert_eq!(view[0]["review_caveats"][0]["applies_to"], "Finland");
+    assert_eq!(
+        view[0]["review_caveats"][0]["statement"],
+        "Operation outside Norway remains unknown."
+    );
+
+    let mut calls = 0;
+    let draft =
+        "The source says the device is used in Norway. Its operation in Finland is unknown.";
+    let answer = ground_research_reply(
+        "Does the device work in Finland?",
+        draft,
+        &evidence,
+        |prompt| {
+            calls += 1;
+            assert!(prompt.contains("Operation outside Norway remains unknown."));
+            assert!(prompt.contains("Finland"));
+            Ok(json!({"verdict":"accept","supported":true,"addresses_request":true,
+                "reason":"The answer keeps the supported location and unresolved requested scope together."}).to_string())
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert!(answer.contains("used in Norway"));
+    assert!(answer.contains("operation in Finland is unknown"));
+}
+
+#[test]
 fn answer_generator_gets_qualification_codes_and_shared_lineage_without_internal_scores() {
     let evidence = vec![
         json!({"source":"https://one.example/story","passage":"Aurora Observatory opened in 2001.",

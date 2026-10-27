@@ -135,7 +135,8 @@ pub(super) fn assess_draft(
         assessment.reason = feedback;
     }
 
-    let unsupported_entity = super::structure::unsupported_entity_name(review_answer, evidence);
+    let unsupported_entity =
+        super::structure::unsupported_entity_name_for_request(question, review_answer, evidence);
     let altered_conjunction = super::structure::altered_source_conjunction(review_answer, evidence);
     let unsupported_causal_join =
         super::structure::unsupported_causal_join(review_answer, evidence);

@@ -31,6 +31,18 @@ pub(super) fn unsupported_entity_name(answer: &str, evidence: &[Value]) -> Optio
         })
 }
 
+pub(super) fn unsupported_entity_name_for_request(
+    question: &str,
+    answer: &str,
+    evidence: &[Value],
+) -> Option<String> {
+    let requested = normalized_words(question);
+    unsupported_entity_name(answer, evidence).filter(|name| {
+        let words = normalized_words(name);
+        !words.is_empty() && !requested.windows(words.len()).any(|window| window == words)
+    })
+}
+
 // A generated citation such as "(Source 2)" is a reference to an evidence
 // slot, not a newly asserted named entity.
 fn is_numbered_source_reference(answer: &str, label: &str, source_count: usize) -> bool {

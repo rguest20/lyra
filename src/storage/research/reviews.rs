@@ -94,6 +94,34 @@ struct SourceOriginFinding {
 }
 
 impl LearningStore {
+    pub fn record_scholar_review_caveats(
+        &self,
+        finding_id: i64,
+        caveats: &[crate::storage::ScholarReviewCaveat],
+    ) -> io::Result<()> {
+        let (question, passage, status): (String, String, String) = self
+            .connection
+            .query_row(
+                "SELECT j.question,f.source_excerpt,f.status FROM scholar_findings f
+             JOIN scholar_jobs j ON j.id=f.job_id WHERE f.id=?1",
+                [finding_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(database_error)?;
+        if status != "needs_review" {
+            return Err(invalid(
+                "review caveats can only be recorded on a pending finding",
+            ));
+        }
+        crate::storage::validate_scholar_review_caveats(caveats, &question, &passage)?;
+        let serialized = serde_json::to_string(caveats).map_err(invalid_json)?;
+        self.connection.execute(
+            "UPDATE scholar_findings SET review_caveats_json=?2 WHERE id=?1 AND status='needs_review'",
+            params![finding_id,serialized],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
     pub fn review_scholar_source_expertise(
         &mut self,
         finding_id: i64,

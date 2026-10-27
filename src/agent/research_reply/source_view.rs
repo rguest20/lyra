@@ -1,5 +1,5 @@
 //! Model-facing quotations and material source-use restrictions.
-use crate::storage::ScholarEvidenceForAnswer;
+use crate::storage::{ScholarEvidenceForAnswer, ScholarReviewCaveat};
 use serde_json::{Value, json};
 
 pub(super) const SOURCE_SCOPE_FIELDS: [(&str, &str); 3] = [
@@ -29,6 +29,7 @@ pub(super) struct SourceUseEvidence<'a> {
     pub polarity: Option<&'a str>,
     pub modality: Option<&'a str>,
     pub conflicting_claims: Vec<&'a str>,
+    pub review_caveats: Vec<ScholarReviewCaveat>,
 }
 
 impl<'a> SourceUseEvidence<'a> {
@@ -55,6 +56,7 @@ impl<'a> SourceUseEvidence<'a> {
                 .iter()
                 .map(String::as_str)
                 .collect(),
+            review_caveats: finding.review_caveats.clone(),
         }
     }
 
@@ -84,6 +86,8 @@ impl<'a> SourceUseEvidence<'a> {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect(),
+            review_caveats: serde_json::from_value(state["review_caveats"].clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -198,6 +202,7 @@ pub(super) fn model_answer_source_use(
                 },
                 "source_date": entry.published_at,
                 "possible_disagreements": disagreements,
+                "review_caveats": entry.review_caveats,
             });
             view.as_object_mut().unwrap().retain(|field, _| match field.as_str() {
                 "possible_disagreements" => !disagreements.is_empty(),

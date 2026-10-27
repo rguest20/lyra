@@ -264,6 +264,7 @@ impl LearningStore {
                     a.research_relevance, a.topic_class, a.source_kind, f.freshness,
                     a.currency, a.direct_support, a.independence_key,
                     a.independence_verified, a.published_at,
+                    f.review_caveats_json,
                     ROW_NUMBER() OVER (PARTITION BY f.status ORDER BY f.id DESC) AS status_rank,
                     COALESCE((SELECT json_group_array(subject || ' ' || relation || ' ' || object ||
                         ' [valid ' || COALESCE(valid_from, 'unknown start') || ' to ' ||
@@ -291,7 +292,7 @@ impl LearningStore {
                     geographic_scope, context_scope, evidence_text, confidence, finding_status,
                     gate_status, reason, research_relevance, topic_class, source_kind, freshness,
                     currency, direct_support, independence_key, independence_verified,
-                    published_at, conflicting_claims
+                    published_at, conflicting_claims, review_caveats_json
                  FROM candidates
                  WHERE (?2 = 0 OR status_rank <= 500)
                  ORDER BY id DESC
@@ -324,6 +325,15 @@ impl LearningStore {
                         published_at: row.get(26)?,
                         conflicting_claims: serde_json::from_str(&row.get::<_, String>(27)?)
                             .unwrap_or_default(),
+                        review_caveats: serde_json::from_str(&row.get::<_, String>(28)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    28,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
                     })
                 },
             )
