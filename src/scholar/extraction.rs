@@ -110,7 +110,6 @@ pub(crate) fn extract_scholar_claim_with(
         source_updated_at: source_updated_at.as_deref(),
         guidance,
     };
-    let attempt = property_repair::repair_property_mismatch(&context, attempt, &mut generate);
     let initial_status = attempt.status;
     let initial_reason = attempt.reason.clone();
     let selected_passage_chars = excerpt.chars().count();
@@ -201,6 +200,10 @@ pub(crate) fn extract_scholar_claim_with(
     } else {
         attempt
     };
+    // Run the property gate after every bounded extraction attempt. A generic
+    // repair must not be able to replace a rejected candidate without being
+    // checked against the original request as well.
+    let attempt = property_repair::repair_property_mismatch(&context, attempt, &mut generate);
     crate::diagnostics::event(
         "scholar.extraction_decision",
         serde_json::json!({

@@ -19,11 +19,12 @@ pub(super) fn repair_property_mismatch(
     let review = match requested_property_match(question, &finding, excerpt, &mut *ask) {
         Ok(review) => review,
         Err(error) => {
+            let reason = format!("requested-property review failed: {error}");
             crate::diagnostics::event(
                 "scholar.extraction_property_review_failed",
-                serde_json::json!({"source_title":source_title,"error":error.to_string()}),
+                serde_json::json!({"source_title":source_title,"error":error.to_string(),"candidate_retained_for_diagnosis":true}),
             );
-            return original;
+            return unresolved(original, reason);
         }
     };
     if review.0 {
@@ -81,7 +82,10 @@ pub(super) fn repair_property_mismatch(
                 "scholar.extraction_property_repair_failed",
                 serde_json::json!({"source_title":source_title,"error":error.to_string()}),
             );
-            return original;
+            return unresolved(
+                original,
+                format!("requested-property repair failed: {error}"),
+            );
         }
     };
     let Some(repaired_finding) = repaired.finding.as_ref() else {
@@ -89,7 +93,13 @@ pub(super) fn repair_property_mismatch(
             "scholar.extraction_property_repair_rejected",
             serde_json::json!({"source_title":source_title,"status":repaired.status,"reason":repaired.reason}),
         );
-        return original;
+        return unresolved(
+            original,
+            format!(
+                "requested-property repair did not produce a reviewed finding: {}",
+                repaired.reason
+            ),
+        );
     };
     match requested_property_match(question, repaired_finding, excerpt, &mut *ask) {
         Ok((true, reason)) => {
@@ -109,16 +119,27 @@ pub(super) fn repair_property_mismatch(
                 "scholar.extraction_property_repair_rejected",
                 serde_json::json!({"source_title":source_title,"status":repaired.status,"reason":reason}),
             );
-            original
+            unresolved(
+                original,
+                format!("requested-property repair was rejected: {reason}"),
+            )
         }
         Err(error) => {
+            let reason = format!("repaired requested-property review failed: {error}");
             crate::diagnostics::event(
                 "scholar.extraction_property_review_failed",
-                serde_json::json!({"source_title":source_title,"repair_review":true,"error":error.to_string()}),
+                serde_json::json!({"source_title":source_title,"repair_review":true,"error":error.to_string(),"candidate_retained_for_diagnosis":true}),
             );
-            original
+            unresolved(original, reason)
         }
     }
+}
+
+fn unresolved(mut attempt: ExtractionAttempt, reason: String) -> ExtractionAttempt {
+    attempt.finding = None;
+    attempt.status = "ungrounded";
+    attempt.reason = reason;
+    attempt
 }
 
 pub(super) fn rank_property_spans(question: &str, subject: &str, excerpt: &str) -> String {

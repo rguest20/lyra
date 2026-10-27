@@ -37,12 +37,13 @@ fn unsupported_source_reference_requires_a_reviewed_repair() {
                     serde_json::json!({"claim":{"subject":"Exact dates","relation":"cannot be","object":"accurately determined","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
                 }
                 5 | 6 => serde_json::json!({"verdict":"entailed","reason":"The source states this uncertainty directly.","evidence_text":passage}).to_string(),
+                7 => serde_json::json!({"matches_property":true,"reason":"The claim directly states whether exact dates can be determined."}).to_string(),
                 _ => panic!("repair must remain bounded"),
             })
         },
     );
     assert_eq!(attempt.status, "accepted", "{}", attempt.reason);
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 7);
     let finding = attempt.finding.unwrap();
     assert_eq!(finding.relation, "cannot be");
     assert_eq!(finding.object, "accurately determined");
@@ -190,12 +191,13 @@ fn rejected_list_claim_recovers_through_a_bounded_semantic_repair() {
                 }
                 5 => serde_json::json!({"verdict":"entailed","reason":"The source names both birds as members of the recorded list.","evidence_text":passage}).to_string(),
                 6 => serde_json::json!({"verdict":"entailed","reason":"The claim names the containing list and its members accurately.","evidence_text":passage}).to_string(),
+                7 => serde_json::json!({"matches_property":true,"reason":"The claim gives the birds recorded on the island."}).to_string(),
                 _ => panic!("list extraction repair must remain bounded"),
             })
         },
     );
     assert_eq!(recovered.status, "accepted", "{}", recovered.reason);
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 7);
     let finding = recovered.finding.unwrap();
     assert_eq!(finding.subject, "Birds recorded on Alder Island");
     assert_eq!(finding.object, "puffins and Arctic terns");
@@ -328,12 +330,13 @@ fn currency_repair_can_extract_a_historical_property_without_claiming_currentnes
                             "object":"an astrolabe","evidence_text":passage,"confidence":0.98,"question_relevance":"direct"}}).to_string()
                     },
                 6 | 7 => serde_json::json!({"verdict":"entailed","reason":"The source states the dated exhibit.","evidence_text":passage}).to_string(),
+                8 => serde_json::json!({"matches_property":true,"reason":"The dated exhibit directly names an instrument."}).to_string(),
                     _ => panic!("repair must be bounded"),
                 })
         },
     );
     assert_eq!(result.status, "accepted", "{}", result.reason);
-    assert_eq!(calls, 7);
+    assert_eq!(calls, 8);
     let finding = result.finding.unwrap();
     assert_eq!(finding.evidence_text, passage);
     assert!(finding.valid_from.is_none());
@@ -363,11 +366,12 @@ fn physical_current_does_not_trigger_temporal_property_repair() {
                 }
                 5 => serde_json::json!({"verdict":"entailed","reason":"The quoted passage states the measured electrical quantity.","evidence_text":passage}).to_string(),
                 6 => serde_json::json!({"verdict":"entailed","reason":"The source directly states the measured quantity.","evidence_text":passage}).to_string(),
+                7 => serde_json::json!({"matches_property":true,"reason":"The claim states the measured electrical quantity."}).to_string(),
                 _ => panic!("repair must be bounded"),
             })
         },
     );
-    assert_eq!(calls, 6);
+    assert_eq!(calls, 7);
     assert_eq!(result.status, "accepted", "{}", result.reason);
 }
 
@@ -454,7 +458,7 @@ fn property_mismatch_repairs_from_a_ranked_span_of_the_same_multi_fact_source() 
 }
 
 #[test]
-fn rejected_property_repair_keeps_the_original_supported_fact() {
+fn rejected_property_repair_does_not_keep_the_original_irrelevant_fact() {
     let passage = "The discoveries of the 118 chemical elements known to exist as of 2026 are presented here in chronological order.\nThe exact date of discovery of most elements cannot be accurately determined.";
     let chronology = "The discoveries of the 118 chemical elements known to exist as of 2026 are presented here in chronological order.";
     let mut calls = 0;
@@ -508,9 +512,61 @@ fn rejected_property_repair_keeps_the_original_supported_fact() {
         },
     );
     assert_eq!(calls, 10);
-    let finding = result.finding.unwrap();
-    assert_eq!(finding.evidence_text, chronology);
-    assert_eq!(finding.object, "in chronological order");
+    assert!(result.finding.is_none());
+    assert_eq!(result.status, "ungrounded");
+    assert!(
+        result
+            .reason
+            .contains("requested-property repair was rejected")
+    );
+    assert!(
+        result.model_output.is_some(),
+        "retain the candidate for diagnosis"
+    );
+}
+
+#[test]
+fn malformed_property_review_removes_the_candidate_from_eligible_findings() {
+    let passage = "The Trapezium Cluster is a group of stars in the Orion Nebula.";
+    let mut calls = 0;
+    let result = extract_scholar_claim_with(
+        "What is the approximate age of the Trapezium stars?",
+        "Trapezium",
+        passage,
+        "reference",
+        None,
+        None,
+        |_| {
+            calls += 1;
+            Ok(match calls {
+                1 => serde_json::json!({"claim":{
+                    "subject":"Trapezium Cluster",
+                    "relation":"is",
+                    "object":"a group of stars in the Orion Nebula",
+                    "evidence_text":passage,
+                    "confidence":0.98,
+                    "question_relevance":"direct"
+                }})
+                .to_string(),
+                2 | 3 => serde_json::json!({
+                    "verdict":"entailed",
+                    "reason":"The passage states the claim.",
+                    "evidence_text":passage
+                })
+                .to_string(),
+                4 => "{\"matches_property\":".into(),
+                _ => panic!("malformed property review must not trigger another extraction"),
+            })
+        },
+    );
+    assert_eq!(calls, 4);
+    assert!(result.finding.is_none());
+    assert_eq!(result.status, "ungrounded");
+    assert!(result.reason.contains("requested-property review failed"));
+    assert!(
+        result.model_output.is_some(),
+        "retain the candidate for diagnosis"
+    );
 }
 
 #[test]
