@@ -205,6 +205,52 @@ fn invalid_feedback_rolls_back_rejection_and_acceptance_stops_retrying() {
 }
 
 #[test]
+fn repeated_repair_of_the_same_proposition_and_passage_records_no_progress() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    let (_, root) = feedback_fixture(&mut store);
+    store
+        .reject_scholar_finding_with_feedback(
+            root,
+            "The candidate still has the same unsupported scope.",
+            "repair",
+            "Narrow the claim to what the passage establishes.",
+        )
+        .unwrap();
+    let task = store.claim_scholar_feedback("repair").unwrap().unwrap();
+    let repeated = feedback_finding(&mut store, &task.job_id);
+    store
+        .finish_scholar_feedback(&task, true, "A finding was proposed for review")
+        .unwrap();
+    store
+        .reject_scholar_finding_with_feedback(
+            repeated,
+            "The candidate still has the same unsupported scope.",
+            "repair",
+            "Narrow the claim to what the passage establishes.",
+        )
+        .unwrap();
+    assert!(store.claim_scholar_feedback("repair").unwrap().is_none());
+    let (attempts, status, reason): (i64, String, String) = store
+        .connection
+        .query_row(
+            "SELECT attempts,status,last_reason FROM scholar_feedback_sessions WHERE root_finding_id=?1",
+            [root],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(status, "exhausted");
+    assert!(reason.starts_with("No progress:"));
+    assert_eq!(
+        store.scholar_findings(&task.job_id).unwrap()[0].status,
+        "rejected"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn feedback_migration_preserves_existing_findings() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();

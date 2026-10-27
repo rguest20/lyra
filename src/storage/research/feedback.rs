@@ -124,6 +124,47 @@ pub(super) fn queue_feedback(
         return Ok(());
     }
     let root = root_finding_id(tx, finding_id)?;
+    let unchanged_repair = if route == "repair" && finding_id != root {
+        tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM scholar_research_feedback previous
+                JOIN scholar_findings prior ON prior.id=previous.finding_id
+                JOIN scholar_findings current ON current.id=?1
+                WHERE previous.root_finding_id=?2 AND previous.route='repair'
+                  AND previous.guidance=?3
+                  AND prior.subject=current.subject AND prior.relation=current.relation
+                  AND prior.object=current.object AND prior.valid_from IS current.valid_from
+                  AND prior.valid_until IS current.valid_until
+                  AND prior.attribution IS current.attribution
+                  AND prior.polarity=current.polarity AND prior.modality=current.modality
+                  AND prior.geographic_scope IS current.geographic_scope
+                  AND prior.context_scope IS current.context_scope
+                  AND prior.source_url=current.source_url
+                  AND prior.source_excerpt=current.source_excerpt
+            )",
+            params![finding_id, root, guidance],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?
+    } else {
+        false
+    };
+    if unchanged_repair {
+        let reason = format!("No progress: the repair repeated the same proposition, reviewer guidance, and source passage. {guidance}")
+            .chars()
+            .take(500)
+            .collect::<String>();
+        tx.execute(
+            "UPDATE scholar_feedback_sessions SET status='exhausted',last_reason=?2 WHERE root_finding_id=?1",
+            params![root, reason],
+        )
+        .map_err(database_error)?;
+        crate::diagnostics::event(
+            "scholar.research_feedback_no_progress",
+            serde_json::json!({"finding_id":finding_id,"root_finding_id":root,"route":route,"reason":reason}),
+        );
+        return Ok(());
+    }
     tx.execute(
         "INSERT OR IGNORE INTO scholar_feedback_sessions VALUES (?1, 1, 'active', ?2)",
         params![root, guidance],
@@ -162,7 +203,7 @@ impl LearningStore {
                 "feedback_id": task.as_ref().map(|task| task.id),
                 "route": task.as_ref().map(|task| task.route.as_str()),
                 "exclusion_reason": task.as_ref().and_then(|task| task.exclusion_reason.as_deref()),
-                "outcome": if session.status == "exhausted" { "attempt_budget_exhausted" } else { "feedback_queued" },
+                "outcome": if session.status == "exhausted" && session.last_reason.starts_with("No progress:") { "no_progress" } else if session.status == "exhausted" { "attempt_budget_exhausted" } else { "feedback_queued" },
             }),
         );
         Ok(())
