@@ -28,9 +28,12 @@ training verification used a separate temporary adapter.
 
 ## Recovery and logs
 
-`COMMUNITY_THINKING_TOKENS` defaults to 256 (allowed range 1–2048). Normal chat
-and extraction still disable thinking. Generation stops a thinking-only stream
-at that budget. Missing closing tags, unexpected thinking-only output, and empty
+`COMMUNITY_THINKING_TOKENS` defaults to 256 (allowed range 1–2048). Chat uses the
+contextual request-intent assessment to decide whether extended reasoning is
+useful; simple turns can skip it, while factual or source-check turns, explicit
+debug requests, and failed assessments keep it enabled. Extraction prompts still
+disable thinking. Generation stops a thinking-only stream at that budget. Missing
+closing tags, unexpected thinking-only output, and empty
 answers receive one fresh generation with thinking disabled. Recovery keeps the
 same conversation context. If that retry also fails, a clear error is logged.
 

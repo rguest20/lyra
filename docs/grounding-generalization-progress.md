@@ -1000,6 +1000,54 @@ was left running on its earlier build at the user's request to wrap up; no
 post-change dialogue or full benchmark pass is claimed. Restart it and replay
 the retained failures before treating the context/intent changes as verified.
 
+## 25 October 2026 runtime log follow-up
+
+The runtime log exposed a fail-open requested-property check: malformed or
+rejected relevance reviews could leave a source-supported but irrelevant claim
+eligible, and a later generic extraction repair could bypass that check. The
+bounded extraction retry now runs first; the final candidate must pass the
+property review, and malformed/uncertain/rejected outcomes remove the finding
+while retaining the original model output and review reason for diagnosis.
+Controlled regressions cover malformed review, rejected same-passage repair,
+and successful repair. These use model doubles and do not establish semantic
+accuracy.
+
+Search prompts now preserve the requested property and scope, and the fallback
+path no longer inserts an entity-only query ahead of the request. In an
+isolated temporary database, INT8 Scholar searched for the approximate age of
+the Trapezium stars, found an age-specific Chandra source through SearXNG, and
+retained its “median age of around 300,000 years” statement for review.
+Wikipedia returned no finding in that run. This is one live case; the finding
+remains `needs_review` because source quality has not been assessed.
+
+Interaction now uses the existing contextual request-intent pass to decide
+whether a turn needs extended reasoning. A simple isolated greeting skipped
+thinking and took 347 ms in Interaction inference; the reviewed log's greeting
+used 1,024 thinking tokens and took about 20.8 seconds in inference. Three-turn
+INT8 pilots at cache capacities one and two loaded seven versus two role
+workers and reduced aggregate time from request-intent assessment through
+visible replies from 4.35 to 3.20 seconds. The first two-worker reply paid its
+cold-load cost. This small local pilot does not establish broad latency,
+quality or memory behavior. The local ignored `.env` uses capacity two; the
+general code default remains one.
+
+The web server now records request read timeouts with their phase and byte
+count. An isolated idle partial-header request reproduced `WouldBlock` OS
+error 35; the server recorded a header timeout and returned HTTP 200 for the
+next valid request. The old log did not record the phase, so the reproduction
+shows a matching benign cause but cannot prove the original request had the
+same cause. Idle reads now close quietly with a specific event instead of a
+generic request error.
+
+A live Scholar replay of the standalone query “When was the bulletin sent?”
+was stopped after two minutes without new diagnostics during SearXNG result
+processing. It lacked the publication title and dialogue context from the
+original log, so it is inconclusive and is not counted as a successful replay.
+
+At the pre-implementation checkpoint, the full Rust suite passed 471 tests,
+with `cargo fmt --check` and `git diff --check`. Independent semantic judgments
+for the grounding benchmark remain pending; training remains gated.
+
 ## 27 October 2026 intake and qualified-review implementation
 
 Read-only code and local database inspection found an existing Scholar-owned

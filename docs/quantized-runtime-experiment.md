@@ -1,8 +1,8 @@
 # Qwen3.5 2B quantized runtime experiment
 
-Updated 15 October 2026. This records a local performance experiment, not a
-grounding acceptance result. The configured model and running browser service
-remain on BF16.
+Updated 15 October 2026. This records the state at that experiment, not the
+current local assignments or a grounding acceptance result. At that time, the
+configured model and running browser service remained on BF16.
 
 ## Runtime support
 
@@ -70,8 +70,10 @@ isolated from Lyra's live data.
   generation, retries and non-model work.
 - Review adapter training and model-lineage behavior before using trained
   adapters with a quantized base.
-- Keep BF16 as the configured default until those checks show an acceptable
-  quality and latency trade-off.
+- The experiment recommended keeping BF16 as the configured default until
+  broader checks showed an acceptable quality and latency trade-off. The
+  current local profile now uses INT8 for all roles; the quality checks remain
+  open.
 
 `cargo test` passed 431 tests, formatting and Python syntax checks passed, and
 the release build succeeded. These checks validate the runtime change; they do

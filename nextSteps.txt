@@ -49,6 +49,51 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   compatibility, benchmark, latency, and rollback evidence specified in the
   detailed plans. None is implied by the cleanup work.
 
+5. Evaluate quantized thinking inference and QLoRA adapters
+
+- [x] Run a first three-repeat, same-prompt comparison through Lyra's actual
+  thinking and answer path for BF16, INT8 and 4-bit Interaction assignments.
+  Initial latency, token rate and generation memory are recorded in
+  `docs/qlora-speed-experiment.md`; this is a one-prompt pilot only.
+- [x] Assign all local roles to INT8 with role-specific adapter paths. The
+  4-bit checkpoint was removed locally because of quality-loss concerns; its
+  benchmark records remain historical comparison data.
+- [x] Compare three BF16-all-role and three INT8-all-role `say` runs on the
+  same prompt. INT8 was about 42% faster end to end in this narrow speed check;
+  raw results and the Candle backend limitation are recorded in
+  `docs/qlora-speed-experiment.md`.
+- [ ] Extend the BF16-versus-INT8 comparison to unrelated factual and
+  conversational prompts, corrections, follow-ups, and research-backed replies.
+  Separate model-load and prompt-processing time, retain outputs, and seek
+  independent judgments to assess quality and grounding across all roles.
+- [ ] Prototype full transformer-layer LoRA training on a frozen quantized
+  checkpoint. Keep adapters separate, versioned, and reversible; the current
+  MLX adapter only adjusts the output layer.
+- [x] Evaluate a native Swift MLX worker. It compiled but could not load MLX's
+  default Metal library in this environment, so it produced no inference or
+  speed result. Keep the working Python MLX-LM runtime; reconsider a native
+  replacement only with a runnable build and evidence it improves performance.
+  Candle would require a separate Qwen3.5 architecture and quantized-checkpoint
+  implementation.
+- [x] Probe MLX-LM batching with four independent INT8 prompts. The batch
+  improved group throughput by about 72% in a speed-only test, while first
+  prompt latency stayed about the same. The test script and raw outputs are in
+  `scripts/benchmark_mlx_batching.py` and
+  `evals/results/mlx-batching-2026-10-25/`.
+- [x] Add a shared batch inference API with batches of up to four same-role
+  requests, per-item stops, thinking budgets and existing answer recovery.
+  Curator uses it for independent observation extraction; dependent reviews
+  remain ordered. The live INT8 worker smoke and Rust suite pass.
+- [ ] Measure Curator batch throughput and quality on representative queued
+  observations. Extend usage to other independent agent stages with evidence;
+  browser requests and dependent agent steps are not automatically batched.
+- [ ] Measure whether training improves a defined behavior without damaging
+  grounding, generalization, or unrelated answers. Do not activate trained
+  weights or merge/requantize a checkpoint until the grounding acceptance gate
+  passes. Keep the BF16 checkpoint and SQLite claim ledger authoritative.
+- See `docs/quantized-runtime-experiment.md` for historical 4-bit measurements
+  and `docs/qlora-speed-experiment.md` for the BF16-versus-INT8 comparison.
+
 6. Scout intake and qualified assertion review — implementation complete;
    semantic acceptance remains open
 
@@ -81,5 +126,6 @@ Component and evidence references:
   assertion verification, rejection feedback, and material caveats.
 - docs/learning-integrity-roadmap.md — evidence policy and benchmark acceptance.
 - docs/grounding-generalization-progress.md — retained failures and recent fixes.
+- docs/log-behavior-fix-plan.md — runtime log findings, fixes in progress, and validation limits.
 - docs/per-agent-models.md — runtime and model assignments.
 - docs/research-baskets-and-quotas.md — bounded harvesting and explicit retry.

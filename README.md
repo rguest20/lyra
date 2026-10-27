@@ -66,13 +66,15 @@ COMMUNITY_MODEL_LOCK=state/model-inference.lock
 ```
 
 Then run `cargo run --release -- chat` or `cargo run --release -- serve`.
-User-facing answers enable thinking; structured extraction disables it. The debug
-setting controls whether the reasoning trace is displayed. Only text inputs are supported.
+Chat uses the contextual request-intent assessment to decide whether a turn
+needs extended reasoning; structured extraction disables it. Debug mode keeps
+reasoning enabled and displays its trace. Only text inputs are supported.
 The MLX backend requires Apple Silicon Metal; `COMMUNITY_DEVICE=cpu` is available
 for the legacy Candle Qwen3 backend. MLX can load BF16 or quantized Qwen3.5
-checkpoints. The current configuration remains BF16. Quantized models keep their
-output adapter separate; the runtime will not merge an adapter into quantized
-weights.
+checkpoints. BF16 remains the global/default configuration; per-agent overrides
+can select a quantized checkpoint. The current local profile assigns all roles
+to INT8. Quantized models keep their output adapters separate; the runtime will
+not merge adapters into quantized weights.
 
 The switch checklist in [docs/qwen35-2b-switch.md](docs/qwen35-2b-switch.md)
 records conversation migration and measured results. The knowledge map and
@@ -117,6 +119,9 @@ adapters skip their unused output computation during generation.
 
 Thinking initially receives 256 tokens by default. Set
 `COMMUNITY_THINKING_TOKENS` to an integer from 1 to 2048 to change that initial budget.
+The request-intent assessment also judges whether a turn needs extended reasoning.
+Simple turns can skip the thinking phase; factual or source-check turns, explicit
+debug requests, and failed intent assessments keep it enabled.
 When exhausted, MLX continues the existing reasoning with up to four times the
 initial budget, capped at 2048 tokens and the available context. At that cap it
 closes the reasoning phase and generates the answer while preserving the reasoning
@@ -163,6 +168,14 @@ conversation enters each prompt, including older turns. The latest user
 message remains the question to answer. If a draft exactly repeats an older
 answer to a different question, the agent tries once more with the entire
 history presented as reference text. The full transcript remains on disk.
+
+Independent inference requests can use the shared `LocalModel::chat_batch`
+API. MLX generates up to four same-agent requests together with that agent's
+adapter; stop rules, thinking budgets, answer validation and bounded recovery
+remain per request. Curator batches independent observation extractions before
+reviewing and saving each result. Dependent steps and browser requests continue
+in order. The throughput probe and validation limits are recorded in
+[`docs/qlora-speed-experiment.md`](docs/qlora-speed-experiment.md).
 
 ## Use the browser frontend
 
@@ -212,10 +225,10 @@ confidence limitations, migration notes, and all inspection commands.
 
 When Lyra's reply leaves a public factual question unanswered, a local model
 check can queue a short search phrase for the scholar. The scholar has its own
-SQLite queue and researches an English Wikipedia article through the MediaWiki
-API. Configured SerpAPI and Tavily searches provide additional leads; Scholar
-checks site policies before fetching a small number of pages. It extracts
-claims only from exact source passages and records each source and assessment.
+SQLite queue and researches English Wikipedia through the MediaWiki API. When
+configured, local SearXNG supplies additional discovery leads. Scholar checks
+site policies before fetching a small number of pages. It extracts claims only
+from exact source passages and records each source and assessment.
 `scholar show JOB_ID` displays the selected passages and why each extraction
 attempt succeeded or failed, plus page-declared author, publisher, publication
 date, canonical URL, and citations when present. These declarations are clues,
@@ -288,7 +301,6 @@ cargo run --release -- scholar
 cargo run --release -- scholar ask "What is photosynthesis?"
 cargo run --release -- scholar-once
 cargo run --release -- scholar show JOB_ID
-cargo run --release -- scholar sites
 cargo run --release -- scholar blocked
 cargo run --release -- scholar queue
 cargo run --release -- scholar source-review FINDING_ID primary suitable - "Publisher is a specialist source for this subject"
@@ -299,10 +311,11 @@ cargo run --release -- knowledge
 
 `scholar blocked` lists robots-denied paths and hosts that Scholar skips for
 30 days. Lyra does not use web results to establish personal facts about the
-user. Research questions are sent to configured search providers; conversation
-history stays local. Internet access and `curl` are required for the worker.
-When local SearXNG is configured, Scholar tries it before quota-based providers
-and only falls back to those providers if SearXNG returns no candidates. The
+user. Research questions are sent to Wikipedia and, when configured, local
+SearXNG; conversation history stays local. Internet access and `curl` are
+required for the worker. SearXNG returns discovery leads beside Wikipedia.
+Scholar checks candidate pages and retains exact passages before extraction;
+search snippets never support findings directly. The
 bundled local setup is available with `scripts/start-searxng.sh`; it creates a
 local secret and starts the container bound only to `127.0.0.1:8888`, enables
 JSON, and caps Google and Brave
@@ -315,21 +328,15 @@ not the upstream search engines. To configure Lyra, copy
 Scholar can use directly supported findings as tentative evidence before they
 reach the semantic map. Lyra should attribute them and qualify the answer
 naturally, for example, “I'm not completely sure, but these sources say…”.
-Scholar uses SerpAPI after weak Wikipedia evidence when its persisted
-30-minute interval has elapsed, and Tavily after its persisted one-hour
-interval when those providers are needed. When Wikipedia yields a direct
-finding, it searches SerpAPI only after an hour and Tavily only after two hours
-since each provider's last search. Set `SCHOLAR_SERP_INTERVAL_SECONDS` or
-`SCHOLAR_TAVILY_INTERVAL_SECONDS` to change the base intervals; the
-strong-Wikipedia interval remains twice the configured value.
 Direct, well-grounded public findings that still need an independent source
 enter a durable corroboration queue. At each maintenance pass, an available
-SerpAPI or Tavily slot takes the next eligible claim. The worker skips hosts
-already cited for that claim and stages only a matching claim from a new
-source. `scholar queue` shows pending, active, completed, and exhausted items.
-Each provider gets at most three attempts per claim; unavailable providers
-leave their work pending. Promotion still uses the existing evidence and
-conflict checks.
+SearXNG slot takes the next eligible claim. The worker skips hosts already
+cited for that claim and stages only a matching claim from a new source.
+`scholar queue` shows pending, active, completed, and exhausted items, with at
+most three SearXNG attempts per claim. Set
+`SCHOLAR_SEARXNG_CORROBORATION_INTERVAL_SECONDS` to change the default
+30-minute spacing between corroboration searches. Promotion still uses the
+existing evidence and conflict checks.
 Automatic promotion requires the configured extraction-confidence threshold,
 two directly supporting sources from distinct hosts, and no unresolved source
 provenance warning or active map conflict. The default threshold is 0.90; set
@@ -488,13 +495,12 @@ Configuration:
 | `COMMUNITY_MAX_RESEARCH_PER_DAY` | `20` | Maximum Scout investigations in a rolling day, 1–200; `0` disables this cap. |
 | `COMMUNITY_SCOUT_MODEL_PROBES_PER_DAY` | `3` | Maximum broad, model-suggested Scout leads per rolling day, 1–200; `0` disables this cap. |
 | `COMMUNITY_SCOUT_MIN_INTERVAL_SECONDS` | `300` | Minimum spacing between Scout investigations and broad model probes, 0–86400 seconds; `0` disables spacing. Per-topic retry limits still apply. |
-| `COMMUNITY_CONFIG` | `config.toml` | Optional local TOML file for search provider settings. |
-| `TAVILY_API_KEY` | — | Tavily API key; overrides `[search.tavily].api_key`. |
-| `SERP_API_KEY` | — | SerpAPI key. |
+| `COMMUNITY_CONFIG` | `config.toml` | Optional local TOML file for SearXNG settings. |
 | `SCHOLAR_WIKIPEDIA_INTERVAL_SECONDS` | `10` | Minimum Wikipedia request spacing, never below ten seconds. |
 | `SCHOLAR_WIKIPEDIA_REQUESTS_PER_HOUR` | `60` | Rolling all-call Wikipedia API budget. |
 | `SCHOLAR_WIKIPEDIA_REQUESTS_PER_DAY` | `200` | Rolling all-call Wikipedia API budget; external pages have no shared daily fetch cap. |
 | `SEARXNG_URL` | — | Local SearXNG search URL; overrides `[search.searxng].url`. |
+| `SCHOLAR_SEARXNG_CORROBORATION_INTERVAL_SECONDS` | `1800` | Minimum spacing between SearXNG corroboration searches. |
 | `OPENAI_API_KEY` | unset | When non-empty and OpenAI reviews are explicitly enabled, Curmudgeon uses OpenAI for claim, source, semantic-support, provenance, and assistant-audit reviews instead of the local model. |
 | `COMMUNITY_CURMUDGEON_OPENAI` | `off` | Only `on`, `true`, or `1` enables OpenAI reviews. Otherwise the local model is used even with an API key configured. |
 | `COMMUNITY_CURMUDGEON_OPENAI_MODEL` | `gpt-4.1-mini` | OpenAI chat-completions model for Curmudgeon; must support JSON-object responses. |
@@ -519,11 +525,10 @@ confidence, exact quoted evidence, privacy, freshness, conflict resolution,
 and independent-corroboration gates are unchanged. A stronger reviewer cannot
 override those storage policies or automatically reopen old rejected findings.
 
-Copy `config.example.toml` to `config.toml` to configure Tavily or a local
-SearXNG instance. `config.toml` is ignored by Git. SearXNG endpoints must be
-local (`localhost`, loopback IP, or `.local` hostname) and return JSON results.
-If no paid discovery provider can run, Scholar can use configured SearXNG;
-Wikipedia remains available in every configuration. Search snippets remain
+Copy `config.example.toml` to `config.toml` to configure a local SearXNG
+instance. `config.toml` is ignored by Git. SearXNG endpoints must be local
+(`localhost`, loopback IP, or `.local` hostname) and return JSON results.
+Wikipedia remains available when SearXNG is absent. Search snippets remain
 leads until source pages pass policy checks and are fetched.
 
 Scholar uses its source and review rules before a claim enters the map;

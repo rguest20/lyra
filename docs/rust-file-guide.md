@@ -42,7 +42,7 @@ that file is for and, in short, how it does the work. The list covers the 94
 | --- | --- |
 | `src/scholar/claims.rs` | Checks whether proposed findings answer the research question and are directly supported by source text; it also provides deterministic list extraction. |
 | `src/scholar/config.rs` | Loads optional search-provider settings from environment variables and local TOML configuration while keeping credentials out of error messages. |
-| `src/scholar/discovery.rs` | Implements Tavily, SerpAPI, and local SearXNG search. It observes provider quotas and request limits, and stores search results as leads rather than verified facts. |
+| `src/scholar/discovery.rs` | Queries the configured local SearXNG instance and stores its results as leads rather than verified facts. Wikipedia search is implemented separately in `wikipedia.rs`. |
 | `src/scholar/passages.rs` | Selects a small number of useful, contiguous page sections. It preserves headings and lists so extracted claims can be checked against exact passages. |
 | `src/scholar/provenance.rs` | Collects declared publication, citation, and publisher clues from pages. These are stored as review signals, not treated as proof of source independence. |
 | `src/scholar/site_policy.rs` | Applies robots.txt, llms.txt, and supported agent-manifest rules before fetching pages. It also bounds page requests and records policy and provenance outcomes. |
@@ -62,13 +62,13 @@ that file is for and, in short, how it does the work. The list covers the 94
 | `src/storage/operations.rs` | Records maintenance passes and per-role outcomes. It exposes recent run history, current status, and interruption recovery. |
 | `src/storage/queries.rs` | Provides read paths for the semantic map, Scholar evidence, review inbox, and observation details, including relevance ranking. |
 | `src/storage/research.rs` | Stores Scholar and Scout research operations. It manages provider attempts, search leads, rate-limit reservations, site-policy caches, provenance reviews, and model-probe history. |
-| `src/storage/research/corroboration.rs` | Queues claims that need another source. It selects an eligible provider, leases the task, and records whether new evidence resolves it. |
+| `src/storage/research/corroboration.rs` | Queues claims that need another source. It leases an eligible SearXNG search and records whether new evidence resolves it. |
 | `src/storage/research/intake.rs` | Accepts findings from research jobs. It checks passage support, freshness, and source assessments before storing evidence or proposing map changes. |
 | `src/storage/research/promotion.rs` | Decides when staged evidence can become active semantic knowledge. It requires sufficient confidence, independent support, resolved provenance warnings, and no active conflict. |
 | `src/storage/schema.rs` | Runs database migrations in order, selecting the migration group needed to bring an older database to the current schema. |
 | `src/storage/schema/early.rs` | Creates and upgrades the foundational database tables used by the earliest versions of the application. |
 | `src/storage/schema/middle.rs` | Applies the middle series of schema upgrades as learning, research, and review features were added. |
-| `src/storage/schema/recent.rs` | Applies newer schema upgrades for provider usage, request safety, maintenance, and current research workflows. |
+| `src/storage/schema/recent.rs` | Applies newer schema upgrades for request safety, maintenance, and current research workflows. It preserves retired search-provider records under legacy table names. |
 | `src/storage/tests.rs` | Exercises storage behavior against temporary SQLite databases, including migrations, leases, evidence decisions, corroboration, and promotion. |
 
 ## Tests and how the pieces fit

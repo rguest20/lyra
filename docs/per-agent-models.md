@@ -66,9 +66,10 @@ configured differently on a desktop, but it does not add ROCm or CUDA support.
 
 ## MacBook Profile
 
-All agents use one shared original BF16 2B checkpoint and adapter, avoiding
-model-size switches and duplicate resident workers. The 0.6B files remain
-available for rollback. Keep both checkpoints installed:
+The global/default assignment remains the original BF16 2B checkpoint. The
+local development profile assigns all five roles to the 8-bit quantized
+checkpoint, with a separate adapter path for each role. The 0.6B files remain
+available for rollback. Keep the BF16 base checkpoint installed:
 
 ```sh
 python3 -m venv --system-site-packages .venv-qwen35
@@ -88,9 +89,33 @@ COMMUNITY_CURMUDGEON_OPENAI=off
 COMMUNITY_MODEL_CACHE_SIZE=1
 ```
 
-Restart Lyra after configuration changes. All agents inherit the 2B assignment.
-Changing Interaction's model preserves its saved conversation history and
-updates the model label when the next turn is saved.
+The local `.env` overrides every role:
+
+```dotenv
+COMMUNITY_SCOUT_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_SCOUT_MODEL_DIR=models/qwen3.5-2b-8bit
+COMMUNITY_SCOUT_ADAPTER=state/adapter-qwen3.5-2b-8bit-scout.safetensors
+COMMUNITY_SCHOLAR_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_SCHOLAR_MODEL_DIR=models/qwen3.5-2b-8bit
+COMMUNITY_SCHOLAR_ADAPTER=state/adapter-qwen3.5-2b-8bit-scholar.safetensors
+COMMUNITY_CURMUDGEON_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_CURMUDGEON_MODEL_DIR=models/qwen3.5-2b-8bit
+COMMUNITY_CURMUDGEON_ADAPTER=state/adapter-qwen3.5-2b-8bit-curmudgeon.safetensors
+COMMUNITY_ARCHIVIST_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_ARCHIVIST_MODEL_DIR=models/qwen3.5-2b-8bit
+COMMUNITY_ARCHIVIST_ADAPTER=state/adapter-qwen3.5-2b-8bit-archivist.safetensors
+COMMUNITY_INTERACTION_MODEL_ID=Qwen/Qwen3.5-2B
+COMMUNITY_INTERACTION_MODEL_DIR=models/qwen3.5-2b-8bit
+COMMUNITY_INTERACTION_ADAPTER=state/adapter-qwen3.5-2b-8bit-interaction.safetensors
+```
+
+The 4-bit checkpoint was removed locally at the user's request; its benchmark
+outputs remain as historical records. The INT8 assignments are inference
+choices only and do not enable training or adapter merging.
+
+Restart Lyra after configuration changes. Roles without overrides inherit the
+global 2B assignment. Changing Interaction's model preserves its saved
+conversation history and updates the model label when the next turn is saved.
 
 The development Mac has 16 GiB of physical RAM. The upstream BF16 weights are
 1,503,300,328 bytes for 0.6B and 4,548,221,488 bytes for 2B. Separate chat and
@@ -101,10 +126,10 @@ each reported about 1.07 GB active memory in a local probe. Monitor Activity
 Monitor and `memory_pressure` during normal use, especially while maintenance
 runs. Lower context limits reduce cache and attention memory if pressure or
 swap grows.
-The original BF16 2B checkpoint, experimental 4-bit checkpoint, and isolated
-MLX environment are installed locally. The ignored `.env` still assigns every
-role to the BF16 2B model; it has not been switched to 4-bit pending broader
-quality evaluation.
+The original BF16 2B checkpoint, experimental 8-bit checkpoint, and isolated
+MLX environment are installed locally. The ignored `.env` assigns every role
+to INT8. The 4-bit checkpoint was removed; only historical comparison data
+remains.
 Local review smoke probes accepted a supported crisp-flavours claim and rejected
 an off-topic US renewable-electricity claim for a food-production question.
 These synthetic fixtures check review decisions and routing, not general model
