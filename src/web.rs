@@ -76,11 +76,15 @@ pub fn serve(
                 continue;
             }
             Err(error) => {
+                web_io_failure("accept", &error, None);
                 eprintln!("web request failed: {error}");
                 continue;
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(15))) {
+            web_io_failure("read_timeout_setup", &error, None);
+            return Err(error);
+        }
         match handle_request(
             &mut stream,
             address,
@@ -93,7 +97,22 @@ pub fn serve(
                 maintenance.wake();
             }
             Ok(_) => {}
-            Err(error) => eprintln!("could not handle web request: {error}"),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                // An idle or incomplete client request is bounded by the read
+                // timeout; keep serving without reporting it as a server error.
+            }
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                // The read layer records the peer close separately.
+            }
+            Err(error) => {
+                web_io_failure("request_handler", &error, None);
+                eprintln!("could not handle web request: {error}");
+            }
         }
     }
     maintenance.stop();
@@ -115,10 +134,16 @@ fn handle_request(
     let mut parts = request_line.split(|byte| *byte == b' ');
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
-    let headers_end = request
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP headers"))?;
+    let Some(headers_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        crate::diagnostics::event(
+            "web.request_parse_failed",
+            json!({"stage":"headers","reason":"missing_header_terminator","received_bytes":request.len()}),
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing HTTP headers",
+        ));
+    };
     let headers = String::from_utf8_lossy(&request[..headers_end]);
     let origin = headers
         .lines()
@@ -227,6 +252,10 @@ fn handle_request(
             parsed
         }
         _ => {
+            crate::diagnostics::event(
+                "web.request_rejected",
+                json!({"stage":"json_body","reason":"invalid_or_empty_chat_request"}),
+            );
             respond(
                 stream,
                 "400 Bad Request",
@@ -324,8 +353,33 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 8192];
     loop {
-        let read = stream.read(&mut chunk)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) => {
+                let phase = if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    "body"
+                } else {
+                    "headers"
+                };
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) {
+                    crate::diagnostics::event(
+                        "web.request_read_timeout",
+                        json!({"phase":phase,"received_bytes":request.len(),"error_kind":format!("{:?}",error.kind()),"os_code":error.raw_os_error()}),
+                    );
+                } else {
+                    web_io_failure("request_read", &error, Some((phase, request.len())));
+                }
+                return Err(error);
+            }
+        };
         if read == 0 {
+            crate::diagnostics::event(
+                "web.request_peer_closed",
+                json!({"stage":"request_read","phase":if request.windows(4).any(|window| window == b"\r\n\r\n") {"body"} else {"headers"},"received_bytes":request.len()}),
+            );
             break;
         }
         request.extend_from_slice(&chunk[..read]);
@@ -362,19 +416,41 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     ))
 }
 
+fn web_io_failure(stage: &str, error: &io::Error, read_progress: Option<(&str, usize)>) {
+    let mut details = json!({
+        "stage":stage,
+        "error_kind":format!("{:?}",error.kind()),
+        "os_code":error.raw_os_error(),
+        "timeout_or_would_block":matches!(error.kind(),io::ErrorKind::TimedOut|io::ErrorKind::WouldBlock),
+    });
+    if let Some((phase, received_bytes)) = read_progress {
+        details["phase"] = json!(phase);
+        details["received_bytes"] = json!(received_bytes);
+    }
+    crate::diagnostics::event("web.io_failure", details);
+}
+
 fn respond(
     stream: &mut TcpStream,
     status: &str,
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
-    write!(
+    if let Err(error) = write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
         body.len()
-    )?;
-    stream.write_all(body)?;
-    stream.flush()
+    ) {
+        web_io_failure("response_headers", &error, None);
+        return Err(error);
+    }
+    if let Err(error) = stream.write_all(body) {
+        web_io_failure("response_body", &error, None);
+        return Err(error);
+    }
+    stream
+        .flush()
+        .inspect_err(|error| web_io_failure("response_flush", error, None))
 }
 
 #[cfg(test)]
