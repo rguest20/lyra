@@ -999,3 +999,108 @@ fixture filenames resist stale files after PID reuse. The live browser service
 was left running on its earlier build at the user's request to wrap up; no
 post-change dialogue or full benchmark pass is claimed. Restart it and replay
 the retained failures before treating the context/intent changes as verified.
+
+## 27 October 2026 intake and qualified-review implementation
+
+Read-only code and local database inspection found an existing Scholar-owned
+page harvester and guided rejection retries, but no direct route from retained
+assertions into Scholar verification. Scout's pending-question early return can
+prevent later feedback work, and harvesting runs only after other Scholar jobs.
+The database contained 709 retained assertions, 408 unfinished sources, and
+58 pending new-source feedback tasks. These are backlog observations, not a
+complete diagnosis of worker execution or semantic accuracy.
+
+The ordered implementation is tracked in
+`docs/scout-intake-and-qualified-review-plan.md`. The basket reader now runs
+under Scout, with a persistent rotation through source intake, feedback,
+retained questions, assertion leads, and map gaps. Scout can link a selected
+retained assertion to a focused Scholar job. Source windows overlap by 1,000
+characters; offsets and source hashes remain tied to the retained version.
+Rejected findings now send Curmudgeon's decision reason and structured objection
+through Scholar repair and source search. Caveats are validated, stored on the
+finding, included in evidence retrieval, and passed to answer generation. A
+caveated finding stays out of automatic map promotion so its limitation is not
+discarded.
+
+Curmudgeon's structured result now separates passage entailment from relevance
+to the original question; source suitability and promotion gates remain
+independent. Scholar also stops a repair chain when the same proposition and
+reviewer guidance come back from the same passage, recording `No progress`
+without treating the claim as disproved.
+
+Controlled tests cover the Scout webpage-to-basket route, assertion selection
+and job queueing, capacity-blocked retained-question coexistence with queued
+feedback, caveat persistence/retrieval, migration replay, and Unicode evidence
+offsets across overlapping windows. A false alignment review test confirms
+that a question introducing a new measurement is skipped; a repeated-repair
+test confirms that an unchanged proposal ends with an explicit no-progress
+outcome. `cargo test --quiet` passed **482 tests**. This confirms orchestration
+and schema behavior, not model semantics.
+
+Live checks used Qwen/Qwen3.5-2B quantized INT8 on the Scout and Curmudgeon
+roles. A synthetic basket probe extracted exact quotations and a grounded
+question. On its first Curmudgeon probe, a site-specific supported finding was
+accepted without a caveat despite the broader question asking whether the
+device works in Finland. A stronger scope comparison then produced
+`accept_with_caveats`; early outputs were rejected by the parser for invalid
+scope binding, and a later valid result correctly left nationwide operation
+unconfirmed but also included a redundant positive caveat. This is one case and
+still shows caveat quality needs independent evaluation.
+That live run predates the final required passage-entailment and question-
+relevance fields. The updated schema was replayed with the configured live
+model; its failure-bearing results are recorded in the latest progress note.
+
+A bounded live Wikipedia/SearXNG cycle ran in an isolated temporary database
+(`/tmp/lyra-scout-live.RCqDiI`), with separate knowledge and runtime state paths.
+Scholar found and fetched an allowed NASA Titan page, while robots/parser policy
+skipped another page. Scout read the retained page and saved 17 assertions. Its
+first derived question drifted from the selected assertion by introducing a
+diameter comparison with Io. I added a second contextual alignment review before
+queue admission; this same-model check has not yet had a live rerun. Scholar
+property review rejected several off-topic candidates and an exact NASA passage
+supported the largest-moon claim, but one Wikipedia semantic review justified
+"largest moon" using the weaker phrase "overwhelmingly dominates Saturn's
+system" and added an unsupported detail to its rationale. Findings remained
+unpromoted and pending evidence/review. This run therefore confirms live intake
+and exposes unresolved shared-model grounding errors; it does not pass semantic
+acceptance. The database contains live page text and provisional outputs for
+inspection; no production database or queue was changed.
+
+### 27 October 2026 — completion of Scout intake and qualified review implementation
+
+The Scout intake and qualified Curmudgeon review plan now has implementation
+tasks 1–4 complete. Focused isolated-database tests exercise retained webpage
+harvesting, assertion selection and Scholar admission, caveat persistence and
+retrieval, and answer-generation handoff. Admission blockers, sustained queues,
+derivation depth, prompt-injection data separation, retry exhaustion and
+unchanged-candidate handling have regression coverage. Schema version 69 adds a
+three-generation assertion-derivation bound. The full serial Rust suite passed
+**490 tests**, and `cargo fmt --check` passed. A prior parallel suite run had a
+single model-lease test fail with `WouldBlock`; it passed in isolation and in
+the complete serial suite.
+
+Every Curmudgeon rejection now requires a structured objection. A live probe of
+a question about both Sweden and Finland exposed a remaining reviewer failure:
+the model treated Sweden-only evidence as irrelevant despite the question
+asking about Sweden, and returned `next_action=repair` with objection action
+`new_source`. Its bounded repair repeated the inconsistency. The parser rejected
+both outputs and left the assessment unresolved. This preserves the evidence
+gate, but the partial-answer judgment is not semantically adequate and needs
+independent review. Another probe correctly marked a Sweden-only passage
+irrelevant to a Finland-only question.
+
+The earlier live Wikipedia/SearXNG run remains failure-bearing: it found page
+intake and provisional assertions, while Scout's proposed question drifted from
+the selected assertion and Scholar produced a weak entailment rationale. The
+alignment review was added after that run and still needs live replay. No
+continuous fetch-to-final-answer rejection/revision replay, cross-domain
+semantic benchmark, archived before/after suite, broader independent human
+judgments, or grounding acceptance result is available. Keep semantic duplicate review,
+these live failures, and the existing training gate open; do not present the
+490 deterministic tests as semantic validation.
+
+The user independently judged the Sweden/Finland live case: the Sweden claim is
+partial at best, and the response should say only that the available evidence
+does not establish deployment in Finland. This gives an expected human
+disposition for the captured case. It is one judgment and does not close the
+cross-domain or broader independent-review items.

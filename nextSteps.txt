@@ -1,5 +1,5 @@
 LYRA — CURRENT TASKS
-Updated 24 October 2026
+Updated 27 October 2026
 
 Lyra should understand requests, give useful grounded answers, and learn without
 turning uncertain interpretations into established knowledge. Unchecked work is
@@ -49,11 +49,36 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   compatibility, benchmark, latency, and rollback evidence specified in the
   detailed plans. None is implied by the cleanup work.
 
+6. Scout intake and qualified assertion review — implementation complete;
+   semantic acceptance remains open
+
+- [x] Move retained-page extraction into Scout with a persistent fair rotation;
+  queue retained assertions for focused Scholar checks and carry rejection
+  reasons and structured objections into Scholar's retry context.
+- [x] Add bounded `accept_with_caveats` assessment, finding storage/retrieval,
+  and answer context. Caveated findings remain unpromoted until their limits can
+  be represented without dropping them. Curmudgeon now reports passage
+  entailment separately from question relevance; unchanged repair proposals end
+  with a recorded no-progress outcome.
+- [x] Complete admission/fairness regressions, structured rejection feedback,
+  caveat persistence/retrieval and answer-generation handoff. The serial Rust
+  suite passes 490 tests. Schema version 69 bounds assertion-derived work to
+  three generations.
+- [ ] Run a continuous fetch-to-Scout-to-Scholar rejection/revision-to-answer
+  replay, add semantic duplicate/paraphrase cases, and obtain independent
+  judgments. Live isolated runs exposed Scout question drift and a Curmudgeon
+  partial-answer/rejection inconsistency; the parser leaves the latter
+  unresolved after bounded repair. Keep grounding/training gates closed until
+  these failures are evaluated. See docs/scout-intake-and-qualified-review-plan.md.
+
 The original code-simplification review and dated progress records are retained
 as historical references. They record completed work, deferred options, raw
 benchmark limits, and why the remaining acceptance gates stay closed.
 
 Component and evidence references:
+- docs/scout-intake-and-qualified-review-plan.md — implementation status,
+  ordered tasks, live findings, and remaining acceptance limits for Scout intake,
+  assertion verification, rejection feedback, and material caveats.
 - docs/learning-integrity-roadmap.md — evidence policy and benchmark acceptance.
 - docs/grounding-generalization-progress.md — retained failures and recent fixes.
 - docs/per-agent-models.md — runtime and model assignments.
