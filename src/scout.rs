@@ -473,6 +473,7 @@ fn scout_model_work(
         );
     }
     let previous_topics = store.recent_model_topics()?;
+    let db_claims = store.active_semantic_claims()?;
     let Some(probe_id) = store.begin_model_probe(
         "open public knowledge",
         "Eligible map-derived gaps exhausted; bounded model-derived lead",
