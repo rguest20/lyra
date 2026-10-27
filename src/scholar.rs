@@ -37,10 +37,7 @@ use extraction::{
 };
 pub(crate) use extraction::{extract_scholar_claim_with, probe_extraction};
 
-use discovery::{
-    discover_searxng, discover_serpapi, discover_tavily, serp_interval_seconds,
-    tavily_interval_seconds,
-};
+use discovery::{discover_searxng, searxng_corroboration_interval_seconds};
 
 const SEARCH_API: &str = "https://en.wikipedia.org/w/api.php";
 const USER_AGENT: &str = "CommunityLabScholar/0.1 (local Rust chatbot; educational use)";
@@ -48,10 +45,7 @@ const MAX_SEARCH_EXTRACT_CHARS: usize = 1_200;
 const MAX_PARSED_PAGE_BYTES: usize = 524_288;
 const MAX_PARSED_ARTICLE_CHARS: usize = 100_000;
 const MAX_SELECTED_PASSAGE_CHARS: usize = 4_500;
-const MAX_SERPAPI_CANDIDATES: usize = 50;
 const HTTP_STATUS_MARKER: &str = "\nCOMMUNITY_HTTP_STATUS:";
-const SERPAPI_SEARCH_API: &str = "https://serpapi.com/search.json";
-const TAVILY_SEARCH_API: &str = "https://api.tavily.com/search";
 
 pub(super) fn limited_curl(max_time_seconds: u64, max_bytes: usize) -> std::process::Command {
     let mut command = std::process::Command::new("curl");
@@ -217,19 +211,6 @@ fn decode_wikipedia_response<T: serde::de::DeserializeOwned>(
 #[derive(Deserialize)]
 struct SearchResponse {
     query: Option<SearchResults>,
-}
-
-#[derive(Deserialize)]
-struct TavilyResponse {
-    #[serde(default)]
-    results: Vec<TavilyResult>,
-}
-
-#[derive(Deserialize)]
-struct TavilyResult {
-    title: Option<String>,
-    url: Option<String>,
-    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -434,14 +415,14 @@ pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<
                 )
             });
         }
-        let corroboration = store.claim_corroboration_task(
-            provider_config.serp_api_key.is_some(),
-            provider_config.tavily_api_key.is_some(),
-            serp_interval_seconds().saturating_mul(1_000),
-            tavily_interval_seconds().saturating_mul(1_000),
-        )?;
-        if let Some(task) = corroboration {
-            return process_corroboration_task(&mut store, &task, model);
+        if let Some(endpoint) = provider_config.searxng_url.as_deref() {
+            let corroboration = store.claim_corroboration_task(
+                true,
+                searxng_corroboration_interval_seconds().saturating_mul(1_000),
+            )?;
+            if let Some(task) = corroboration {
+                return process_corroboration_task(&mut store, &task, model, endpoint);
+            }
         }
     }
     let job = match user_job {
@@ -511,10 +492,7 @@ fn process_job(
     let mut logged_query = job.question.clone();
     match queries {
         Err(error) => result = Err(error),
-        Ok(mut queries) => {
-            if names.len() == 1 && !queries.iter().any(|q| q.eq_ignore_ascii_case(&names[0])) {
-                queries.insert(0, names[0].clone());
-            }
+        Ok(queries) => {
             for query in queries.into_iter().take(2) {
                 logged_query = query;
                 result = research(
@@ -564,9 +542,6 @@ fn process_job(
         &result,
         Ok(Some(found)) if found.finding.is_some() && found.research_relevance == "direct"
     );
-    let now_ms = crate::storage::unix_time_ms_i64_with_overflow(|_| {
-        io::Error::other("search timestamp too large")
-    })?;
     let mut sources = Vec::new();
     if !foreground || wikipedia_weak {
         discover_configured_searxng(
@@ -574,25 +549,8 @@ fn process_job(
             &job.id,
             &logged_query,
             provider_config.searxng_url.as_deref(),
+            provider_config.config_error.as_deref(),
         )?;
-        if store.scholar_search_candidates(&job.id)?.is_empty() {
-            if let Some(trigger) = discovery_trigger(
-                wikipedia_weak,
-                store.last_scholar_provider_search_ms("serpapi")?,
-                now_ms,
-                serp_interval_seconds(),
-            ) {
-                discover_serpapi(store, &job.id, &logged_query, trigger);
-            }
-            if let Some(trigger) = discovery_trigger(
-                wikipedia_weak,
-                store.last_scholar_provider_search_ms("tavily")?,
-                now_ms,
-                tavily_interval_seconds(),
-            ) {
-                discover_tavily(store, &job.id, &logged_query, trigger);
-            }
-        }
         sources = process_discovered_candidates(
             store,
             &job.id,
@@ -736,26 +694,44 @@ fn discover_configured_searxng(
     job_id: &str,
     query: &str,
     endpoint: Option<&str>,
+    config_error: Option<&str>,
 ) -> io::Result<bool> {
     if !store.scholar_search_candidates(job_id)?.is_empty() {
         return Ok(false);
     }
-    Ok(endpoint.is_some_and(|endpoint| {
-        discover_searxng(store, job_id, query, "configured_primary", endpoint)
-    }))
+    let Some(endpoint) = endpoint else {
+        if let Some(error) = config_error {
+            store.record_scholar_search_attempt_for_provider(
+                crate::storage::ScholarSearchAttemptInput {
+                    job_id,
+                    provider: "searxng",
+                    trigger_reason: "configuration",
+                    query,
+                    status: "error",
+                    result_count: None,
+                    error: Some(error),
+                },
+            )?;
+        }
+        return Ok(false);
+    };
+    Ok(discover_searxng(
+        store,
+        job_id,
+        query,
+        "configured_primary",
+        endpoint,
+    ))
 }
 
 fn process_corroboration_task(
     store: &mut LearningStore,
     task: &CorroborationTask,
     model: &mut LocalModel,
+    endpoint: &str,
 ) -> io::Result<usize> {
     let query = format!("{} {} {}", task.subject, task.relation, task.object);
-    let started = match task.provider.as_str() {
-        "serpapi" => discover_serpapi(store, &task.job_id, &query, "corroboration_queue"),
-        "tavily" => discover_tavily(store, &task.job_id, &query, "corroboration_queue"),
-        _ => return Err(io::Error::other("unsupported corroboration provider")),
-    };
+    let started = discover_searxng(store, &task.job_id, &query, "corroboration_queue", endpoint);
     let sources = if started {
         process_discovered_candidates(
             store,
@@ -792,23 +768,6 @@ fn process_corroboration_task(
         },
     )?;
     Ok(usize::from(started))
-}
-
-fn discovery_trigger(
-    wikipedia_weak: bool,
-    last_search_ms: Option<i64>,
-    now_ms: i64,
-    minimum_interval_seconds: i64,
-) -> Option<&'static str> {
-    let interval_ms = minimum_interval_seconds.saturating_mul(1_000);
-    if wikipedia_weak {
-        return last_search_ms
-            .is_none_or(|last| now_ms >= last.saturating_add(interval_ms))
-            .then_some("wikipedia_insufficient");
-    }
-    last_search_ms
-        .is_none_or(|last| now_ms >= last.saturating_add(interval_ms.saturating_mul(2)))
-        .then_some("exploration_elapsed")
 }
 
 fn finding_matches_target(finding: &ScholarFinding, target: &CorroborationTask) -> bool {

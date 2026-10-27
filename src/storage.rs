@@ -35,11 +35,6 @@ pub(crate) fn unix_time_ms_i64_with_overflow(
     i64::try_from(timestamp).map_err(overflow)
 }
 
-pub(crate) fn normalize_domain(value: &str) -> String {
-    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
-    domain.strip_prefix("www.").unwrap_or(&domain).to_owned()
-}
-
 #[derive(Debug)]
 pub struct ScholarFeedbackTask {
     pub id: i64,
@@ -258,7 +253,6 @@ pub struct ScholarJob {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CorroborationTask {
     pub finding_id: i64,
-    pub provider: String,
     pub job_id: String,
     pub question: String,
     pub subject: String,
@@ -273,8 +267,7 @@ pub struct CorroborationQueueItem {
     pub finding_id: i64,
     pub claim: String,
     pub status: String,
-    pub serp_attempts: i64,
-    pub tavily_attempts: i64,
+    pub searxng_attempts: i64,
     pub claimed_provider: Option<String>,
     pub last_outcome: Option<String>,
 }
@@ -358,18 +351,6 @@ pub struct HostRequestReservation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TavilyReservation {
-    pub id: i64,
-    pub credits: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SerpApiReservation {
-    pub id: i64,
-    pub scheduled_at_ms: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CachedSitePolicy {
     pub status: u16,
     pub content_type: String,
@@ -380,14 +361,6 @@ pub(crate) struct CachedSitePolicy {
 pub(crate) struct CachedSourcePage {
     pub content_type: String,
     pub body: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SerpApiDomainObservation {
-    pub searched_at_ms: i64,
-    pub query: String,
-    pub domain: String,
-    pub result_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

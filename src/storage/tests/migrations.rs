@@ -214,7 +214,7 @@ fn scholar_task_target_migration_backfills_existing_jobs() {
 }
 
 #[test]
-fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
+fn corroboration_queue_backfills_and_uses_searxng_preserving_legacy_history() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();
     store
@@ -255,18 +255,17 @@ fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
     let mut store = LearningStore::open(&path).unwrap();
     assert_eq!(store.corroboration_queue(10).unwrap().len(), 1);
     let first = store
-        .claim_corroboration_task(true, true, 1_800_000, 3_600_000)
+        .claim_corroboration_task(true, 1_800_000)
         .unwrap()
         .unwrap();
     assert_eq!(first.finding_id, finding_id);
-    assert_eq!(first.provider, "serpapi");
     assert_eq!(
         store.corroboration_source_urls(&first).unwrap(),
         vec!["https://first.example.org/mars"]
     );
     assert!(
         store
-            .claim_corroboration_task(true, true, 1_800_000, 3_600_000)
+            .claim_corroboration_task(true, 1_800_000)
             .unwrap()
             .is_none()
     );
@@ -274,11 +273,18 @@ fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
         .finish_scholar_job_with_evidence(&first.job_id, &[], Some("no match"))
         .unwrap();
     store.finish_corroboration_task(&first, "no_match").unwrap();
+    store
+        .connection
+        .execute(
+            "UPDATE scholar_corroboration_queue SET next_searxng_at_ms = 0
+             WHERE finding_id = ?1",
+            [finding_id],
+        )
+        .unwrap();
     let second = store
-        .claim_corroboration_task(false, true, 1_800_000, 3_600_000)
+        .claim_corroboration_task(true, 1_800_000)
         .unwrap()
         .unwrap();
-    assert_eq!(second.provider, "tavily");
     store
         .connection
         .execute(
@@ -289,7 +295,7 @@ fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
         .unwrap();
     assert!(
         store
-            .claim_corroboration_task(false, false, 1_800_000, 3_600_000)
+            .claim_corroboration_task(true, 1_800_000)
             .unwrap()
             .is_none()
     );
@@ -303,7 +309,108 @@ fn corroboration_queue_backfills_on_upgrade_and_routes_each_provider() {
     let queue = store.corroboration_queue(10).unwrap();
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].status, "pending");
-    assert_eq!((queue[0].serp_attempts, queue[0].tavily_attempts), (1, 1));
+    assert_eq!(queue[0].searxng_attempts, 2);
+
+    store
+        .connection
+        .execute(
+            "UPDATE scholar_corroboration_queue SET status = 'exhausted',
+                legacy_serp_attempts = 2, legacy_tavily_attempts = 1 WHERE finding_id = ?1",
+            [finding_id],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO scholar_corroboration_attempts
+                (finding_id, provider, job_id, started_at_ms, finished_at_ms, outcome)
+             VALUES (?1, 'serpapi', ?2, 100, 200, 'no_match')",
+            rusqlite::params![finding_id, first_job.id],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch(
+            "CREATE TABLE scholar_corroboration_queue_v63 (
+                finding_id INTEGER PRIMARY KEY REFERENCES scholar_findings(id),
+                claim_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'done', 'exhausted')),
+                serp_attempts INTEGER NOT NULL DEFAULT 0,
+                tavily_attempts INTEGER NOT NULL DEFAULT 0,
+                next_serp_at_ms INTEGER NOT NULL DEFAULT 0,
+                next_tavily_at_ms INTEGER NOT NULL DEFAULT 0,
+                claimed_at_ms INTEGER,
+                claimed_provider TEXT CHECK (claimed_provider IN ('serpapi', 'tavily')),
+                attempt_job_id TEXT REFERENCES scholar_jobs(id),
+                created_at_ms INTEGER NOT NULL,
+                last_outcome TEXT
+             );
+             INSERT INTO scholar_corroboration_queue_v63
+                (finding_id, claim_key, status, serp_attempts, tavily_attempts,
+                 next_serp_at_ms, next_tavily_at_ms, created_at_ms, last_outcome)
+             SELECT finding_id, claim_key, status, legacy_serp_attempts,
+                    legacy_tavily_attempts, legacy_next_serp_at_ms,
+                    legacy_next_tavily_at_ms, created_at_ms, last_outcome
+             FROM scholar_corroboration_queue;
+             CREATE TABLE scholar_corroboration_attempts_v63 (
+                id INTEGER PRIMARY KEY,
+                finding_id INTEGER NOT NULL REFERENCES scholar_corroboration_queue_v63(finding_id),
+                provider TEXT NOT NULL CHECK (provider IN ('serpapi', 'tavily')),
+                job_id TEXT NOT NULL UNIQUE REFERENCES scholar_jobs(id),
+                started_at_ms INTEGER NOT NULL,
+                finished_at_ms INTEGER,
+                outcome TEXT NOT NULL DEFAULT 'processing'
+             );
+             INSERT INTO scholar_corroboration_attempts_v63
+                (id, finding_id, provider, job_id, started_at_ms, finished_at_ms, outcome)
+             SELECT id, finding_id, provider, job_id, started_at_ms, finished_at_ms, outcome
+             FROM scholar_corroboration_attempts WHERE provider IN ('serpapi', 'tavily');
+             DROP TABLE scholar_corroboration_attempts;
+             DROP TABLE scholar_corroboration_queue;
+             ALTER TABLE scholar_corroboration_queue_v63 RENAME TO scholar_corroboration_queue;
+             ALTER TABLE scholar_corroboration_attempts_v63 RENAME TO scholar_corroboration_attempts;
+             ALTER TABLE legacy_serpapi_search_domains RENAME TO serpapi_search_domains;
+             ALTER TABLE legacy_serpapi_usage RENAME TO serpapi_usage;
+             ALTER TABLE legacy_tavily_usage RENAME TO tavily_usage;
+             PRAGMA user_version = 63;",
+        )
+        .unwrap();
+    drop(store);
+
+    let store = LearningStore::open(&path).unwrap();
+    let queue = store.corroboration_queue(10).unwrap();
+    assert_eq!(queue[0].status, "pending");
+    assert_eq!(queue[0].searxng_attempts, 0);
+    let legacy_counts: (i64, i64) = store
+        .connection
+        .query_row(
+            "SELECT legacy_serp_attempts, legacy_tavily_attempts FROM scholar_corroboration_queue
+             WHERE finding_id = ?1",
+            [finding_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy_counts, (2, 1));
+    let legacy_attempt: (String, String) = store
+        .connection
+        .query_row(
+            "SELECT provider, outcome FROM scholar_corroboration_attempts WHERE job_id = ?1",
+            [&first_job.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy_attempt, ("serpapi".into(), "no_match".into()));
+    let legacy_tables: i64 = store
+        .connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+             AND name IN ('legacy_serpapi_usage', 'legacy_serpapi_search_domains', 'legacy_tavily_usage')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_tables, 3);
     drop(store);
     let _ = std::fs::remove_file(path);
 }

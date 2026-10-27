@@ -583,7 +583,7 @@ fn distinct_hosts_do_not_automatically_promote_direct_findings_at_configured_def
     }
     assert!(
         store
-            .claim_corroboration_task(false, false, 1_800_000, 3_600_000)
+            .claim_corroboration_task(false, 1_800_000)
             .unwrap()
             .is_none()
     );

@@ -167,5 +167,6 @@ pub(crate) fn answer_evidence_fixture(
         independence_verified: true,
         published_at: None,
         conflicting_claims: Vec::new(),
+        review_caveats: Vec::new(),
     }
 }

@@ -1,5 +1,6 @@
 //! Storage regressions for network.
 use super::*;
+use crate::storage::ScholarSearchAttemptInput;
 
 #[test]
 fn wikipedia_search_attempt_keeps_query_and_outcome_across_restart() {
@@ -26,30 +27,35 @@ fn wikipedia_search_attempt_keeps_query_and_outcome_across_restart() {
 }
 
 #[test]
-fn serpapi_cooldown_and_discovery_candidates_survive_restart() {
+fn searxng_search_attempts_and_candidates_survive_restart() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();
     store
         .enqueue_research("test", 1, "Chicken soup ingredients")
         .unwrap();
     let job = store.claim_scholar_job().unwrap().unwrap();
-    let reservation = store
-        .reserve_serpapi_search(1_800_000, &job.id, "Chicken soup ingredients")
-        .unwrap();
     store
-        .complete_serpapi_search(reservation.id, Some(200), None)
+        .record_scholar_search_attempt_for_provider(ScholarSearchAttemptInput {
+            job_id: &job.id,
+            provider: "searxng",
+            trigger_reason: "wikipedia_insufficient",
+            query: "Chicken soup ingredients",
+            status: "results",
+            result_count: Some(1),
+            error: None,
+        })
         .unwrap();
     store
         .record_typed_search_candidate(
             &job.id,
-            "serpapi",
+            "searxng",
             "Chicken soup ingredients",
             &scholar_search_candidate(
                 "recipe",
                 "Chicken soup",
                 "https://example.org/chicken-soup",
                 "Search result snippet is discovery only.",
-                r#"{"source":"Example Kitchen","ingredients":["chicken","carrots"],"rating":4.5}"#,
+                "{}",
             ),
         )
         .unwrap();
@@ -67,167 +73,25 @@ fn serpapi_cooldown_and_discovery_candidates_survive_restart() {
             ),
         )
         .unwrap();
-    store
-        .record_scholar_candidate_provenance(
-            candidate_id,
-            r#"{"canonical_url":"https://example.org/chicken-soup","author":"A Cook","publisher":null,"published_at":null,"cited_urls":[]}"#,
-        )
-        .unwrap();
-    store
-        .record_serpapi_search_domains(
-            reservation.id,
-            &[
-                ("www.Example.org.".to_owned(), 2),
-                ("news.example.net".to_owned(), 1),
-            ],
-        )
-        .unwrap();
     drop(store);
 
-    let mut store = LearningStore::open(&path).unwrap();
-    assert_eq!(
-        store
-            .reserve_serpapi_search(1_800_000, &job.id, "second query")
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock
-    );
+    let store = LearningStore::open(&path).unwrap();
+    let attempts = store.scholar_search_attempts(&job.id).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].provider, "searxng");
+    assert_eq!(attempts[0].trigger_reason, "wikipedia_insufficient");
+    assert_eq!(attempts[0].result_count, Some(1));
     let candidates = store.scholar_search_candidates(&job.id).unwrap();
     assert_eq!(candidates.len(), 1);
-    assert_eq!(candidates[0].provider, "serpapi");
+    assert_eq!(candidates[0].provider, "searxng");
     assert_eq!(candidates[0].query, "Chicken soup ingredients");
-    assert_eq!(candidates[0].result_type, "recipe");
-    assert!(
-        candidates[0]
-            .page_provenance_json
-            .as_deref()
-            .unwrap()
-            .contains("A Cook")
-    );
-    assert!(
-        candidates[0]
-            .structured_data_json
-            .contains("Example Kitchen")
-    );
     assert_eq!(candidates[0].status, "fetched");
     assert_eq!(candidates[0].policy_status, "allowed");
     assert_eq!(
         candidates[0].fetched_excerpt.as_deref(),
         Some("Chicken soup contains chicken and carrots.")
     );
-    assert_eq!(candidates[0].url, "https://example.org/chicken-soup");
-    let domains = store.serpapi_domain_history(50).unwrap();
-    assert_eq!(domains.len(), 2);
-    let example_domain = domains
-        .iter()
-        .find(|domain| domain.domain == "example.org")
-        .unwrap();
-    assert_eq!(example_domain.query, "Chicken soup ingredients");
-    assert_eq!(example_domain.result_count, 2);
     drop(store);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn tavily_daily_reservations_enforce_the_persisted_call_cap() {
-    let path = temp_path();
-    let mut store = LearningStore::open(&path).unwrap();
-    for _ in 0..25 {
-        store
-            .reserve_tavily_search_with_interval("basic", 0)
-            .unwrap();
-    }
-    assert_eq!(
-        store
-            .reserve_tavily_search_with_interval("basic", 0)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-    assert_eq!(
-        store
-            .reserve_tavily_search_with_interval("unsupported", 0)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::InvalidData
-    );
-    drop(store);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn tavily_advanced_retries_reserve_two_monthly_credits() {
-    let path = temp_path();
-    let mut store = LearningStore::open(&path).unwrap();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
-    let historical = now - 25 * 60 * 60 * 1000;
-    for _ in 0..374 {
-        store
-            .connection
-            .execute(
-                "INSERT INTO tavily_usage (scheduled_at_ms, search_depth, credits, outcome)
-                 VALUES (?1, 'advanced', 2, 'succeeded')",
-                [historical],
-            )
-            .unwrap();
-    }
-    store
-        .connection
-        .execute(
-            "INSERT INTO tavily_usage (scheduled_at_ms, search_depth, credits, outcome)
-             VALUES (?1, 'basic', 1, 'succeeded')",
-            [historical],
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .reserve_tavily_search_with_interval("advanced", 0)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock,
-        "a two-credit advanced retry must respect the 750-credit monthly ceiling"
-    );
-    store
-        .reserve_tavily_search_with_interval("basic", 0)
-        .unwrap();
-    let credits: i64 = store
-        .connection
-        .query_row("SELECT SUM(credits) FROM tavily_usage", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(credits, 750);
-    drop(store);
-    let _ = std::fs::remove_file(path);
-}
-
-#[test]
-fn tavily_hourly_spacing_survives_restart() {
-    let path = temp_path();
-    let mut store = LearningStore::open(&path).unwrap();
-    store
-        .reserve_tavily_search_with_interval("basic", 3_600_000)
-        .unwrap();
-    drop(store);
-
-    let mut reopened = LearningStore::open(&path).unwrap();
-    assert!(
-        reopened
-            .last_scholar_provider_search_ms("tavily")
-            .unwrap()
-            .is_some()
-    );
-    assert_eq!(
-        reopened
-            .reserve_tavily_search_with_interval("basic", 3_600_000)
-            .unwrap_err()
-            .kind(),
-        std::io::ErrorKind::WouldBlock
-    );
-    drop(reopened);
     let _ = std::fs::remove_file(path);
 }
 
@@ -305,7 +169,7 @@ fn robots_cache_migration_imports_prior_denied_candidates() {
     store
         .record_typed_search_candidate(
             &job.id,
-            "serpapi",
+            "searxng",
             "topic",
             &scholar_search_candidate(
                 "organic_result",
@@ -352,7 +216,7 @@ fn scholar_http_slots_enforce_global_and_per_host_caps_and_recover_expired_lease
     let mut first = LearningStore::open(&path).unwrap();
     let mut second = LearningStore::open(&path).unwrap();
     let a = first
-        .reserve_host_request_with_interval("one.example", "tavily_search", 10_000)
+        .reserve_host_request_with_interval("one.example", "searxng_search", 10_000)
         .unwrap();
     let b = second
         .reserve_host_request_with_interval("two.example", "external_robots_txt", 10_000)
@@ -362,7 +226,7 @@ fn scholar_http_slots_enforce_global_and_per_host_caps_and_recover_expired_lease
         .unwrap_err();
     assert_eq!(same_host.kind(), std::io::ErrorKind::WouldBlock);
     let global = first
-        .reserve_host_request_with_interval("three.example", "serpapi_search", 10_000)
+        .reserve_host_request_with_interval("three.example", "searxng_search", 10_000)
         .unwrap_err();
     assert_eq!(global.kind(), std::io::ErrorKind::WouldBlock);
 

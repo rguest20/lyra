@@ -27,26 +27,18 @@ pub(super) fn enqueue_corroboration_candidate(
     Ok(())
 }
 
-fn provider_ready(
-    tx: &Transaction<'_>,
-    provider: &str,
-    now: i64,
-    interval_ms: i64,
-) -> io::Result<bool> {
-    let table = match provider {
-        "serpapi" => "serpapi_usage",
-        "tavily" => "tavily_usage",
-        _ => return Err(invalid("unsupported corroboration provider")),
-    };
-    let last = super::network::latest_provider_search_ms(tx, table)?;
-    if !last.is_none_or(|last| now >= last.saturating_add(interval_ms)) {
-        return Ok(false);
-    }
-    if provider == "tavily" {
-        let (daily_calls, monthly_credits) = super::network::tavily_usage_totals(tx, now)?;
-        return Ok(daily_calls < 25 && monthly_credits < 750);
-    }
-    Ok(true)
+fn searxng_ready(tx: &Transaction<'_>, now: i64, interval_ms: i64) -> io::Result<bool> {
+    let last: Option<i64> = tx
+        .query_row(
+            "SELECT CAST(strftime('%s', created_at) AS INTEGER) * 1000
+             FROM scholar_search_attempts WHERE provider = 'searxng'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(database_error)?;
+    Ok(last.is_none_or(|last| now >= last.saturating_add(interval_ms)))
 }
 
 impl LearningStore {
@@ -55,7 +47,7 @@ impl LearningStore {
             .connection
             .prepare(
                 "SELECT q.finding_id, f.subject || ' ' || f.relation || ' ' || f.object,
-                        q.status, q.serp_attempts, q.tavily_attempts,
+                        q.status, q.searxng_attempts,
                         q.claimed_provider, q.last_outcome
                  FROM scholar_corroboration_queue q
                  JOIN scholar_findings f ON f.id = q.finding_id
@@ -68,10 +60,9 @@ impl LearningStore {
                     finding_id: row.get(0)?,
                     claim: row.get(1)?,
                     status: row.get(2)?,
-                    serp_attempts: row.get(3)?,
-                    tavily_attempts: row.get(4)?,
-                    claimed_provider: row.get(5)?,
-                    last_outcome: row.get(6)?,
+                    searxng_attempts: row.get(3)?,
+                    claimed_provider: row.get(4)?,
+                    last_outcome: row.get(5)?,
                 })
             })
             .map_err(database_error)?
@@ -81,13 +72,11 @@ impl LearningStore {
 
     pub fn claim_corroboration_task(
         &mut self,
-        serp_available: bool,
-        tavily_available: bool,
-        serp_interval_ms: i64,
-        tavily_interval_ms: i64,
+        searxng_available: bool,
+        interval_ms: i64,
     ) -> io::Result<Option<CorroborationTask>> {
-        if serp_interval_ms < 1 || tavily_interval_ms < 1 {
-            return Err(invalid("corroboration provider intervals must be positive"));
+        if interval_ms < 1 {
+            return Err(invalid("SearXNG corroboration interval must be positive"));
         }
         let now = super::unix_time_ms_i64("corroboration timestamp too large")?;
         let tx = self
@@ -129,30 +118,21 @@ impl LearningStore {
         )
         .map_err(database_error)?;
 
-        for (provider, available, interval) in [
-            ("serpapi", serp_available, serp_interval_ms),
-            ("tavily", tavily_available, tavily_interval_ms),
-        ] {
-            if !available || !provider_ready(&tx, provider, now, interval)? {
-                continue;
-            }
-            let (attempt_column, due_column) = if provider == "serpapi" {
-                ("serp_attempts", "next_serp_at_ms")
-            } else {
-                ("tavily_attempts", "next_tavily_at_ms")
-            };
-            let sql = format!(
+        if !searxng_available || !searxng_ready(&tx, now, interval_ms)? {
+            tx.commit().map_err(database_error)?;
+            return Ok(None);
+        }
+        let selected = tx
+            .query_row(
                 "SELECT q.finding_id, f.subject, f.relation, f.object,
                         f.valid_from, f.valid_until
                  FROM scholar_corroboration_queue q
                  JOIN scholar_findings f ON f.id = q.finding_id
-                 WHERE q.status = 'pending' AND q.{attempt_column} < 3
-                   AND q.{due_column} <= ?1 AND f.status = 'needs_review'
-                 ORDER BY (q.serp_attempts + q.tavily_attempts),
-                          q.created_at_ms, q.finding_id LIMIT 1"
-            );
-            let selected = tx
-                .query_row(&sql, [now], |row| {
+                 WHERE q.status = 'pending' AND q.searxng_attempts < 3
+                   AND q.next_searxng_at_ms <= ?1 AND f.status = 'needs_review'
+                 ORDER BY q.searxng_attempts, q.created_at_ms, q.finding_id LIMIT 1",
+                [now],
+                |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -161,62 +141,52 @@ impl LearningStore {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<String>>(5)?,
                     ))
-                })
-                .optional()
-                .map_err(database_error)?;
-            let Some((finding_id, subject, relation, object, valid_from, valid_until)) = selected
-            else {
-                continue;
-            };
-            let job_id = super::new_scholar_job_id(&tx)?;
-            let question = format!("{} {} {}", subject, relation, object);
-            tx.execute(
-                "INSERT INTO scholar_jobs
-                    (id, conversation_id, turn_number, question, status, created_at, claimed_at, attempts)
-                 VALUES (?1, ?2, 0, ?3, 'processing',
-                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                         strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1)",
-                params![job_id, format!("corroboration:{job_id}"), question],
+                },
             )
+            .optional()
             .map_err(database_error)?;
-            tx.execute(
-                &format!(
-                    "UPDATE scholar_corroboration_queue SET status = 'processing',
-                        claimed_at_ms = ?2, claimed_provider = ?3, attempt_job_id = ?4,
-                        {attempt_column} = {attempt_column} + 1,
-                        {due_column} = ?5 WHERE finding_id = ?1 AND status = 'pending'"
-                ),
-                params![
-                    finding_id,
-                    now,
-                    provider,
-                    job_id,
-                    now.saturating_add(interval)
-                ],
-            )
-            .map_err(database_error)?;
-            tx.execute(
-                "INSERT INTO scholar_corroboration_attempts
-                    (finding_id, provider, job_id, started_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![finding_id, provider, job_id, now],
-            )
-            .map_err(database_error)?;
+        let Some((finding_id, subject, relation, object, valid_from, valid_until)) = selected
+        else {
             tx.commit().map_err(database_error)?;
-            return Ok(Some(CorroborationTask {
-                finding_id,
-                provider: provider.to_owned(),
-                job_id,
-                question,
-                subject,
-                relation,
-                object,
-                valid_from,
-                valid_until,
-            }));
-        }
+            return Ok(None);
+        };
+        let job_id = super::new_scholar_job_id(&tx)?;
+        let question = format!("{} {} {}", subject, relation, object);
+        tx.execute(
+            "INSERT INTO scholar_jobs
+                (id, conversation_id, turn_number, question, status, created_at, claimed_at, attempts)
+             VALUES (?1, ?2, 0, ?3, 'processing',
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1)",
+            params![job_id, format!("corroboration:{job_id}"), question],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "UPDATE scholar_corroboration_queue SET status = 'processing',
+                claimed_at_ms = ?2, claimed_provider = 'searxng', attempt_job_id = ?3,
+                searxng_attempts = searxng_attempts + 1, next_searxng_at_ms = ?4
+             WHERE finding_id = ?1 AND status = 'pending'",
+            params![finding_id, now, job_id, now.saturating_add(interval_ms)],
+        )
+        .map_err(database_error)?;
+        tx.execute(
+            "INSERT INTO scholar_corroboration_attempts
+                (finding_id, provider, job_id, started_at_ms)
+             VALUES (?1, 'searxng', ?2, ?3)",
+            params![finding_id, job_id, now],
+        )
+        .map_err(database_error)?;
         tx.commit().map_err(database_error)?;
-        Ok(None)
+        Ok(Some(CorroborationTask {
+            finding_id,
+            job_id,
+            question,
+            subject,
+            relation,
+            object,
+            valid_from,
+            valid_until,
+        }))
     }
 
     pub fn finish_corroboration_task(
@@ -237,33 +207,26 @@ impl LearningStore {
             )
             .map_err(database_error)?;
         if outcome == "deferred" {
-            let (attempt_column, due_column) = if task.provider == "serpapi" {
-                ("serp_attempts", "next_serp_at_ms")
-            } else {
-                ("tavily_attempts", "next_tavily_at_ms")
-            };
             tx.execute(
-                &format!(
-                    "UPDATE scholar_corroboration_queue SET
-                        {attempt_column} = max(0, {attempt_column} - 1),
-                        {due_column} = 0
-                     WHERE finding_id = ?1 AND attempt_job_id = ?2"
-                ),
+                "UPDATE scholar_corroboration_queue SET
+                    searxng_attempts = max(0, searxng_attempts - 1),
+                    next_searxng_at_ms = 0
+                 WHERE finding_id = ?1 AND attempt_job_id = ?2",
                 params![task.finding_id, task.job_id],
             )
             .map_err(database_error)?;
         }
-        let attempts: (i64, i64) = tx
+        let attempts: i64 = tx
             .query_row(
-                "SELECT serp_attempts, tavily_attempts FROM scholar_corroboration_queue
+                "SELECT searxng_attempts FROM scholar_corroboration_queue
                  WHERE finding_id = ?1 AND attempt_job_id = ?2 AND status = 'processing'",
                 params![task.finding_id, task.job_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .map_err(database_error)?;
         let next_status = if status != "needs_review" {
             "done"
-        } else if attempts.0 >= 3 && attempts.1 >= 3 {
+        } else if attempts >= 3 {
             "exhausted"
         } else {
             "pending"

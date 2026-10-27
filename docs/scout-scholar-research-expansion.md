@@ -1,8 +1,10 @@
 # Scout and Scholar Research Expansion
 
-**Status:** implementation in progress; Scout and Scholar run unattended with
-bounded probes, durable provider queues, policy-checked retrieval, provenance
-assessment, and conservative promotion gates.
+**Status:** historical implementation and design record. The provider plan
+below is superseded: current research sources are Wikipedia and local SearXNG.
+SerpAPI and Tavily credentials, requests, quotas, and corroboration paths have
+been retired. See the [README](../README.md) for current setup and behavior;
+provider-specific entries below describe the former implementation.
 
 ## Implementation progress
 
@@ -393,7 +395,7 @@ algorithm can enumerate every concept in a safetensors file. Keep the existing
 spacing, daily research cap, cooldowns, and private-topic filter, and add a
 separate cap for weight-derived leads.
 
-### Research and source policy
+### Historical research and source policy design
 
 Use a `SearchProvider` trait so discovery can be swapped without changing
 page retrieval or evidence policy. Bound result counts, timeouts, and fetch
@@ -779,7 +781,7 @@ should be ready before model-only Scout leads increase research volume.
   if many concurrent I/O streams justify it; keep model inference on a
   dedicated or blocking queue.
 
-## Open decisions before implementation
+## Historical open decisions before implementation
 
 - Identify the self-hosted SearXNG instance for deployment and ensure it
   enables JSON responses. Scholar can use Wikipedia until one is configured.

@@ -110,7 +110,7 @@ pub fn plan_with(
     if private_fact_request(question) {
         return Ok(None);
     }
-    let system = "/no_think\nPlan a lookup for missing PUBLIC facts needed by the current request (the last message). Prior user questions supply context. Known evidence contains SOURCE PASSAGES only, not a model draft. A best/preference request has factual prerequisites: neutral available choices or properties, never proof of an objective favourite. Research available candidates and relevant properties before making a recommendation. Do not research whether an assistant's invented answer is best. Search terms must describe the user's topic, not an unsupported answer. Preserve requested entities and constraints. For best X for purpose Y, keep purpose Y and research relevant properties, not merely a generic list of X. Skip lookup only when the passages address the concrete request and its constraints, not merely the same topic. Partial context does not fill missing facts needed for the requested comparison, use or recommendation. Private user facts, acknowledgments, corrections without a new factual request, and creative tasks need no lookup. Return ONLY JSON {\"needs_research\":true,\"question\":\"neutral factual prerequisite\",\"queries\":[\"public topic phrase\",\"synonym or alternate title\"]}, at most two queries. Otherwise return {\"needs_research\":false,\"question\":null,\"queries\":[]}.";
+    let system = "/no_think\nPlan a lookup for missing PUBLIC facts needed by the current request (the last message). Prior user questions supply context. Known evidence contains SOURCE PASSAGES only, not a model draft. A best/preference request has factual prerequisites: neutral available choices or properties, never proof of an objective favourite. Research available candidates and relevant properties before making a recommendation. Do not research whether an assistant's invented answer is best. Search terms must describe the user's topic, not an unsupported answer. Preserve requested entities and constraints. Each query must retain the requested property, comparison, time or scope needed to find relevant evidence; do not return an entity-only query for a question about a specific attribute. For best X for purpose Y, keep purpose Y and research relevant properties, not merely a generic list of X. Skip lookup only when the passages address the concrete request and its constraints, not merely the same topic. Partial context does not fill missing facts needed for the requested comparison, use or recommendation. Private user facts, acknowledgments, corrections without a new factual request, and creative tasks need no lookup. Return ONLY JSON {\"needs_research\":true,\"question\":\"neutral factual prerequisite\",\"queries\":[\"public topic phrase\",\"synonym or alternate title\"]}, at most two queries. Otherwise return {\"needs_research\":false,\"question\":null,\"queries\":[]}.";
     let mut messages = vec![
         Message {
             role: "system".into(),
@@ -857,6 +857,9 @@ mod tests {
         let mut calls = 0;
         let plan = plan_with("Are you sure about Walkers' Vanilla crisps?", "[]", |messages| {
             calls += 1;
+            assert!(messages[0]
+                .content
+                .contains("Each query must retain the requested property"));
             let context: serde_json::Value = serde_json::from_str(&messages[1].content).unwrap();
             assert_eq!(context["known_evidence"], "[]");
             assert!(context.get("draft").is_none());
@@ -870,6 +873,24 @@ mod tests {
         }).unwrap().unwrap();
         assert_eq!(calls, 2);
         assert!(plan.question.contains("Walkers"));
+    }
+
+    #[test]
+    fn lookup_plan_keeps_a_specific_property_with_an_ambiguous_entity_name() {
+        let plan = plan_with(
+            "What is the approximate age of the Trapezium stars?",
+            "[]",
+            |messages| {
+                assert!(messages[0]
+                    .content
+                    .contains("do not return an entity-only query"));
+                Ok(r#"{"needs_research":true,"question":"What is the approximate age of the Trapezium stars?","queries":["Trapezium stars approximate age","Trapezium Cluster age estimate"]}"#.into())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(plan.queries[0], "Trapezium stars approximate age");
+        assert!(plan.queries.iter().all(|query| query.contains("age")));
     }
 
     #[test]

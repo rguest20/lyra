@@ -1,10 +1,9 @@
 //! Scholar orchestration and extraction integration regressions.
 use super::claims::claim_is_grounded;
-use super::discovery::{SerpApiResponse, linked_serpapi_results};
 use super::{
     ExtractionAttempt, ScholarFindingJson, SearchPage, calibrate_research_relevance,
-    discover_configured_searxng, discovery_trigger, evaluate_extraction, finding_matches_target,
-    html_to_text, parse_extraction, relevant_page, retry_after_delay_ms, should_retry_grounding,
+    discover_configured_searxng, evaluate_extraction, finding_matches_target, html_to_text,
+    parse_extraction, relevant_page, retry_after_delay_ms, should_retry_grounding,
 };
 use crate::storage::CorroborationTask;
 use crate::test_support::ScholarJobTestHelpers;
@@ -420,7 +419,8 @@ fn configured_searxng_is_dispatched_only_when_no_candidates_exist() {
             &mut store,
             &job.id,
             "chicken soup ingredients",
-            Some(&format!("http://127.0.0.1:{}/search", address.port()))
+            Some(&format!("http://127.0.0.1:{}/search", address.port())),
+            None,
         )
         .unwrap()
     );
@@ -435,7 +435,8 @@ fn configured_searxng_is_dispatched_only_when_no_candidates_exist() {
             &mut store,
             &job.id,
             "chicken soup ingredients",
-            Some("https://untrusted.example/search")
+            Some("https://untrusted.example/search"),
+            None,
         )
         .unwrap()
     );
@@ -447,7 +448,6 @@ fn configured_searxng_is_dispatched_only_when_no_candidates_exist() {
 fn corroboration_requires_the_same_claim_and_validity_period() {
     let task = CorroborationTask {
         finding_id: 1,
-        provider: "serpapi".into(),
         job_id: "job".into(),
         question: "Mars is a planet".into(),
         subject: "Mars".into(),
@@ -471,30 +471,6 @@ fn corroboration_requires_the_same_claim_and_validity_period() {
     finding.object = "planet".into();
     finding.valid_until = Some("2020-01-01".into());
     assert!(!finding_matches_target(&finding, &task));
-}
-
-#[test]
-fn weak_wikipedia_uses_normal_spacing_and_strong_wikipedia_waits_twice_as_long() {
-    let now = 10_000_000;
-    let last = now - 3_600_000;
-    assert_eq!(
-        discovery_trigger(true, Some(last), now, 1_800),
-        Some("wikipedia_insufficient")
-    );
-    assert_eq!(discovery_trigger(false, Some(last), now, 3_600), None);
-    assert_eq!(
-        discovery_trigger(false, Some(last), now, 1_800),
-        Some("exploration_elapsed")
-    );
-    assert_eq!(discovery_trigger(true, Some(now - 1_000), now, 1_800), None);
-    assert_eq!(
-        discovery_trigger(false, Some(now - 1_000), now, 1_800),
-        None
-    );
-    assert_eq!(
-        discovery_trigger(false, None, now, 3_600),
-        Some("exploration_elapsed")
-    );
 }
 
 #[test]
@@ -794,42 +770,6 @@ fn malformed_and_ungrounded_outputs_receive_one_bounded_ai_repair() {
         model_output: None,
     };
     assert!(!should_retry_grounding(&model_error));
-}
-
-#[test]
-fn serpapi_rich_result_groups_preserve_type_and_structured_context() {
-    let response: SerpApiResponse = serde_json::from_str(
-        r#"{
-            "organic_results": [],
-            "recipes_results": [{"title":"Chicken Soup","link":"https://www.example.test/chicken-soup","source":"Example Kitchen","rating":4.8,"reviews":123,"ingredients":["chicken","carrots","celery"],"total_time":"45 minutes"}],
-            "shopping_results": [{"title":"Soup Pot","link":"https://shop.example.test/pot","price":"£20","rating":4.2}],
-            "local_results": {"places":[{"title":"Soup Kitchen","website":"https://food.example.test","address":"Main Street"}]}
-        }"#,
-    )
-    .unwrap();
-    let recipes = linked_serpapi_results(
-        "recipes_results",
-        response.structured_results.get("recipes_results").unwrap(),
-    );
-    assert_eq!(recipes.len(), 1);
-    assert_eq!(recipes[0].result_type, "recipes_results");
-    assert_eq!(recipes[0].title, "Chicken Soup");
-    assert!(recipes[0].snippet.contains("carrots"));
-    assert!(recipes[0].structured_data_json.contains("45 minutes"));
-    let products = linked_serpapi_results(
-        "shopping_results",
-        response.structured_results.get("shopping_results").unwrap(),
-    );
-    assert_eq!(products.len(), 1);
-    assert_eq!(products[0].result_type, "shopping_results");
-    assert!(products[0].structured_data_json.contains("£20"));
-    let places = linked_serpapi_results(
-        "local_results",
-        response.structured_results.get("local_results").unwrap(),
-    );
-    assert_eq!(places.len(), 1);
-    assert_eq!(places[0].title, "Soup Kitchen");
-    assert_eq!(places[0].url, "https://food.example.test/");
 }
 
 #[test]

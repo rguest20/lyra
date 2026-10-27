@@ -261,21 +261,17 @@ impl Cli {
                     }
                 }
             }
-            [subcommand] if subcommand == "sites" => {
-                print_serpapi_sites(&store, 50)?;
-            }
             [subcommand] if subcommand == "blocked" => {
                 print_robots_blocks(&store, 50)?;
             }
             [subcommand] if subcommand == "queue" => {
                 for task in store.corroboration_queue(50).map_err(|e| e.to_string())? {
                     println!(
-                        "Finding #{} [{}] {} — SerpAPI {}/3, Tavily {}/3{}",
+                        "Finding #{} [{}] {} — SearXNG {}/3{}",
                         task.finding_id,
                         task.status,
                         task.claim,
-                        task.serp_attempts,
-                        task.tavily_attempts,
+                        task.searxng_attempts,
                         task.claimed_provider
                             .as_deref()
                             .map(|provider| format!("; running {provider}"))
@@ -291,12 +287,6 @@ impl Cli {
                     .parse::<usize>()
                     .map_err(|_| "scholar blocked limit must be a positive integer")?;
                 print_robots_blocks(&store, limit)?;
-            }
-            [subcommand, limit] if subcommand == "sites" => {
-                let limit = limit
-                    .parse::<usize>()
-                    .map_err(|_| "scholar sites limit must be a positive integer")?;
-                print_serpapi_sites(&store, limit)?;
             }
             [subcommand, job_id] if subcommand == "show" => {
                 for attempt in store
@@ -559,26 +549,6 @@ fn print_robots_blocks(store: &storage::LearningStore, limit: usize) -> Result<(
         println!(
             "{}{} — {} (expires {})",
             block.host, block.display_path, block.reason, block.expires_at
-        );
-    }
-    Ok(())
-}
-
-fn print_serpapi_sites(store: &storage::LearningStore, limit: usize) -> Result<(), String> {
-    let sites = store
-        .serpapi_domain_history(limit)
-        .map_err(|error| error.to_string())?;
-    if sites.is_empty() {
-        println!("No SerpAPI domain history yet");
-        return Ok(());
-    }
-    println!(
-        "SerpAPI domains by search (search-result appearance is discovery provenance, not a trust score):"
-    );
-    for site in sites {
-        println!(
-            "{} — {} Google result(s) for: {}",
-            site.domain, site.result_count, site.query
         );
     }
     Ok(())

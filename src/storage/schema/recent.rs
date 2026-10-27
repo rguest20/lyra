@@ -1273,6 +1273,116 @@ impl LearningStore {
             ).map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 64 {
+            // Preserve former provider history while moving active corroboration
+            // to SearXNG and separating its attempt count from legacy counters.
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !table_has_column(&tx, "scholar_corroboration_queue", "searxng_attempts")? {
+                let now: i64 = tx
+                    .query_row(
+                        "SELECT CAST(strftime('%s', 'now') AS INTEGER) * 1000",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(database_error)?;
+                tx.execute(
+                    "UPDATE scholar_jobs SET status = 'no_result', claimed_at = NULL,
+                    last_error = 'corroboration discovery now uses SearXNG'
+                 WHERE status = 'processing' AND id IN
+                    (SELECT attempt_job_id FROM scholar_corroboration_queue
+                     WHERE status = 'processing')",
+                    [],
+                )
+                .map_err(database_error)?;
+                tx.execute(
+                    "UPDATE scholar_corroboration_attempts SET outcome = 'interrupted',
+                    finished_at_ms = ?1 WHERE outcome = 'processing' AND job_id IN
+                    (SELECT attempt_job_id FROM scholar_corroboration_queue
+                     WHERE status = 'processing')",
+                    [now],
+                )
+                .map_err(database_error)?;
+                tx.execute_batch(
+                "CREATE TABLE scholar_corroboration_queue_replacement (
+                    finding_id INTEGER PRIMARY KEY REFERENCES scholar_findings(id),
+                    claim_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'processing', 'done', 'exhausted')),
+                    legacy_serp_attempts INTEGER NOT NULL DEFAULT 0,
+                    legacy_tavily_attempts INTEGER NOT NULL DEFAULT 0,
+                    legacy_next_serp_at_ms INTEGER NOT NULL DEFAULT 0,
+                    legacy_next_tavily_at_ms INTEGER NOT NULL DEFAULT 0,
+                    searxng_attempts INTEGER NOT NULL DEFAULT 0,
+                    next_searxng_at_ms INTEGER NOT NULL DEFAULT 0,
+                    claimed_at_ms INTEGER,
+                    claimed_provider TEXT CHECK (claimed_provider IN ('searxng')),
+                    attempt_job_id TEXT REFERENCES scholar_jobs(id),
+                    created_at_ms INTEGER NOT NULL,
+                    last_outcome TEXT
+                 );
+                 INSERT INTO scholar_corroboration_queue_replacement (
+                    finding_id, claim_key, status, legacy_serp_attempts, legacy_tavily_attempts,
+                    legacy_next_serp_at_ms, legacy_next_tavily_at_ms, searxng_attempts,
+                    next_searxng_at_ms, claimed_at_ms, claimed_provider,
+                    attempt_job_id, created_at_ms, last_outcome
+                 )
+                 SELECT q.finding_id, q.claim_key,
+                    CASE
+                      WHEN q.status = 'processing' THEN 'pending'
+                      WHEN q.status = 'exhausted' AND f.status = 'needs_review' THEN 'pending'
+                      ELSE q.status
+                    END,
+                    q.serp_attempts, q.tavily_attempts,
+                    q.next_serp_at_ms, q.next_tavily_at_ms, 0, 0,
+                    CASE WHEN q.status = 'processing' THEN NULL ELSE q.claimed_at_ms END,
+                    CASE WHEN q.status = 'processing' THEN NULL ELSE q.claimed_provider END,
+                    CASE WHEN q.status = 'processing' THEN NULL ELSE q.attempt_job_id END,
+                    q.created_at_ms,
+                    CASE WHEN q.status = 'processing' THEN 'provider_replaced'
+                         WHEN q.status = 'exhausted' AND f.status = 'needs_review'
+                           THEN 'provider_replaced'
+                         ELSE q.last_outcome END
+                 FROM scholar_corroboration_queue q
+                 JOIN scholar_findings f ON f.id = q.finding_id;
+                 CREATE TABLE scholar_corroboration_attempts_replacement (
+                    id INTEGER PRIMARY KEY,
+                    finding_id INTEGER NOT NULL REFERENCES scholar_corroboration_queue_replacement(finding_id),
+                    provider TEXT NOT NULL CHECK (provider IN ('serpapi', 'tavily', 'searxng')),
+                    job_id TEXT NOT NULL UNIQUE REFERENCES scholar_jobs(id),
+                    started_at_ms INTEGER NOT NULL,
+                    finished_at_ms INTEGER,
+                    outcome TEXT NOT NULL DEFAULT 'processing'
+                 );
+                 INSERT INTO scholar_corroboration_attempts_replacement
+                    (id, finding_id, provider, job_id, started_at_ms, finished_at_ms, outcome)
+                 SELECT id, finding_id, provider, job_id, started_at_ms, finished_at_ms, outcome
+                 FROM scholar_corroboration_attempts;
+                 DROP TABLE scholar_corroboration_attempts;
+                 DROP TABLE scholar_corroboration_queue;
+                 ALTER TABLE scholar_corroboration_queue_replacement
+                    RENAME TO scholar_corroboration_queue;
+                 ALTER TABLE scholar_corroboration_attempts_replacement
+                    RENAME TO scholar_corroboration_attempts;
+                 CREATE INDEX scholar_corroboration_queue_by_status
+                    ON scholar_corroboration_queue(status, created_at_ms);
+                 CREATE INDEX scholar_corroboration_attempts_by_finding
+                    ON scholar_corroboration_attempts(finding_id, id DESC);
+                 ALTER TABLE serpapi_search_domains RENAME TO legacy_serpapi_search_domains;
+                 ALTER TABLE serpapi_usage RENAME TO legacy_serpapi_usage;
+                 ALTER TABLE tavily_usage RENAME TO legacy_tavily_usage;
+                 DROP INDEX IF EXISTS serpapi_usage_by_time;
+                 DROP INDEX IF EXISTS serpapi_domains_by_domain;
+                 DROP INDEX IF EXISTS tavily_usage_by_day;",
+            )
+            .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 64)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         if version < 65 {
             let tx = self
                 .connection

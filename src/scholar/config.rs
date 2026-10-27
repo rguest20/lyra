@@ -1,4 +1,4 @@
-//! Small, secret-safe configuration surface for optional research providers.
+//! Secret-safe configuration for the local SearXNG search service.
 
 use std::io;
 use std::path::Path;
@@ -7,8 +7,6 @@ use serde::Deserialize;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ProviderConfig {
-    pub tavily_api_key: Option<String>,
-    pub serp_api_key: Option<String>,
     pub searxng_url: Option<String>,
     pub config_error: Option<String>,
 }
@@ -22,14 +20,7 @@ struct ConfigFile {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct SearchSection {
-    tavily: TavilySection,
     searxng: SearxngSection,
-}
-
-#[derive(Debug, Deserialize, Default)]
-#[serde(default)]
-struct TavilySection {
-    api_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -59,9 +50,6 @@ impl ProviderConfig {
             ),
         };
         Ok(Self {
-            tavily_api_key: usable(std::env::var("TAVILY_API_KEY").ok())
-                .or_else(|| usable(file.search.tavily.api_key)),
-            serp_api_key: usable(std::env::var("SERP_API_KEY").ok()),
             searxng_url: usable(std::env::var("SEARXNG_URL").ok())
                 .or_else(|| usable(file.search.searxng.url)),
             config_error,
@@ -88,33 +76,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_provider_configuration_without_exposing_values_in_errors() {
+    fn reads_searxng_configuration_without_exposing_values_in_errors() {
         let parsed: ConfigFile = toml::from_str(
-            r#"[search.tavily]
-api_key = "test-secret"
-[search.searxng]
+            r#"[search.searxng]
 url = "http://searxng.local:8080/search"
 "#,
         )
         .unwrap();
-        assert_eq!(parsed.search.tavily.api_key.as_deref(), Some("test-secret"));
         assert_eq!(
             parsed.search.searxng.url.as_deref(),
             Some("http://searxng.local:8080/search")
         );
-        let missing_keys: ConfigFile = toml::from_str("[search.tavily]\n").unwrap();
-        assert!(missing_keys.search.tavily.api_key.is_none());
-        let error = toml::from_str::<ConfigFile>("[search.tavily\n").unwrap_err();
-        assert!(!error.to_string().contains("test-secret"));
+        let missing_url: ConfigFile = toml::from_str("[search.searxng]\n").unwrap();
+        assert!(missing_url.search.searxng.url.is_none());
+        let error = toml::from_str::<ConfigFile>("[search.searxng\n").unwrap_err();
+        assert!(!error.to_string().contains("api_key"));
         let safe_error = invalid_config(Path::new("config.toml"));
         assert!(safe_error.to_string().contains("unreadable or invalid"));
-        assert!(!safe_error.to_string().contains("test-secret"));
-    }
-
-    #[test]
-    fn malformed_file_errors_never_include_the_raw_secret_value() {
-        let error = invalid_config(Path::new("config.toml"));
-        assert!(error.to_string().contains("unreadable or invalid"));
-        assert!(!error.to_string().contains("api_key"));
+        assert!(!safe_error.to_string().contains("api_key"));
     }
 }

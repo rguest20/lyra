@@ -1,4 +1,4 @@
-//! Host reservations, provider budgets, cache and network accounting.
+//! Shared host reservations, caches and Wikipedia request accounting.
 use super::*;
 use sha2::{Digest, Sha256};
 pub(crate) const MEDIAWIKI_TRANSIENT_ERROR: &str = "MediaWiki API returned a retryable error";
@@ -20,70 +20,6 @@ impl CachedSourcePage {
             body: row.get(1)?,
         })
     }
-}
-
-pub(super) fn tavily_usage_totals(connection: &Connection, now: i64) -> io::Result<(i64, i64)> {
-    connection
-        .query_row(
-            "SELECT
-                (SELECT COUNT(*) FROM tavily_usage WHERE scheduled_at_ms >= ?1),
-                (SELECT COALESCE(SUM(credits), 0) FROM tavily_usage
-                 WHERE strftime('%Y-%m', scheduled_at_ms / 1000, 'unixepoch') =
-                       strftime('%Y-%m', 'now'))",
-            [now.saturating_sub(86_400_000)],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(database_error)
-}
-
-pub(super) fn latest_provider_search_ms(
-    connection: &Connection,
-    table: &str,
-) -> io::Result<Option<i64>> {
-    connection
-        .query_row(
-            &format!("SELECT scheduled_at_ms FROM {table} ORDER BY id DESC LIMIT 1"),
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(database_error)
-}
-
-fn complete_search_reservation(
-    connection: &Connection,
-    table: &str,
-    provider: &str,
-    request_id: i64,
-    response_status: Option<u16>,
-    error: Option<&str>,
-) -> io::Result<()> {
-    let completed_at_ms = super::unix_time_ms_i64("search completion timestamp too large")?;
-    let changed = connection
-        .execute(
-            &format!(
-                "UPDATE {table} SET completed_at_ms = ?2, response_status = ?3,
-                    outcome = ?4, error = ?5 WHERE id = ?1 AND outcome = 'reserved'"
-            ),
-            params![
-                request_id,
-                completed_at_ms,
-                response_status,
-                if error.is_some() {
-                    "failed"
-                } else {
-                    "succeeded"
-                },
-                error.map(|value| value.chars().take(500).collect::<String>()),
-            ],
-        )
-        .map_err(database_error)?;
-    if changed != 1 {
-        return Err(invalid(&format!(
-            "{provider} search reservation was not pending"
-        )));
-    }
-    Ok(())
 }
 
 fn configured_limit(name: &str, default: i64, maximum: i64) -> i64 {
@@ -487,15 +423,6 @@ pub(crate) fn robots_block_key(path_query: &str) -> String {
 }
 
 impl LearningStore {
-    pub fn last_scholar_provider_search_ms(&self, provider: &str) -> io::Result<Option<i64>> {
-        let table = match provider {
-            "serpapi" => "serpapi_usage",
-            "tavily" => "tavily_usage",
-            _ => return Err(invalid("unsupported Scholar search provider")),
-        };
-        latest_provider_search_ms(&self.connection, table)
-    }
-
     pub fn robots_blocked(&self, host: &str, path_query: &str) -> io::Result<bool> {
         let key = robots_block_key(path_query);
         self.connection
@@ -569,197 +496,6 @@ impl LearningStore {
             .map_err(database_error)
     }
 
-    /// Reserves the single SerpAPI slot only after its persisted cooldown has
-    /// elapsed. Reservations are written before issuing network requests.
-    pub fn reserve_serpapi_search(
-        &mut self,
-        minimum_interval_ms: i64,
-        job_id: &str,
-        query: &str,
-    ) -> io::Result<SerpApiReservation> {
-        if minimum_interval_ms < 1 || query.trim().is_empty() {
-            return Err(invalid("SerpAPI interval must be positive"));
-        }
-        let now = super::unix_time_ms_i64("search timestamp too large")?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error)?;
-        let previous: Option<i64> = tx
-            .query_row(
-                "SELECT scheduled_at_ms FROM serpapi_usage ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        if previous.is_some_and(|last| now < last.saturating_add(minimum_interval_ms)) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "SerpAPI search is cooling down",
-            ));
-        }
-        tx.execute(
-            "INSERT INTO serpapi_usage (scheduled_at_ms, outcome, job_id, query)
-             VALUES (?1, 'reserved', ?2, ?3)",
-            params![now, job_id, query.chars().take(1_000).collect::<String>()],
-        )
-        .map_err(database_error)?;
-        let id = tx.last_insert_rowid();
-        tx.commit().map_err(database_error)?;
-        Ok(SerpApiReservation {
-            id,
-            scheduled_at_ms: now,
-        })
-    }
-
-    pub fn record_serpapi_search_domains(
-        &self,
-        search_id: i64,
-        domains: &[(String, usize)],
-    ) -> io::Result<()> {
-        let tx = self
-            .connection
-            .unchecked_transaction()
-            .map_err(database_error)?;
-        for (domain, result_count) in domains {
-            let domain = crate::storage::normalize_domain(domain);
-            if domain.is_empty() || *result_count == 0 {
-                continue;
-            }
-            tx.execute(
-                "INSERT INTO serpapi_search_domains (search_id, domain, result_count)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(search_id, domain) DO UPDATE SET
-                    result_count = excluded.result_count",
-                params![
-                    search_id,
-                    domain,
-                    i64::try_from(*result_count).unwrap_or(i64::MAX)
-                ],
-            )
-            .map_err(database_error)?;
-        }
-        tx.commit().map_err(database_error)
-    }
-
-    pub fn serpapi_domain_history(
-        &self,
-        limit: usize,
-    ) -> io::Result<Vec<SerpApiDomainObservation>> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT u.scheduled_at_ms, u.query, d.domain, d.result_count
-             FROM serpapi_search_domains d
-             JOIN serpapi_usage u ON u.id = d.search_id
-             ORDER BY u.scheduled_at_ms DESC, d.domain
-             LIMIT ?1",
-            )
-            .map_err(database_error)?;
-        statement
-            .query_map([sqlite_limit(limit.min(1_000))?], |row| {
-                Ok(SerpApiDomainObservation {
-                    searched_at_ms: row.get(0)?,
-                    query: row.get(1)?,
-                    domain: row.get(2)?,
-                    result_count: usize::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
-                })
-            })
-            .map_err(database_error)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)
-    }
-
-    pub fn complete_serpapi_search(
-        &self,
-        request_id: i64,
-        response_status: Option<u16>,
-        error: Option<&str>,
-    ) -> io::Result<()> {
-        complete_search_reservation(
-            &self.connection,
-            "serpapi_usage",
-            "SerpAPI",
-            request_id,
-            response_status,
-            error,
-        )
-    }
-
-    pub fn reserve_tavily_search_with_interval(
-        &mut self,
-        search_depth: &str,
-        minimum_interval_ms: i64,
-    ) -> io::Result<TavilyReservation> {
-        if minimum_interval_ms < 0 {
-            return Err(invalid("Tavily interval must not be negative"));
-        }
-        let credits = match search_depth {
-            "basic" => 1_i64,
-            "advanced" => 2_i64,
-            _ => return Err(invalid("unsupported Tavily search depth")),
-        };
-        let now = super::unix_time_ms_i64("search timestamp too large")?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(database_error)?;
-        let previous: Option<i64> = tx
-            .query_row(
-                "SELECT scheduled_at_ms FROM tavily_usage ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        if previous.is_some_and(|last| now < last.saturating_add(minimum_interval_ms)) {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Tavily search is cooling down",
-            ));
-        }
-        let (daily_calls, month_credits) = tavily_usage_totals(&tx, now)?;
-        if daily_calls >= 25 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Scholar reached the rolling Tavily search-call limit",
-            ));
-        }
-        if month_credits.saturating_add(credits) > 750 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Scholar reached the monthly Tavily credit limit",
-            ));
-        }
-        tx.execute(
-            "INSERT INTO tavily_usage
-                (scheduled_at_ms, search_depth, credits, outcome)
-             VALUES (?1, ?2, ?3, 'reserved')",
-            params![now, search_depth, credits],
-        )
-        .map_err(database_error)?;
-        let id = tx.last_insert_rowid();
-        tx.commit().map_err(database_error)?;
-        Ok(TavilyReservation { id, credits })
-    }
-
-    pub fn complete_tavily_search(
-        &self,
-        request_id: i64,
-        response_status: Option<u16>,
-        error: Option<&str>,
-    ) -> io::Result<()> {
-        complete_search_reservation(
-            &self.connection,
-            "tavily_usage",
-            "Tavily",
-            request_id,
-            response_status,
-            error,
-        )
-    }
-
     /// Atomically reserve a persisted host slot. Unfinished reservations count
     /// against the global and per-host caps until completion or lease expiry.
     pub fn reserve_host_request_with_interval(
@@ -787,8 +523,6 @@ impl LearningStore {
                     | "external_llms_txt"
                     | "external_manifest_txt"
                     | "external_page_content"
-                    | "serpapi_search"
-                    | "tavily_search"
                     | "searxng_search"
             )
         {

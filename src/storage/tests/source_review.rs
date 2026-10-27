@@ -427,7 +427,7 @@ fn scholar_extraction_attempts_keep_both_passage_decisions_across_restarts() {
     store
         .record_typed_search_candidate(
             &job.id,
-            "serpapi",
+            "searxng",
             "Mars composition",
             &scholar_search_candidate(
                 "organic_result",
