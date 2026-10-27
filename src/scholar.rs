@@ -7,8 +7,7 @@ pub(crate) mod evidence;
 mod extraction;
 pub(crate) mod passages;
 mod provenance;
-mod retention;
-pub(crate) use retention::probe_baskets;
+pub(crate) use crate::research_intake::probe_baskets;
 mod site_policy;
 mod wikipedia;
 
@@ -451,9 +450,6 @@ pub fn process_once(database_path: &Path, model: &mut LocalModel) -> io::Result<
     };
     if let Some(job) = job {
         return process_job(&mut store, job, model, false);
-    }
-    if let Some(source) = store.claim_research_source()? {
-        return retention::harvest(&mut store, source, model);
     }
     store.automatically_review_pending_scholar_evidence()
 }

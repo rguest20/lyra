@@ -1,6 +1,7 @@
 use super::*;
 
-const RESEARCH_HARVEST_CHUNK_CHARS: usize = 1_000;
+const RESEARCH_HARVEST_CHUNK_CHARS: usize = 2_000;
+const RESEARCH_HARVEST_STRIDE_CHARS: usize = 1_000;
 
 #[derive(Debug)]
 pub struct ResearchSource {
@@ -121,6 +122,236 @@ fn semantic_subject_terms(subject: &str) -> Vec<String> {
 }
 
 impl LearningStore {
+    /// Persistently rotates background Scout work so available queues get a
+    /// turn even when another source of work remains continuously eligible.
+    pub fn claim_next_scout_stage(&mut self) -> io::Result<usize> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(database_error)?;
+        let stage: i64 = tx
+            .query_row(
+                "SELECT next_stage FROM scout_work_state WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        tx.execute(
+            "UPDATE scout_work_state SET next_stage=?1 WHERE id=1",
+            [(stage + 1) % 5],
+        )
+        .map_err(database_error)?;
+        tx.commit().map_err(database_error)?;
+        usize::try_from(stage).map_err(io::Error::other)
+    }
+
+    pub fn next_research_assertion_lead(
+        &mut self,
+    ) -> io::Result<Option<crate::storage::RetainedClaimLead>> {
+        self.connection.execute(
+            "WITH claim_depth AS (
+                SELECT c.id AS claim_id,
+                    COALESCE((SELECT parent.derivation_depth+1
+                        FROM scout_investigations i
+                        JOIN research_assertion_checks parent
+                          ON i.trigger_ref='research_claim:' || parent.claim_id
+                        WHERE i.trigger_kind='assertion' AND i.scholar_job_id=s.job_id
+                        ORDER BY i.id DESC LIMIT 1),
+                      (SELECT max(q.depth) FROM research_questions q WHERE q.scholar_job_id=s.job_id),0) AS depth
+                FROM research_claims c JOIN research_sources s ON s.id=c.source_id
+                WHERE NOT EXISTS(SELECT 1 FROM research_assertion_checks a WHERE a.claim_id=c.id)
+             )
+             INSERT OR IGNORE INTO research_assertion_checks
+                (claim_id,question,selection_reason,status,derivation_depth,created_at,updated_at)
+             SELECT claim_id,NULL,'Skipped: maximum assertion derivation depth is three','skipped',depth,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             FROM claim_depth WHERE depth>=3",
+            [],
+        ).map_err(database_error)?;
+        self.connection
+            .query_row(
+                "SELECT c.id,c.subject,c.relation,c.object,c.evidence_text,c.qualifications,
+                    s.title,s.url,s.content_hash,
+                    COALESCE((SELECT parent.derivation_depth+1
+                        FROM scout_investigations i
+                        JOIN research_assertion_checks parent
+                          ON i.trigger_ref='research_claim:' || parent.claim_id
+                        WHERE i.trigger_kind='assertion' AND i.scholar_job_id=s.job_id
+                        ORDER BY i.id DESC LIMIT 1),
+                      (SELECT max(q.depth) FROM research_questions q WHERE q.scholar_job_id=s.job_id),0)
+                 FROM research_claims c JOIN research_sources s ON s.id=c.source_id
+                 WHERE NOT EXISTS(SELECT 1 FROM research_assertion_checks a WHERE a.claim_id=c.id)
+                   AND COALESCE((SELECT parent.derivation_depth+1
+                        FROM scout_investigations i
+                        JOIN research_assertion_checks parent
+                          ON i.trigger_ref='research_claim:' || parent.claim_id
+                        WHERE i.trigger_kind='assertion' AND i.scholar_job_id=s.job_id
+                        ORDER BY i.id DESC LIMIT 1),
+                      (SELECT max(q.depth) FROM research_questions q WHERE q.scholar_job_id=s.job_id),0) < 3
+                 ORDER BY c.id LIMIT 1",
+                [],
+                |row| {
+                    Ok(crate::storage::RetainedClaimLead {
+                        claim_id: row.get(0)?,
+                        subject: row.get(1)?,
+                        relation: row.get(2)?,
+                        object: row.get(3)?,
+                        evidence_text: row.get(4)?,
+                        qualifications: row.get(5)?,
+                        source_title: row.get(6)?,
+                        source_url: row.get(7)?,
+                        content_hash: row.get(8)?,
+                        derivation_depth: row.get(9)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(database_error)
+    }
+
+    pub fn has_pending_research_assertion_lead(&self) -> io::Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM research_assertion_checks WHERE status='pending')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn recent_research_assertion_checks(
+        &self,
+        limit: i64,
+    ) -> io::Result<Vec<serde_json::Value>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.subject,c.relation,c.object,c.qualifications,c.evidence_text,
+                a.question,a.status,a.selection_reason,a.derivation_depth,s.content_hash
+             FROM research_assertion_checks a
+             JOIN research_claims c ON c.id=a.claim_id
+             JOIN research_sources s ON s.id=c.source_id
+             ORDER BY a.updated_at DESC,a.claim_id DESC LIMIT ?1",
+            )
+            .map_err(database_error)?;
+        statement
+            .query_map([limit.clamp(1, 30)], |row| {
+                Ok(serde_json::json!({
+                    "subject":row.get::<_,String>(0)?,
+                    "relation":row.get::<_,String>(1)?,
+                    "object":row.get::<_,String>(2)?,
+                    "qualifications":row.get::<_,String>(3)?,
+                    "exact_source_quote":row.get::<_,String>(4)?,
+                    "previous_question":row.get::<_,Option<String>>(5)?,
+                    "status":row.get::<_,String>(6)?,
+                    "selection_reason":row.get::<_,String>(7)?,
+                    "derivation_depth":row.get::<_,i64>(8)?,
+                    "source_content_hash":row.get::<_,String>(9)?,
+                }))
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)
+    }
+
+    pub fn research_assertion_selection(&self, claim_id: i64) -> io::Result<String> {
+        self.connection
+            .query_row(
+                "SELECT CASE WHEN question IS NULL THEN 'skipped' ELSE status END
+                 FROM research_assertion_checks WHERE claim_id=?1",
+                [claim_id],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
+    pub fn record_research_assertion_selection(
+        &self,
+        lead: &crate::storage::RetainedClaimLead,
+        question: Option<&str>,
+        reason: &str,
+    ) -> io::Result<()> {
+        if !crate::storage::valid_printable_field(reason, 1_000)
+            || question.is_some_and(|question| !crate::storage::valid_bounded_field(question, 300))
+        {
+            return Err(invalid("invalid retained assertion selection"));
+        }
+        self.connection.execute(
+                "INSERT OR IGNORE INTO research_assertion_checks
+                (claim_id,question,selection_reason,status,derivation_depth,created_at,updated_at)
+             VALUES (?1,?2,?3,?4,?5,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            params![lead.claim_id,question,reason,if question.is_some() { "pending" } else { "skipped" },lead.derivation_depth],
+        ).map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn queue_research_assertion_lead(&mut self) -> io::Result<Option<(i64, String)>> {
+        self.connection.execute(
+            "UPDATE research_assertion_checks
+             SET status=CASE
+                 WHEN EXISTS(SELECT 1 FROM scholar_findings f WHERE f.job_id=scholar_job_id AND f.status='promoted')
+                   OR (SELECT status FROM scholar_jobs WHERE id=scholar_job_id)='promoted' THEN 'verified'
+                 WHEN EXISTS(SELECT 1 FROM scholar_findings f JOIN scholar_source_assessments a ON a.finding_id=f.id
+                     WHERE f.job_id=scholar_job_id AND a.gate_status='awaiting_corroboration') THEN 'waiting_for_evidence'
+                 WHEN EXISTS(SELECT 1 FROM scholar_findings f WHERE f.job_id=scholar_job_id AND f.status='needs_review') THEN 'proposed'
+                 WHEN EXISTS(SELECT 1 FROM scholar_findings f WHERE f.job_id=scholar_job_id AND f.status='rejected') THEN 'reviewed'
+                 WHEN (SELECT status FROM scholar_jobs WHERE id=scholar_job_id)='needs_review' THEN 'proposed'
+                 WHEN (SELECT status FROM scholar_jobs WHERE id=scholar_job_id)='no_result' THEN 'unanswered'
+                 ELSE status END,
+                 updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE status IN ('queued','proposed','waiting_for_evidence') AND scholar_job_id IN
+                (SELECT id FROM scholar_jobs WHERE status IN ('promoted','needs_review','no_result'))",
+            [],
+        ).map_err(database_error)?;
+        let lead: Option<(i64, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT claim_id,question,selection_reason FROM research_assertion_checks
+             WHERE status='pending' ORDER BY claim_id LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((claim_id, question, reason)) = lead else {
+            return Ok(None);
+        };
+        let key = format!("research-claim:{claim_id}");
+        let admission = self.try_enqueue_scout_research(
+            "assertion",
+            &key,
+            &format!("research_claim:{claim_id}"),
+            &question,
+            &reason,
+        )?;
+        match admission {
+            ScoutAdmission::Queued(job_id) => {
+                self.connection.execute("UPDATE research_assertion_checks SET status='queued',scholar_job_id=?2,last_admission_reason=NULL,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE claim_id=?1",params![claim_id,job_id]).map_err(database_error)?;
+                crate::diagnostics::event(
+                    "research.assertion_queued",
+                    serde_json::json!({"claim_id":claim_id,"scholar_job_id":job_id}),
+                );
+                Ok(Some((claim_id, job_id)))
+            }
+            ScoutAdmission::Deferred(reason) => {
+                self.connection.execute("UPDATE research_assertion_checks SET last_admission_reason=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE claim_id=?1",params![claim_id,reason]).map_err(database_error)?;
+                crate::diagnostics::event(
+                    "research.assertion_deferred",
+                    serde_json::json!({"claim_id":claim_id,"reason":reason}),
+                );
+                Ok(None)
+            }
+            ScoutAdmission::Blocked(reason) => {
+                self.connection.execute("UPDATE research_assertion_checks SET status='skipped',last_admission_reason=?2,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE claim_id=?1",params![claim_id,reason]).map_err(database_error)?;
+                crate::diagnostics::event(
+                    "research.assertion_skipped",
+                    serde_json::json!({"claim_id":claim_id,"reason":reason}),
+                );
+                Ok(None)
+            }
+        }
+    }
+
     pub fn bootstrap_research_sources(&self) -> io::Result<i64> {
         let populated: bool = self
             .connection
@@ -307,8 +538,9 @@ impl LearningStore {
         {
             passage.truncate(end + 1);
         }
-        let next_cursor =
-            cursor + i64::try_from(passage.chars().count()).map_err(io::Error::other)?;
+        let remaining = body.chars().count().saturating_sub(offset);
+        let advance = remaining.min(RESEARCH_HARVEST_STRIDE_CHARS);
+        let next_cursor = cursor + i64::try_from(advance).map_err(io::Error::other)?;
         tx.execute(
             "UPDATE research_sources SET claimed_until_ms=?2 WHERE id=?1",
             params![id, now + 600_000],
@@ -349,10 +581,15 @@ impl LearningStore {
             .map_err(database_error)?;
         let offset = usize::try_from(harvest_state.cursor)
             .map_err(|_| invalid("invalid research source cursor"))?;
+        let expected_advance = harvest_state
+            .body
+            .chars()
+            .count()
+            .saturating_sub(offset)
+            .min(RESEARCH_HARVEST_STRIDE_CHARS);
         if harvest_state.cursor != source.cursor
             || source.next_cursor
-                != source.cursor
-                    + i64::try_from(source.passage.chars().count()).map_err(io::Error::other)?
+                != source.cursor + i64::try_from(expected_advance).map_err(io::Error::other)?
             || harvest_state
                 .body
                 .chars()
@@ -666,9 +903,81 @@ impl LearningStore {
                 })
                 .map_err(database_error)
         };
-        Ok(
-            serde_json::json!({"sources":count("research_sources")?,"unverified_claims":count("research_claims")?,"questions":count("research_questions")?,"evidence_links":count("research_evidence_links")?,"semantic_relations":count("research_claim_relations")?}),
-        )
+        let sources = self.connection.query_row(
+            "SELECT count(*),sum(harvest_cursor>=length(body)),sum(harvest_cursor<length(body)),
+                sum(harvest_cursor<length(body) AND next_attempt_at_ms=9223372036854775807),
+                sum(harvest_cursor<length(body) AND next_attempt_at_ms<=CAST(strftime('%s','now') AS INTEGER)*1000
+                    AND claimed_until_ms<=CAST(strftime('%s','now') AS INTEGER)*1000),
+                min(CASE WHEN harvest_cursor<length(body) AND next_attempt_at_ms<=CAST(strftime('%s','now') AS INTEGER)*1000
+                    AND claimed_until_ms<=CAST(strftime('%s','now') AS INTEGER)*1000 THEN created_at END)
+             FROM research_sources", [], |row| Ok(serde_json::json!({
+                "total":row.get::<_,i64>(0)?,"completed":row.get::<_,Option<i64>>(1)?.unwrap_or_default(),
+                "unfinished":row.get::<_,Option<i64>>(2)?.unwrap_or_default(),"parked":row.get::<_,Option<i64>>(3)?.unwrap_or_default(),
+                "eligible":row.get::<_,Option<i64>>(4)?.unwrap_or_default(),"oldest_eligible_at":row.get::<_,Option<String>>(5)?
+            })),
+        ).map_err(database_error)?;
+        let question_states = self.connection.query_row(
+            "SELECT json_group_object(status,n) FROM (SELECT status,count(*) AS n FROM research_questions GROUP BY status)",
+            [], |row| row.get::<_,Option<String>>(0),
+        ).map_err(database_error)?.unwrap_or_else(|| "{}".into());
+        let assertion_states = self.connection.query_row(
+            "SELECT json_group_object(status,n) FROM (SELECT status,count(*) AS n FROM research_assertion_checks GROUP BY status)",
+            [], |row| row.get::<_,Option<String>>(0),
+        ).map_err(database_error)?.unwrap_or_else(|| "{}".into());
+        let feedback_states = self
+            .connection
+            .query_row(
+                "SELECT json_group_object(route || ':' || status,n),sum(n),min(oldest_at)
+             FROM (SELECT route,status,count(*) AS n,min(created_at) AS oldest_at
+                   FROM scholar_research_feedback WHERE status IN ('pending','queued','processing')
+                   GROUP BY route,status)",
+                [],
+                |row| {
+                    Ok(serde_json::json!({
+                        "states":row.get::<_,Option<String>>(0)?.unwrap_or_else(|| "{}".into()),
+                        "count":row.get::<_,Option<i64>>(1)?.unwrap_or_default(),
+                        "oldest_at":row.get::<_,Option<String>>(2)?
+                    }))
+                },
+            )
+            .map_err(database_error)?;
+        let assertion_admission = self
+            .connection
+            .query_row(
+                "SELECT last_admission_reason FROM research_assertion_checks
+             WHERE last_admission_reason IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(database_error)?
+            .flatten();
+        let latest_assertion_selection = self
+            .connection
+            .query_row(
+                "SELECT claim_id,status,selection_reason,derivation_depth FROM research_assertion_checks
+                 ORDER BY updated_at DESC,claim_id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok(serde_json::json!({
+                        "claim_id":row.get::<_,i64>(0)?,
+                        "status":row.get::<_,String>(1)?,
+                        "reason":row.get::<_,String>(2)?,
+                        "derivation_depth":row.get::<_,i64>(3)?
+                    }))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        Ok(serde_json::json!({
+            "sources":sources,"unverified_claims":count("research_claims")?,
+            "questions":count("research_questions")?,"question_states":serde_json::from_str::<serde_json::Value>(&question_states).unwrap_or_default(),
+            "assertion_checks":count("research_assertion_checks")?,"assertion_states":serde_json::from_str::<serde_json::Value>(&assertion_states).unwrap_or_default(),
+            "unresolved_feedback":feedback_states,
+            "latest_assertion_admission_reason":assertion_admission,
+            "latest_assertion_selection":latest_assertion_selection,
+            "evidence_links":count("research_evidence_links")?,"semantic_relations":count("research_claim_relations")?
+        }))
     }
 
     pub fn retained_claim_evidence(&self, id: i64) -> io::Result<serde_json::Value> {
@@ -989,6 +1298,117 @@ mod tests {
     }
 
     #[test]
+    fn scout_background_stage_cursor_survives_calls_and_cycles_boundedly() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        let stages = (0..7)
+            .map(|_| store.claim_next_scout_stage().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(stages, [0, 1, 2, 3, 4, 0, 1]);
+    }
+
+    #[test]
+    fn selected_retained_assertion_queues_provisional_scholar_work() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        let passage = "The observatory opened in 1974.";
+        let source = source(&mut store, "https://example.org/observatory", passage);
+        let baskets = ResearchBaskets {
+            claims: vec![retained_claim(
+                "The observatory",
+                "opened in",
+                "1974",
+                passage,
+                0.94,
+            )],
+            questions: vec![],
+        };
+        store.finish_research_baskets(&source, &baskets).unwrap();
+        let lead = store.next_research_assertion_lead().unwrap().unwrap();
+        assert_eq!(lead.source_url, "https://example.org/observatory");
+        assert_eq!(lead.content_hash.len(), 64);
+        let question = "What evidence establishes when the observatory opened?";
+        store
+            .record_research_assertion_selection(
+                &lead,
+                Some(question),
+                "A second source can verify this dated public claim.",
+            )
+            .unwrap();
+        assert!(store.has_pending_research_assertion_lead().unwrap());
+        let (claim_id, job_id) = store.queue_research_assertion_lead().unwrap().unwrap();
+        assert_eq!(claim_id, lead.claim_id);
+        let investigation = store.scout_investigations().unwrap().remove(0);
+        assert_eq!(investigation.trigger_kind, "assertion");
+        assert_eq!(
+            investigation.trigger_ref,
+            format!("research_claim:{claim_id}")
+        );
+        assert_eq!(investigation.scholar_job_id, job_id);
+        assert_eq!(investigation.question, question);
+        assert!(store.active_semantic_claims().unwrap().is_empty());
+        assert_eq!(
+            store.research_assertion_selection(claim_id).unwrap(),
+            "queued"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE scholar_jobs SET status='needs_review' WHERE id=?1",
+                [&job_id],
+            )
+            .unwrap();
+        assert!(store.queue_research_assertion_lead().unwrap().is_none());
+        assert_eq!(
+            store.research_assertion_selection(claim_id).unwrap(),
+            "proposed"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE scholar_jobs SET status='promoted' WHERE id=?1",
+                [&job_id],
+            )
+            .unwrap();
+        assert!(store.queue_research_assertion_lead().unwrap().is_none());
+        assert_eq!(
+            store.research_assertion_selection(claim_id).unwrap(),
+            "verified"
+        );
+    }
+
+    #[test]
+    fn skipped_retained_assertions_are_recorded_without_creating_research_jobs() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        let passage = "A public page mentions an unrelated detail.";
+        let source = source(&mut store, "https://example.org/detail", passage);
+        store
+            .finish_research_baskets(
+                &source,
+                &ResearchBaskets {
+                    claims: vec![retained_claim(
+                        "The page",
+                        "mentions",
+                        "an unrelated detail",
+                        passage,
+                        0.8,
+                    )],
+                    questions: vec![],
+                },
+            )
+            .unwrap();
+        let lead = store.next_research_assertion_lead().unwrap().unwrap();
+        store
+            .record_research_assertion_selection(
+                &lead,
+                None,
+                "Checking this detail adds no useful public knowledge.",
+            )
+            .unwrap();
+        assert!(store.next_research_assertion_lead().unwrap().is_none());
+        assert!(!store.has_pending_research_assertion_lead().unwrap());
+        assert!(store.scout_investigations().unwrap().is_empty());
+    }
+
+    #[test]
     fn exhausted_source_is_preserved_and_only_resumes_after_explicit_retry() {
         let mut store = crate::test_support::in_memory_learning_store();
         let passage = "The observatory opened in 1974.";
@@ -1091,7 +1511,7 @@ mod tests {
     fn harvested_evidence_offsets_survive_a_source_chunk_boundary() {
         let mut store = crate::test_support::in_memory_learning_store();
         let fact = "The Amazon rainforest is in South America.";
-        let body = format!("{}\n{fact}\nMore source text.", "x".repeat(990));
+        let body = format!("{}{fact}\nMore source text.", "é".repeat(1_990));
         let source = source(&mut store, "https://example.org/chunked", &body);
         assert!(!source.passage.contains(fact));
         store
@@ -1215,6 +1635,106 @@ mod tests {
             store.research_basket_items("questions").unwrap()[0]["status"],
             "queued"
         );
+    }
+
+    #[test]
+    fn blocked_retained_questions_stay_pending_for_interval_daily_and_duplicate_gates() {
+        for blocker in ["interval", "daily", "duplicate"] {
+            let mut store = crate::test_support::in_memory_learning_store();
+            let text = "The Amazon rainforest is in South America.";
+            let source = source(
+                &mut store,
+                &format!("https://{blocker}.example/amazon"),
+                text,
+            );
+            let question = "What evidence describes Amazon rainforest biodiversity?";
+            store
+                .finish_research_baskets(
+                    &source,
+                    &ResearchBaskets {
+                        claims: vec![],
+                        questions: vec![retained_question(question, text)],
+                    },
+                )
+                .unwrap();
+            store
+                .connection
+                .execute("UPDATE scholar_jobs SET status='no_result'", [])
+                .unwrap();
+
+            let blocking_question = if blocker == "duplicate" {
+                question
+            } else {
+                "How does the Amazon basin receive rainfall?"
+            };
+            assert!(
+                store
+                    .enqueue_scout_research_with_reason(
+                        "sparse",
+                        &format!("blocker:{blocker}"),
+                        "fixture",
+                        blocking_question,
+                        "Fixture investigation for admission coverage",
+                    )
+                    .unwrap()
+            );
+            if blocker != "interval" {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE scout_investigations SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-6 minutes')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            if blocker == "daily" {
+                let blocking_job: String = store
+                    .connection
+                    .query_row(
+                        "SELECT scholar_job_id FROM scout_investigations LIMIT 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                for index in 1..20 {
+                    store.connection.execute(
+                        "INSERT INTO scout_investigations(trigger_kind,topic_key,trigger_ref,question,scholar_job_id,selection_reason,created_at)
+                         VALUES('stale',?1,'fixture','A dated status check?',?2,'daily budget fixture',strftime('%Y-%m-%dT%H:%M:%fZ','now','-6 minutes'))",
+                        rusqlite::params![format!("daily:{index}"),blocking_job],
+                    ).unwrap();
+                }
+            }
+
+            let expected = match blocker {
+                "interval" => "Scout minimum investigation interval has not elapsed",
+                "daily" => "Scout daily investigation budget exhausted",
+                _ => "Same question is pending or was researched within the last day",
+            };
+            match store
+                .try_enqueue_scout_research(
+                    "uncertain",
+                    &format!("assertion:{blocker}"),
+                    "fixture",
+                    question,
+                    "Admission blocker fixture",
+                )
+                .unwrap()
+            {
+                ScoutAdmission::Deferred(reason) | ScoutAdmission::Blocked(reason) => {
+                    assert_eq!(reason, expected, "blocker={blocker}");
+                }
+                ScoutAdmission::Queued(_) => panic!("blocked admission unexpectedly queued"),
+            }
+            assert!(
+                !store.queue_retained_question().unwrap(),
+                "blocker={blocker}"
+            );
+            assert_eq!(
+                store.research_basket_items("questions").unwrap()[0]["status"],
+                "pending",
+                "blocker={blocker}"
+            );
+        }
     }
 
     #[test]
@@ -1455,5 +1975,160 @@ mod tests {
         );
         assert_eq!(after["independence_verified"], false);
         assert!(store.active_semantic_claims().unwrap().is_empty());
+    }
+
+    #[test]
+    fn assertion_derived_research_is_bounded_to_three_generations() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        let passage = "The observatory opened in 1974.";
+        let source = source(&mut store, "https://example.org/original", passage);
+        store
+            .finish_research_baskets(
+                &source,
+                &ResearchBaskets {
+                    claims: vec![retained_claim(
+                        "The observatory",
+                        "opened in",
+                        "1974",
+                        passage,
+                        0.95,
+                    )],
+                    questions: vec![],
+                },
+            )
+            .unwrap();
+
+        for expected_depth in 0..3 {
+            let lead = store.next_research_assertion_lead().unwrap().unwrap();
+            assert_eq!(lead.derivation_depth, expected_depth);
+            let question = format!("What independent source checks generation {expected_depth}?");
+            store
+                .record_research_assertion_selection(
+                    &lead,
+                    Some(&question),
+                    "A bounded check could confirm this provisional assertion.",
+                )
+                .unwrap();
+            let (claim_id, job_id) = store.queue_research_assertion_lead().unwrap().unwrap();
+            assert_eq!(claim_id, lead.claim_id);
+            store
+                .connection
+                .execute(
+                    "UPDATE scout_investigations SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-10 minutes') WHERE scholar_job_id=?1",
+                    [&job_id],
+                )
+                .unwrap();
+
+            let derived_passage = format!("The observatory recorded generation {expected_depth}.");
+            store
+                .retain_research_source(
+                    &job_id,
+                    "Derived observatory evidence",
+                    &format!("https://example.org/derived/{expected_depth}"),
+                    &derived_passage,
+                )
+                .unwrap();
+            let derived_source = store.claim_research_source().unwrap().unwrap();
+            store
+                .finish_research_baskets(
+                    &derived_source,
+                    &ResearchBaskets {
+                        claims: vec![retained_claim(
+                            "The observatory",
+                            "recorded generation",
+                            expected_depth.to_string(),
+                            &derived_passage,
+                            0.92,
+                        )],
+                        questions: vec![],
+                    },
+                )
+                .unwrap();
+        }
+
+        assert!(store.next_research_assertion_lead().unwrap().is_none());
+        let (status, depth, reason): (String, i64, String) = store
+            .connection
+            .query_row(
+                "SELECT status,derivation_depth,selection_reason FROM research_assertion_checks ORDER BY derivation_depth DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "skipped");
+        assert_eq!(depth, 3);
+        assert!(reason.contains("maximum assertion derivation depth"));
+    }
+
+    #[test]
+    fn quota_deferred_assertion_reuses_its_selected_question_on_later_admission() {
+        let mut store = crate::test_support::in_memory_learning_store();
+        let passage = "The observatory opened in 1974.";
+        let source = source(&mut store, "https://example.org/observatory", passage);
+        store
+            .finish_research_baskets(
+                &source,
+                &ResearchBaskets {
+                    claims: vec![retained_claim(
+                        "The observatory",
+                        "opened in",
+                        "1974",
+                        passage,
+                        0.95,
+                    )],
+                    questions: vec![],
+                },
+            )
+            .unwrap();
+        let lead = store.next_research_assertion_lead().unwrap().unwrap();
+        let selected_question = "What independent record confirms the opening year?";
+        let selected_reason = "The dated public statement can be checked against another source.";
+        store
+            .record_research_assertion_selection(&lead, Some(selected_question), selected_reason)
+            .unwrap();
+        assert!(
+            store
+                .enqueue_scout_research_with_reason(
+                    "stale",
+                    "fixture:blocking-investigation",
+                    "fixture",
+                    "What rainfall reaches the observatory site?",
+                    "Temporary spacing fixture",
+                )
+                .unwrap()
+        );
+        assert!(store.queue_research_assertion_lead().unwrap().is_none());
+        assert_eq!(
+            store.research_assertion_selection(lead.claim_id).unwrap(),
+            "pending"
+        );
+        let deferred_reason: String = store
+            .connection
+            .query_row(
+                "SELECT last_admission_reason FROM research_assertion_checks WHERE claim_id=?1",
+                [lead.claim_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(deferred_reason.contains("minimum investigation interval"));
+        store.connection.execute(
+            "UPDATE scout_investigations SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-6 minutes')",
+            [],
+        ).unwrap();
+        let queued = store.queue_research_assertion_lead().unwrap().unwrap();
+        assert_eq!(queued.0, lead.claim_id);
+        assert_eq!(
+            store.research_assertion_selection(lead.claim_id).unwrap(),
+            "queued"
+        );
+        let stored: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT question,selection_reason FROM research_assertion_checks WHERE claim_id=?1",
+                [lead.claim_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (selected_question.into(), selected_reason.into()));
     }
 }

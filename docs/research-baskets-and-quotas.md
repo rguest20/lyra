@@ -66,13 +66,20 @@ to the immediate question. Each source is bounded to 32,000 characters and
 deduplicated by URL and content hash. This is bounded retention, not a complete
 website archive. Existing source-policy and raw HTTP response limits remain.
 
-Background Scholar work leases a source and processes at most 2,200 characters
-per pass. A durable cursor advances only after successful basket storage. Failed
-or malformed extraction gets one format-repair attempt, then keeps the text and
-schedules another attempt after five minutes. Each passage is asked for all
-distinct grounded assertions and follow-up questions; there is no fixed
-per-passage item count. Output remains bounded by the model's available context
-window. User research, repair work, and corroboration retain their existing
+Background Scout work leases a source and reads a 2,000-character window per
+pass. The cursor advances by at most 1,000 characters after successful basket
+storage, so adjacent windows overlap and can recover assertions cut at a
+boundary. Failed or malformed extraction gets bounded format-repair attempts,
+then keeps the text and schedules another attempt after five minutes. Each
+passage is asked for all distinct grounded assertions and follow-up questions;
+there is no fixed per-passage item count. Output remains bounded by the model's
+available context window. Scholar retains page fetching, targeted answer
+extraction, repair, and corroboration; Scout owns retained-page basket reading.
+User research retains priority. Scout rotates eligible source intake,
+new-source feedback, retained questions, retained-assertion selection/admission,
+and existing map-gap work. Scout-invented leads run after those queues. The
+persisted stage cursor gives each continuously eligible class a first turn at
+least once per five Scout background passes, subject to user research taking
 priority.
 
 Claims are concrete, fact-shaped assertions, not verified facts. For example,
@@ -89,11 +96,25 @@ attached as context provenance instead. This records where the question came
 from, not evidence that any premise in the question is true. Claim quotations
 are never repaired by substituting the whole passage.
 Repeated source occurrences add provenance rather than another question. Scout
-schedules one retained question after urgent challenged/due claims, under its
-existing spacing and daily investigation policies. Due user questions take
-priority. At most 20 retained questions are queued simultaneously, and derived
-question chains stop at depth three. Terminal research is labeled `researched`
+schedules one retained question under its existing spacing and daily
+investigation policies. Due user questions take priority. At most 20 retained
+questions are queued simultaneously, and derived question chains stop at depth
+three. Terminal research is labeled `researched`
 or `unanswered`, never automatically `answered` merely because a job ran.
+
+Scout can also select an existing retained assertion for a focused public
+verification question. The assertion, source quote, qualifications, source
+version, and selection reason remain linked to the provisional Scholar job.
+Admission uses the existing investigation limits; a deferred lead stays pending
+with its latest admission reason and selected question; it is not regenerated
+on each retry. Scout gives its contextual selector up to 20 recent assertion
+decisions so it can skip materially equivalent propositions and verification-
+question paraphrases. Lexical overlap alone does not reject a new lead.
+Assertion-derived checks persist a depth and stop at generation three. Checks
+distinguish skipped, queued, proposed, reviewed, waiting for evidence, verified,
+and unanswered.
+Retained assertions remain outside the semantic map and are never evidence of
+their own truth.
 
 ## Evidence Relationships
 
@@ -127,10 +148,10 @@ chat as established truth and does not automatically promote or retract claims.
 Stop running Lyra processes, back up the learning database, then restart with the
 new binary. The original additive rollout upgraded schema 44 through 47 and
 retained existing findings, learning/audit records, and semantic claims; later
-migrations bring the current schema to version 63. The JSON map format remains
+migrations bring the current schema to version 69. The JSON map format remains
 unchanged. Do not run old and new binaries against the same database.
 
-If the source basket is empty, the next background Scholar pass automatically
+If the source basket is empty, the next background Scout pass automatically
 imports previously saved finding/candidate excerpts once material is available.
 This seeds sources only: claims and questions appear as background harvesting
 processes them. Existing reviews and semantic claims are unchanged. User work,
@@ -154,10 +175,14 @@ remains deduplicated. `import` retains up to 500 previously saved finding and
 candidate excerpts per invocation, without fetching pages or changing old review
 decisions. New raw assertions and relationships remain separate from the map.
 
-Diagnostics `internet.cache_hit`, `scholar.job_deferred`,
+`scholar baskets` reports retained-source backlog and age, parked sources,
+question and assertion states, unresolved feedback routes/age, and relationship
+counts. Diagnostics `internet.cache_hit`, `scholar.job_deferred`,
 `research.baskets_retained`, `research.harvest_deferred`,
-`research.question_queued`, and `research.evidence_link` record IDs, counts,
-status, and scheduling metadata rather than adding prompt contents to logs.
+`research.question_queued`, `scout.assertion_selection`,
+`research.assertion_queued`, `research.assertion_deferred`, and
+`research.evidence_link` report progress and deferrals. Some diagnostic events
+include bounded excerpts to make malformed extraction reviewable.
 
 ### Bounded basket-output repair
 

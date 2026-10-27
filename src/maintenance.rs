@@ -658,6 +658,13 @@ mod tests {
             .unwrap();
         assert_eq!(store.active_semantic_claims().unwrap().len(), 2);
         drop(store);
+        rusqlite::Connection::open(&database_path)
+            .unwrap()
+            .execute(
+                "UPDATE research_sources SET harvest_cursor=length(body),claimed_until_ms=0",
+                [],
+            )
+            .unwrap();
         roles.audit_fails = false;
         let second = run_pass_with_roles(
             &database_path,

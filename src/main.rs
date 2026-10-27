@@ -9,6 +9,7 @@ mod inference;
 mod knowledge;
 mod maintenance;
 mod research;
+mod research_intake;
 mod scholar;
 mod scout;
 mod semantic;

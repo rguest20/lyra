@@ -40,17 +40,18 @@ fn feedback_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScholarFe
         finding_id: row.get(1)?,
         root_finding_id: row.get(2)?,
         attempt: row.get(3)?,
-        guidance: row.get(4)?,
-        job_id: row.get(5)?,
-        question: row.get(6)?,
-        source_title: row.get(7)?,
-        source_url: row.get(8)?,
-        source_excerpt: row.get(9)?,
-        source_quality: row.get(10)?,
-        source_updated_at: row.get(11)?,
-        rejected_claim: row.get(12)?,
-        suggested_evidence: row.get(13)?,
-        exclusion_reason: row.get(14)?,
+        review_reason: row.get(4)?,
+        guidance: row.get(5)?,
+        job_id: row.get(6)?,
+        question: row.get(7)?,
+        source_title: row.get(8)?,
+        source_url: row.get(9)?,
+        source_excerpt: row.get(10)?,
+        source_quality: row.get(11)?,
+        source_updated_at: row.get(12)?,
+        rejected_claim: row.get(13)?,
+        suggested_evidence: row.get(14)?,
+        exclusion_reason: row.get(15)?,
     })
 }
 
@@ -209,7 +210,7 @@ impl LearningStore {
         job_id: &str,
     ) -> io::Result<Option<ScholarFeedbackTask>> {
         self.connection.query_row(
-            "SELECT r.id, r.finding_id, r.root_finding_id, r.attempt, r.guidance, r.scholar_job_id,
+            "SELECT r.id, r.finding_id, r.root_finding_id, r.attempt, coalesce(f.decision_reason,''), r.guidance, r.scholar_job_id,
                     j.question, f.source_title, f.source_url, f.source_excerpt, f.source_quality, f.source_updated_at,
                     f.subject || ' ' || f.relation || ' ' || f.object, r.suggested_evidence, r.exclusion_reason
              FROM scholar_research_feedback r JOIN scholar_findings f ON f.id = r.finding_id

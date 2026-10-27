@@ -46,11 +46,7 @@ impl Cli {
                 }
             }
             [action, title, passage] if action == "probe-baskets" => {
-                let mut backend = self
-                    .model_runtime
-                    .as_ref()
-                    .unwrap()
-                    .model(AgentRole::Scholar);
+                let mut backend = self.model_runtime.as_ref().unwrap().model(AgentRole::Scout);
                 let baskets = crate::scholar::probe_baskets(title, passage, &mut backend)
                     .map_err(|error| error.to_string())?;
                 println!(

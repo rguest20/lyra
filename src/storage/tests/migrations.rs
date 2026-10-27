@@ -3,6 +3,83 @@ use super::*;
 use crate::storage::SCHEMA_VERSION;
 
 #[test]
+fn assertion_depth_migration_preserves_existing_review_state() {
+    let path = temp_path();
+    let mut store = LearningStore::open(&path).unwrap();
+    store
+        .enqueue_research(
+            "assertion-depth-migration",
+            1,
+            "What did the observatory report?",
+        )
+        .unwrap();
+    let job = store.claim_scholar_job().unwrap().unwrap();
+    store
+        .finish_scholar_job(
+            &job.id,
+            "Observatory",
+            "https://example.org/observatory",
+            "The observatory opened in 1974.",
+            None,
+            None,
+        )
+        .unwrap();
+    store
+        .retain_research_source(
+            &job.id,
+            "Observatory",
+            "https://example.org/observatory",
+            "The observatory opened in 1974.",
+        )
+        .unwrap();
+    let source = store.claim_research_source().unwrap().unwrap();
+    store
+        .finish_research_baskets(
+            &source,
+            &crate::storage::ResearchBaskets {
+                claims: vec![crate::storage::RetainedClaim {
+                    subject: "The observatory".into(),
+                    relation: "opened in".into(),
+                    object: "1974".into(),
+                    evidence_text: "The observatory opened in 1974.".into(),
+                    qualifications: String::new(),
+                    extraction_confidence: 0.95,
+                }],
+                questions: vec![],
+            },
+        )
+        .unwrap();
+    let lead = store.next_research_assertion_lead().unwrap().unwrap();
+    store
+        .record_research_assertion_selection(
+            &lead,
+            Some("What evidence independently confirms the opening date?"),
+            "The dated public assertion can be checked.",
+        )
+        .unwrap();
+    store
+        .connection
+        .execute_batch("ALTER TABLE research_assertion_checks DROP COLUMN derivation_depth; PRAGMA user_version=68;")
+        .unwrap();
+    drop(store);
+
+    let store = LearningStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .connection
+            .query_row(
+                "SELECT status,derivation_depth,question FROM research_assertion_checks WHERE claim_id=?1",
+                [lead.claim_id],
+                |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?,row.get::<_,String>(2)?)),
+            )
+            .unwrap(),
+        ("pending".into(), 0, "What evidence independently confirms the opening date?".into())
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn differing_relation_migration_reopens_only_unreviewed_lexical_decisions() {
     let path = temp_path();
     let mut store = LearningStore::open(&path).unwrap();

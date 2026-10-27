@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) use crate::errors::invalid_data as invalid;
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 63;
+const SCHEMA_VERSION: i64 = 69;
 static SCHEMA_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) struct ResearchSourceInput<'a> {
@@ -46,6 +46,7 @@ pub struct ScholarFeedbackTask {
     pub finding_id: i64,
     pub root_finding_id: i64,
     pub attempt: i64,
+    pub review_reason: String,
     pub guidance: String,
     pub job_id: String,
     pub question: String,
@@ -286,6 +287,20 @@ pub struct ScoutInvestigation {
     pub question: String,
     pub scholar_job_id: String,
     pub selection_reason: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetainedClaimLead {
+    pub claim_id: i64,
+    pub subject: String,
+    pub relation: String,
+    pub object: String,
+    pub evidence_text: String,
+    pub qualifications: String,
+    pub source_title: String,
+    pub source_url: String,
+    pub content_hash: String,
+    pub derivation_depth: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -937,6 +952,8 @@ mod queries;
 mod research;
 pub(crate) use research::ScoutAdmission;
 pub(crate) use research::baskets::{ClaimPair, ResearchBaskets, ResearchSource};
+#[cfg(test)]
+pub(crate) use research::baskets::{RetainedClaim, RetainedQuestion};
 pub(crate) use research::network::{MEDIAWIKI_TRANSIENT_ERROR, wikipedia_interval_ms};
 mod schema;
 

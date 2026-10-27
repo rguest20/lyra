@@ -1273,6 +1273,157 @@ impl LearningStore {
             ).map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 65 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS scout_work_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    next_stage INTEGER NOT NULL DEFAULT 0 CHECK (next_stage BETWEEN 0 AND 4)
+                 );
+                 INSERT OR IGNORE INTO scout_work_state(id,next_stage) VALUES(1,0);
+                 CREATE TABLE IF NOT EXISTS research_assertion_checks (
+                    claim_id INTEGER PRIMARY KEY REFERENCES research_claims(id),
+                    question TEXT,
+                    selection_reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','queued','researched','unanswered','skipped')),
+                    scholar_job_id TEXT REFERENCES scholar_jobs(id),
+                    last_admission_reason TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS research_assertion_checks_by_status
+                    ON research_assertion_checks(status, claim_id);
+                 PRAGMA user_version = 65;",
+            )
+            .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 66 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !table_has_column(&tx, "scholar_findings", "review_caveats_json")? {
+                tx.execute(
+                    "ALTER TABLE scholar_findings ADD COLUMN review_caveats_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 66)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 67 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let definition = table_definition(&tx, "scout_investigations")?.unwrap_or_default();
+            if !definition.contains("'assertion'") {
+                tx.execute_batch(
+                    "ALTER TABLE scout_investigations RENAME TO scout_investigations_before_assertion;
+                     CREATE TABLE scout_investigations (
+                        id INTEGER PRIMARY KEY,
+                        trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('challenged', 'uncertain', 'sparse', 'stale', 'expansion', 'model_probe', 'assertion')),
+                        topic_key TEXT NOT NULL,
+                        trigger_ref TEXT NOT NULL,
+                        question TEXT NOT NULL,
+                        scholar_job_id TEXT NOT NULL REFERENCES scholar_jobs(id),
+                        selection_reason TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                     );
+                     INSERT INTO scout_investigations
+                        (id,trigger_kind,topic_key,trigger_ref,question,scholar_job_id,selection_reason,created_at)
+                     SELECT id,trigger_kind,topic_key,trigger_ref,question,scholar_job_id,selection_reason,created_at
+                     FROM scout_investigations_before_assertion;
+                     DROP TABLE scout_investigations_before_assertion;
+                     CREATE INDEX scout_investigations_by_topic
+                        ON scout_investigations(trigger_kind, topic_key, id DESC);
+                     CREATE INDEX scout_investigations_by_created
+                        ON scout_investigations(created_at);",
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 67)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 68 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            let definition =
+                table_definition(&tx, "research_assertion_checks")?.unwrap_or_default();
+            if !definition.contains("'verified'") {
+                tx.execute_batch(
+                    "ALTER TABLE research_assertion_checks
+                        RENAME TO research_assertion_checks_before_outcomes;
+                     CREATE TABLE research_assertion_checks (
+                        claim_id INTEGER PRIMARY KEY REFERENCES research_claims(id),
+                        question TEXT,
+                        selection_reason TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending','queued','proposed','reviewed',
+                                'waiting_for_evidence','verified','unanswered','skipped')),
+                        scholar_job_id TEXT REFERENCES scholar_jobs(id),
+                        last_admission_reason TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                     );
+                     INSERT INTO research_assertion_checks
+                        (claim_id,question,selection_reason,status,scholar_job_id,last_admission_reason,created_at,updated_at)
+                     SELECT old.claim_id,old.question,old.selection_reason,
+                        CASE
+                          WHEN j.status='promoted' OR EXISTS(SELECT 1 FROM scholar_findings f
+                               WHERE f.job_id=old.scholar_job_id AND f.status='promoted') THEN 'verified'
+                          WHEN EXISTS(SELECT 1 FROM scholar_findings f
+                               JOIN scholar_source_assessments a ON a.finding_id=f.id
+                               WHERE f.job_id=old.scholar_job_id AND a.gate_status='awaiting_corroboration') THEN 'waiting_for_evidence'
+                          WHEN EXISTS(SELECT 1 FROM scholar_findings f
+                               WHERE f.job_id=old.scholar_job_id AND f.status='needs_review') THEN 'proposed'
+                          WHEN EXISTS(SELECT 1 FROM scholar_findings f
+                               WHERE f.job_id=old.scholar_job_id AND f.status='rejected') THEN 'reviewed'
+                          WHEN j.status='needs_review' THEN 'proposed'
+                          WHEN j.status='no_result' OR old.status='unanswered' THEN 'unanswered'
+                          WHEN old.question IS NULL OR old.status='skipped' THEN 'skipped'
+                          WHEN old.status='pending' THEN 'pending'
+                          ELSE 'queued'
+                        END,
+                        old.scholar_job_id,old.last_admission_reason,old.created_at,old.updated_at
+                     FROM research_assertion_checks_before_outcomes old
+                     LEFT JOIN scholar_jobs j ON j.id=old.scholar_job_id;
+                     DROP TABLE research_assertion_checks_before_outcomes;
+                     CREATE INDEX research_assertion_checks_by_status
+                        ON research_assertion_checks(status, claim_id);",
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 68)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
+        if version < 69 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            if !table_has_column(&tx, "research_assertion_checks", "derivation_depth")? {
+                tx.execute(
+                    "ALTER TABLE research_assertion_checks ADD COLUMN derivation_depth INTEGER NOT NULL DEFAULT 0 CHECK (derivation_depth BETWEEN 0 AND 3)",
+                    [],
+                )
+                .map_err(database_error)?;
+            }
+            tx.pragma_update(None, "user_version", 69)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }
