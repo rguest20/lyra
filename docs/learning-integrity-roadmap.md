@@ -1,5 +1,9 @@
 # Lyra Learning Integrity Roadmap
 
+This is the detailed policy and architecture record, not a second active task
+list. `nextSteps.txt` is the single source for current priorities; unchecked
+roadmap items below remain proposals until they are promoted there.
+
 ## Objective
 
 Let Lyra retain a broad, useful record of what it reads while preventing
@@ -228,7 +232,7 @@ question/source without a changed plan.
   laboratory provenance. Its retained failures require preserving useful dated
   context during relevance review and rejecting invented entities/relationships
   in otherwise qualified answers.
-  The subsequent [grounding basics progress report](grounding-basics-progress.md)
+  The subsequent [grounding basics progress report](archive/grounding-basics-progress.md)
   records property matching, historical/provenance answer contracts, entity-name
   safeguards, file splits and retained failed runs. Its final two-case replay is
   encouraging. The [generalization follow-up](grounding-generalization-progress.md)

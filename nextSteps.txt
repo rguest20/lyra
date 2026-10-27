@@ -19,6 +19,8 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   follow-ups. These audits remain advisory and separate from factual review.
 - Keep training and scaling gated until this benchmark passes. Unit tests and
   same-model review do not establish semantic acceptance.
+- The related log-driven fixes and their isolated validation limits are in
+  `docs/log-behavior-fix-plan.md`.
 
 2. Continue investigation judgment
 
@@ -91,7 +93,7 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   grounding, generalization, or unrelated answers. Do not activate trained
   weights or merge/requantize a checkpoint until the grounding acceptance gate
   passes. Keep the BF16 checkpoint and SQLite claim ledger authoritative.
-- See `docs/quantized-runtime-experiment.md` for historical 4-bit measurements
+- See `docs/archive/quantized-runtime-experiment.md` for historical 4-bit measurements
   and `docs/qlora-speed-experiment.md` for the BF16-versus-INT8 comparison.
 
 6. Scout intake and qualified assertion review — implementation complete;

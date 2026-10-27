@@ -40,8 +40,23 @@ and review states. Rejected or uncertain outcomes remain recorded rather than
 being approved by a fallback.
 
 The current work list is [nextSteps.txt](nextSteps.txt). This README is the
-system and operator guide; the linked documents below provide detailed
-component references, dated validation evidence, and historical design notes.
+system and operator guide. Keep active priorities there and use the following
+references for detail:
+
+- [Learning integrity roadmap](docs/learning-integrity-roadmap.md) — evidence
+  policy and acceptance gates.
+- [Grounding progress and retained failures](docs/grounding-generalization-progress.md)
+  — current validation record and known limits.
+- [Scout intake and qualified review](docs/scout-intake-and-qualified-review-plan.md)
+  — implementation status and remaining semantic acceptance.
+- [Per-agent models](docs/per-agent-models.md) and
+  [research baskets and quotas](docs/research-baskets-and-quotas.md) — runtime
+  and research operations.
+- [Rust file guide](docs/rust-file-guide.md) — source layout.
+- [Quantized inference experiment](docs/qlora-speed-experiment.md) — local
+  measurements and their limits.
+- [Archived plans and implementation records](docs/archive/) — superseded
+  proposals and completed work kept for historical context.
 
 ## Set up the model
 
@@ -76,10 +91,10 @@ can select a quantized checkpoint. The current local profile assigns all roles
 to INT8. Quantized models keep their output adapters separate; the runtime will
 not merge adapters into quantized weights.
 
-The switch checklist in [docs/qwen35-2b-switch.md](docs/qwen35-2b-switch.md)
-records conversation migration and measured results. The knowledge map and
-SQLite research database remain shared. Context exhaustion returns an error;
-it does not silently discard conversation history.
+The historical [Qwen3.5 switch record](docs/archive/qwen35-2b-switch.md)
+contains migration measurements. The knowledge map and SQLite research
+database remain shared. Context exhaustion returns an error; it does not
+silently discard conversation history.
 
 ### Model runtime
 
@@ -144,8 +159,8 @@ without a semantic assessment receive one during AI review. Invalid assessments
 follow automated repair/retry handling. Each candidate adds one model call,
 including another check if extraction repair produces a new candidate.
 
-The implementation and probe results are recorded in
-[docs/semantic-support.md](docs/semantic-support.md).
+The implementation and probe results are retained in the
+[semantic-support archive](docs/archive/semantic-support.md).
 
 Isolated probes use the actual Scholar extraction and Curmudgeon review prompts:
 
@@ -417,8 +432,10 @@ different, relevant sentence in the source, it keeps that sentence as a sourced
 encyclopedia detail. A sparse map is a lead for
 investigation, not evidence that its existing claim is false. Scholar's normal
 source checks and review rules still decide whether a finding enters the map.
-For the current architecture and maintenance ideas, see
-[Agentic Semantic Map Maintenance](docs/agentic-map-maintenance.md).
+For active priorities and architecture constraints, see
+[nextSteps.txt](nextSteps.txt) and the
+[learning integrity roadmap](docs/learning-integrity-roadmap.md). The earlier
+maintenance proposal is retained in the [archive](docs/archive/agentic-map-maintenance.md).
 
 ## Autonomous maintenance
 
@@ -533,8 +550,9 @@ leads until source pages pass policy checks and are fetched.
 
 Scholar uses its source and review rules before a claim enters the map;
 personal facts are excluded. Model checkpoint training and approval remain
-manual. See [Autonomous Knowledge Maintenance](docs/autonomous-knowledge-maintenance.md)
-for the implementation and verification details.
+manual. The dated implementation details are in the
+[autonomous maintenance archive](docs/archive/autonomous-knowledge-maintenance.md);
+the current behavior is summarized here and in the grounding progress record.
 
 ## Update the model
 

@@ -4,10 +4,13 @@ Lyra should understand conversations, give useful grounded answers, and learn
 without turning uncertain interpretations into established knowledge. Prefer
 general solutions that work across topics over patches for individual failures.
 
-Read `nextSteps.txt` for the working plan and
-`docs/grounding-generalization-progress.md` for retained failures and validation
-limits. Unchecked tasks are proposals, not implemented capabilities. Check the
-actual code and evidence before claiming a feature works.
+Use `README.md` as the single system and operator guide, and `nextSteps.txt` as
+the single active work list. Read `docs/grounding-generalization-progress.md`
+for retained failures and validation limits. Detailed design and component notes
+live in `docs/`; superseded plans and completed implementation records live in
+`docs/archive/`. Unchecked items in detailed notes are proposals unless they
+also appear in `nextSteps.txt`. Check the actual code and evidence before
+claiming a feature works.
 
 ## Semantic understanding
 
