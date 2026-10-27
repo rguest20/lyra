@@ -10,7 +10,17 @@ pub(super) struct ResolvedTurnRequest<'a> {
     pub original_message: &'a str,
     pub resolved_request: String,
     pub needs_external_facts: bool,
+    pub requires_extended_reasoning: bool,
     pub requires_source_check: bool,
+}
+
+impl ResolvedTurnRequest<'_> {
+    pub(super) fn use_extended_reasoning(&self, show_thinking: bool) -> bool {
+        show_thinking
+            || self.requires_extended_reasoning
+            || self.needs_external_facts
+            || self.requires_source_check
+    }
 }
 
 pub(super) struct TurnContext {
@@ -97,6 +107,29 @@ pub(super) fn select_turn_context(
     })
 }
 
+#[cfg(test)]
+mod reasoning_tests {
+    use super::ResolvedTurnRequest;
+
+    #[test]
+    fn simple_turns_skip_thinking_but_factual_or_complex_turns_keep_it() {
+        let mut request = ResolvedTurnRequest {
+            original_message: "Hello",
+            resolved_request: "Hello".into(),
+            needs_external_facts: false,
+            requires_extended_reasoning: false,
+            requires_source_check: false,
+        };
+        assert!(!request.use_extended_reasoning(false));
+        assert!(request.use_extended_reasoning(true));
+        request.requires_extended_reasoning = true;
+        assert!(request.use_extended_reasoning(false));
+        request.requires_extended_reasoning = false;
+        request.needs_external_facts = true;
+        assert!(request.use_extended_reasoning(false));
+    }
+}
+
 pub(super) fn assess_request<'a>(
     request: &'a str,
     history: &[Message],
@@ -110,6 +143,7 @@ pub(super) fn assess_request<'a>(
             );
             crate::research::RequestIntent {
                 needs_external_facts: true,
+                requires_extended_reasoning: true,
                 resolved_request: request.into(),
             }
         });
@@ -131,12 +165,13 @@ pub(super) fn assess_request<'a>(
     };
     crate::diagnostics::research_decision(
         "conversation.request_intent",
-        json!({"question":request,"needs_external_facts":intent.needs_external_facts,"requires_source_check":requires_source_check}),
+        json!({"question":request,"needs_external_facts":intent.needs_external_facts,"requires_extended_reasoning":intent.requires_extended_reasoning,"requires_source_check":requires_source_check}),
     );
     ResolvedTurnRequest {
         original_message: request,
         resolved_request: intent.resolved_request,
         needs_external_facts: intent.needs_external_facts,
+        requires_extended_reasoning: intent.requires_extended_reasoning,
         requires_source_check,
     }
 }

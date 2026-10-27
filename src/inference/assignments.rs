@@ -285,6 +285,41 @@ impl RoutedModel {
         }
     }
 
+    pub(super) fn generate_batch(
+        &mut self,
+        conversations: &[Vec<crate::agent::Message>],
+        extra_tokens: usize,
+        cap: usize,
+        temperature: f64,
+        thinking: bool,
+    ) -> Vec<io::Result<String>> {
+        self.last_thinking = None;
+        let started = Instant::now();
+        let results = self.with_model(|model| {
+            let results = model.chat_batch(conversations, extra_tokens, cap, temperature, thinking);
+            Ok((results, model.take_thinking()))
+        });
+        let answers = match results {
+            Ok((answers, last_thinking)) => {
+                self.last_thinking = last_thinking;
+                answers
+            }
+            Err(error) => conversations
+                .iter()
+                .map(|_| Err(io::Error::other(error.to_string())))
+                .collect(),
+        };
+        crate::diagnostics::event(
+            "agent.batch_inference",
+            serde_json::json!({
+                "agent":self.role.name(),"requests":conversations.len(),
+                "completed":answers.iter().filter(|answer| answer.is_ok()).count(),
+                "elapsed_ms":started.elapsed().as_millis(),
+            }),
+        );
+        answers
+    }
+
     pub(super) fn generate(
         &mut self,
         messages: &[crate::agent::Message],

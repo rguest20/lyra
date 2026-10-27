@@ -18,7 +18,7 @@ def main():
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
-    from mlx_lm.generate import generate_step
+    from mlx_lm.generate import BatchGenerator, StopSequences, generate_step
     from mlx_lm.utils import load_model
     from mlx_lm.sample_utils import make_sampler
 
@@ -88,11 +88,64 @@ def main():
           'adapter_created': not adapter_loaded, 'adapter_active': model.adapter_active,
           'adapter_training_steps': training_steps, 'memory': memory_stats(mx)})
 
+    def generate_batch(requests):
+        if not 1 <= len(requests) <= 4:
+            raise ValueError('Generation batches must contain one to four requests')
+        generator = BatchGenerator(model, prefill_batch_size=len(requests),
+                                   completion_batch_size=len(requests), prefill_step_size=128)
+        results = [{'tokens': [], 'finish_reason': 'max_tokens', 'thinking_tokens': 0}
+                   for request in requests]
+        thinking = [request.get('thinking', False) for request in requests]
+        mx.reset_peak_memory()
+        try:
+            uids = generator.insert(
+                [request['ids'] for request in requests],
+                max_tokens=[request['max_tokens'] for request in requests],
+                samplers=[make_sampler(temp=request['temperature'], top_p=0.8, top_k=20)
+                          for request in requests],
+                stop_sequences=[StopSequences([[token] for token in request['stop_ids']])
+                                for request in requests])
+            indices = {uid: index for index, uid in enumerate(uids)}
+            finished = set()
+            while len(finished) < len(requests):
+                responses = generator.next_generated()
+                if not responses:
+                    raise RuntimeError('Batch generator ended before all requests completed')
+                for response in responses:
+                    index = indices[response.uid]
+                    request, result = requests[index], results[index]
+                    token = response.token
+                    if token in request['stop_ids']:
+                        result['finish_reason'] = 'stop_token'
+                        finished.add(response.uid)
+                        continue
+                    result['tokens'].append(token)
+                    if token == request.get('think_start_id'):
+                        thinking[index] = True
+                    if token == request.get('think_end_id'):
+                        thinking[index] = False
+                    if thinking[index]:
+                        result['thinking_tokens'] += 1
+                        if result['thinking_tokens'] >= request.get('thinking_budget', 256):
+                            result['finish_reason'] = 'thinking_budget'
+                            generator.remove([response.uid])
+                            finished.add(response.uid)
+                    if response.finish_reason is not None:
+                        finished.add(response.uid)
+            for result in results:
+                result['generated_tokens'] = len(result['tokens'])
+                result['memory'] = memory_stats(mx)
+            return results
+        finally:
+            generator.close()
+
     for line in sys.stdin:
         try:
             request = json.loads(line)
             op = request['op']
-            if op == 'generate':
+            if op == 'generate_batch':
+                send({'results': generate_batch(request['requests'])})
+            elif op == 'generate':
                 stops = set(request['stop_ids'])
                 tokens = []
                 finish_reason = 'max_tokens'

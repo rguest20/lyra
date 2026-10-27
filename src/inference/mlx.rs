@@ -167,6 +167,77 @@ impl MlxModel {
         temperature: f64,
         thinking: bool,
     ) -> io::Result<String> {
+        self.chat_with_initial(messages, extra, cap, temperature, thinking, None)
+    }
+
+    pub(super) fn chat_batch(
+        &mut self,
+        messages: &[Vec<Message>],
+        extra: usize,
+        cap: usize,
+        temperature: f64,
+        thinking: bool,
+    ) -> Vec<io::Result<String>> {
+        let mut answers = Vec::with_capacity(messages.len());
+        for chunk in messages.chunks(4) {
+            let requests: io::Result<Vec<_>> = chunk.iter().map(|messages| {
+                let use_thinking = thinking && self.supports_thinking;
+                let ids = self.ids(messages, use_thinking)?;
+                if ids.is_empty() || ids.len() > self.max_context - MIN_REPLY {
+                    return Err(invalid("full conversation exceeds the configured context limit; no history was discarded"));
+                }
+                let limit = reply_budget(ids.len(), extra, self.max_context, cap);
+                Ok(serde_json::json!({"ids":ids,"max_tokens":limit,"temperature":temperature,
+                    "stop_ids":[self.tokenizer.token_to_id("<|im_end|>").unwrap(),self.tokenizer.token_to_id("<|endoftext|>").unwrap()],
+                    "thinking":use_thinking,"thinking_budget":thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1)),
+                    "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))
+            }).collect();
+            let response = requests.and_then(|requests| {
+                self.request(serde_json::json!({"op":"generate_batch","requests":requests}))
+            });
+            let responses = response.and_then(|response| {
+                let results = response["results"]
+                    .as_array()
+                    .filter(|results| results.len() == chunk.len())
+                    .ok_or_else(|| other("MLX batch returned an invalid result count"))?;
+                Ok(results.clone())
+            });
+            match responses {
+                Ok(responses) => {
+                    for (messages, response) in chunk.iter().zip(responses) {
+                        answers.push(self.chat_with_initial(
+                            messages,
+                            extra,
+                            cap,
+                            temperature,
+                            thinking,
+                            Some(response),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    crate::diagnostics::event(
+                        "model.batch_recovery",
+                        serde_json::json!({"error":error.to_string(),"requests":chunk.len(),"action":"retry_serially"}),
+                    );
+                    for messages in chunk {
+                        answers.push(self.chat(messages, extra, cap, temperature, thinking));
+                    }
+                }
+            }
+        }
+        answers
+    }
+
+    fn chat_with_initial(
+        &mut self,
+        messages: &[Message],
+        extra: usize,
+        cap: usize,
+        temperature: f64,
+        thinking: bool,
+        mut initial: Option<serde_json::Value>,
+    ) -> io::Result<String> {
         self.last_thinking = None;
         for attempt in 0..3 {
             let use_thinking = thinking && attempt == 0 && self.supports_thinking;
@@ -183,8 +254,11 @@ impl MlxModel {
                 self.tokenizer.token_to_id("<|im_end|>").unwrap(),
                 self.tokenizer.token_to_id("<|endoftext|>").unwrap(),
             ];
-            let mut response = self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
-                "thinking":use_thinking,"thinking_budget":initial_budget,"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+            let mut response = match initial.take() {
+                Some(response) => response,
+                None => self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
+                    "thinking":use_thinking,"thinking_budget":initial_budget,"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?,
+            };
             let mut tokens: Vec<u32> =
                 serde_json::from_value(response["tokens"].clone()).map_err(other)?;
             if use_thinking && response["finish_reason"] == "thinking_budget" {
@@ -434,6 +508,70 @@ mod tests {
             output: BufReader::new(child.stdout.take().unwrap()),
             child,
         }
+    }
+
+    #[test]
+    fn batches_preserve_order_chunk_bounds_and_individual_recovery() {
+        let vocabulary = [
+            ("<unk>".into(), 0),
+            ("<|im_end|>".into(), 1),
+            ("<|endoftext|>".into(), 2),
+            ("A".into(), 3),
+            ("B".into(), 4),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocabulary)
+                .unk_token("<unk>".into())
+                .build()
+                .unwrap(),
+        );
+        let path = crate::test_support::unique_temp_path("batch-recovery", "");
+        let script = r#"import sys,json
+for call,line in enumerate(sys.stdin):
+ r=json.loads(line)
+ if call==0:
+  assert r['op']=='generate_batch' and len(r['requests'])==4
+  results=[{'tokens':[3], 'finish_reason':'stop_token'} for _ in range(4)]
+  results[1]['finish_reason']='max_tokens'
+  response={'results':results}
+ elif call==1:
+  assert r['op']=='generate' and r['max_tokens']==1024
+  response={'tokens':[4], 'finish_reason':'stop_token'}
+ else:
+  assert call==2 and r['op']=='generate_batch' and len(r['requests'])==2
+  response={'results':[{'tokens':[3], 'finish_reason':'stop_token'} for _ in range(2)]}
+ print(json.dumps(response),flush=True)
+"#;
+        let mut model = MlxModel {
+            worker: Mutex::new(worker(script)),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
+            tokenizer,
+            supports_thinking: false,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(&path).unwrap(),
+        };
+        let conversations = vec![
+            vec![Message {
+                role: "user".into(),
+                content: "question".into()
+            }];
+            6
+        ];
+        let replies: Vec<_> = model
+            .chat_batch(&conversations, 0, 512, 0.1, false)
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(replies, ["A", "B", "A", "A", "A", "A"]);
+        drop(model);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

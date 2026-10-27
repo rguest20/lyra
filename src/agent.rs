@@ -220,8 +220,13 @@ impl Agent {
             map,
             services.research_model,
         )?;
-        let (answer, answer_thinking) =
-            self.initial_draft(&request, &turn_context, backend, services.research_model)?;
+        let (answer, answer_thinking) = self.initial_draft(
+            &request,
+            &turn_context,
+            backend,
+            services.research_model,
+            show_thinking,
+        )?;
         let task::TurnContext {
             pending,
             research_evidence,
@@ -305,6 +310,7 @@ impl Agent {
         context: &task::TurnContext,
         backend: &mut LocalModel,
         research_model: &mut LocalModel,
+        show_thinking: bool,
     ) -> io::Result<(String, Option<String>)> {
         if !context.research_evidence.is_empty() {
             return answer_from_research_with_thinking(
@@ -348,7 +354,11 @@ impl Agent {
             baseline.insert(1, challenge);
         }
         let extra_prompt_tokens = backend.additional_prompt_tokens(&baseline, &messages)?;
-        let answer = backend.chat(&messages, extra_prompt_tokens, true)?;
+        let answer = backend.chat(
+            &messages,
+            extra_prompt_tokens,
+            request.use_extended_reasoning(show_thinking),
+        )?;
         Ok((answer, backend.take_thinking()))
     }
 
@@ -419,7 +429,8 @@ impl Agent {
                             pending,
                             &found,
                         );
-                        let answer = backend.chat(&messages, 0, true)?;
+                        let answer =
+                            backend.chat(&messages, 0, request.use_extended_reasoning(false))?;
                         (answer, backend.take_thinking())
                     };
                     answer = researched;

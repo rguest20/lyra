@@ -134,6 +134,42 @@ impl LocalModel {
         )
     }
 
+    pub fn chat_for_extraction_batch(
+        &mut self,
+        conversations: &[Vec<Message>],
+    ) -> Vec<io::Result<String>> {
+        self.chat_batch(conversations, 0, MAX_EXTRACTION_REPLY, 0.1, false)
+    }
+
+    /// Generate independent conversations in bounded, same-model batches.
+    /// Return values retain input order; dependent follow-ups require a later call.
+    pub fn chat_batch(
+        &mut self,
+        conversations: &[Vec<Message>],
+        extra_tokens: usize,
+        cap: usize,
+        temperature: f64,
+        thinking: bool,
+    ) -> Vec<io::Result<String>> {
+        if conversations.is_empty() {
+            return Vec::new();
+        }
+        match self {
+            Self::Mlx(model) => {
+                model.chat_batch(conversations, extra_tokens, cap, temperature, thinking)
+            }
+            Self::Shared(model) => {
+                model.generate_batch(conversations, extra_tokens, cap, temperature, thinking)
+            }
+            Self::Candle(_) => conversations
+                .iter()
+                .map(|messages| {
+                    self.chat_with_reply_cap(messages, extra_tokens, cap, temperature, thinking)
+                })
+                .collect(),
+        }
+    }
+
     pub fn chat_for_extraction(&mut self, messages: &[Message]) -> io::Result<String> {
         self.chat_for_extraction_with_budget(messages, MAX_EXTRACTION_REPLY)
     }
@@ -178,7 +214,7 @@ impl LocalModel {
         let messages = [
             Message {
                 role: "system".into(),
-                content: "/no_think\nTurn the research question into a short encyclopedia search phrase naming its main subject. Return exactly SEARCH: followed by 2 to 8 words. Remove question words and omit personal details. Example: `Who was the first editor of The Journal of Hellenic Studies?` -> `SEARCH: The Journal of Hellenic Studies`. Return no explanation.".into(),
+                content: "/no_think\nTurn the research request into a short encyclopedia search phrase. Preserve the named subject and the requested property, comparison, time, and scope needed to find evidence answering it. Do not reduce a question about a specific attribute to the subject alone. Remove grammatical question wording and omit private personal details. Return exactly SEARCH: followed by 2 to 8 words, with no explanation. Example: `What was the approximate age of the Trapezium stars?` -> `SEARCH: Trapezium stars approximate age`.".into(),
             },
             Message { role: "user".into(), content: question.into() },
         ];

@@ -22,12 +22,28 @@ pub fn process_once_limited(
     limit: usize,
 ) -> io::Result<usize> {
     let mut store = LearningStore::open(Path::new(database_path))?;
-    let mut processed = 0;
+    let mut observations = Vec::new();
     for _ in 0..limit.min(MAX_BATCH) {
         let Some(observation) = store.claim_next_observation(LEASE_SECONDS)? else {
             break;
         };
-        match extract_observation(model, &observation).and_then(|mut extraction| {
+        observations.push(observation);
+    }
+    let prepared: Vec<_> = observations.iter().map(observation_messages).collect();
+    let prompts: Vec<_> = prepared
+        .iter()
+        .filter_map(|result| result.as_ref().ok().map(|(messages, _)| messages.clone()))
+        .collect();
+    let mut replies = model.chat_for_extraction_batch(&prompts).into_iter();
+    let mut processed = 0;
+    for (observation, prepared) in observations.into_iter().zip(prepared) {
+        let extraction = prepared.and_then(|(_, available_ids)| {
+            let reply = replies
+                .next()
+                .ok_or_else(|| invalid("missing observation batch result"))??;
+            finish_observation(&reply, &observation, &available_ids)
+        });
+        match extraction.and_then(|mut extraction| {
             ai_review_flagged_claims(model, &observation, &mut extraction, true)?;
             Ok(extraction)
         }) {
@@ -304,6 +320,12 @@ fn extract_observation(
     model: &mut LocalModel,
     observation: &Observation,
 ) -> io::Result<ExtractionResult> {
+    let (messages, available_ids) = observation_messages(observation)?;
+    let reply = model.chat_for_extraction(&messages)?;
+    finish_observation(&reply, observation, &available_ids)
+}
+
+fn observation_messages(observation: &Observation) -> io::Result<(Vec<Message>, Vec<String>)> {
     let (context, available_ids) = load_context(observation)?;
     let mut user_content = String::new();
     if !context.is_empty() {
@@ -320,7 +342,7 @@ fn extract_observation(
     user_content.push_str("\nUser observation to extract from:\n");
     user_content.push_str(&observation.raw_text);
 
-    let messages = [
+    let messages = vec![
         Message {
             role: "system".into(),
             content: format!(
@@ -341,8 +363,15 @@ fn extract_observation(
             content: user_content,
         },
     ];
-    let reply = model.chat_for_extraction(&messages)?;
-    let parsed = parse_response(&reply)?;
+    Ok((messages, available_ids))
+}
+
+fn finish_observation(
+    reply: &str,
+    observation: &Observation,
+    available_ids: &[String],
+) -> io::Result<ExtractionResult> {
+    let parsed = parse_response(reply)?;
     if parsed.claims.len() > MAX_CANDIDATES {
         return Err(invalid("extractor returned too many candidate claims"));
     }
