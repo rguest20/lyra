@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod coding;
 mod curator;
 mod curmudgeon;
 mod diagnostics;

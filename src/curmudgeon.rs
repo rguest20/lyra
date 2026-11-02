@@ -14,6 +14,7 @@ use crate::storage::{AssistantClaim, ClaimJudgment, LearningStore, ScholarProven
 const MAX_CLAIMS: usize = 4;
 const MAGNITUDE_CHALLENGE_RATIO: f64 = 3.0;
 
+pub(crate) mod coding;
 mod openai;
 
 fn openai_review_enabled(value: Option<&str>) -> bool {

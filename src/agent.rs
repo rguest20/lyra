@@ -16,6 +16,7 @@ use crate::storage::{
     StoredCandidate,
 };
 
+mod coding;
 pub(crate) mod conversation_review;
 mod research_reply;
 mod task;
@@ -209,9 +210,32 @@ impl Agent {
         if let Some(maintenance) = services.maintenance {
             maintenance.wake();
         }
-        let request = task::assess_request(input, &self.history, |messages| {
-            services.research_model.chat_for_extraction(messages)
-        });
+        // An explicit command is a protocol delimiter, not semantic phrase matching.
+        let explicit_code = input
+            .strip_prefix("/code ")
+            .filter(|problem| !problem.trim().is_empty());
+        let request =
+            task::assess_request(explicit_code.unwrap_or(input), &self.history, |messages| {
+                services.research_model.chat_for_extraction(messages)
+            });
+        if explicit_code.is_some() || request.requires_code_execution {
+            crate::diagnostics::event(
+                "conversation.coding_requested",
+                json!({
+                    "conversation_id":self.conversation_id,"turn":self.turn_count()+1,"explicit_command":explicit_code.is_some(),
+                    "requires_source_check":request.requires_source_check,"needs_external_facts":request.needs_external_facts,
+                }),
+            );
+            let (answer, researched) = self.solve_coding_task(&request, &mut services)?;
+            return self.deliver_reply(
+                raw_input,
+                answer,
+                None,
+                researched,
+                services,
+                show_thinking,
+            );
+        }
         let turn_context = task::select_turn_context(
             services.store,
             &self.conversation_id,

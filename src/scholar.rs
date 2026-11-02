@@ -1,6 +1,7 @@
 //! Separate research queue for public facts. Search results are evidence, not instructions.
 
 mod claims;
+pub(crate) mod coding;
 mod config;
 mod discovery;
 pub(crate) mod evidence;

@@ -176,6 +176,9 @@ impl Cli {
     }
 
     pub(super) fn scholar(&mut self, args: Vec<String>) -> Result<(), String> {
+        if args.first().is_some_and(|argument| argument == "code") {
+            return self.scholar_code(&args[1..]);
+        }
         let database_path = &self.database_path;
         let values = args;
         let mut store = storage::LearningStore::open(database_path).map_err(|e| e.to_string())?;
@@ -536,6 +539,31 @@ impl Cli {
                             .into(),
                     );
             }
+        }
+        Ok(())
+    }
+
+    fn scholar_code(&mut self, args: &[String]) -> Result<(), String> {
+        let root = scholar::coding::runs_root(&self.database_path);
+        match args {
+            [command, id] if command == "show" => {
+                let report = scholar::coding::load_report(&root, id).map_err(|error| error.to_string())?;
+                println!("{}", serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?);
+            },
+            [command, id, destination] if command == "export" => {
+                let report = scholar::coding::load_report(&root, id).map_err(|error| error.to_string())?;
+                scholar::coding::export(&report, std::path::Path::new(destination)).map_err(|error| error.to_string())?;
+                println!("Exported {:?} artifact to {destination}; see run {id} for its review and limits.", report.outcome);
+            },
+            [command, request @ ..] if command == "solve" && !request.is_empty() => {
+                self.ensure_runtime("scholar code")?;
+                let runtime = self.model_runtime.as_ref().expect("runtime initialized");
+                let (report, directory) = scholar::coding::solve(&request.join(" "), &[], &root,
+                    &mut runtime.model(AgentRole::Scholar), &mut runtime.model(AgentRole::Curmudgeon), crate::coding::SourceContext::default())
+                    .map_err(|error| error.to_string())?;
+                println!("{}", report.summary(&directory));
+            },
+            _ => return Err("usage: scholar code solve PROBLEM | scholar code show RUN_ID | scholar code export RUN_ID NEW_DIRECTORY".into()),
         }
         Ok(())
     }

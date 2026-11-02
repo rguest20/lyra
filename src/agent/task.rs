@@ -4,6 +4,8 @@ use super::*;
 #[derive(serde::Deserialize)]
 struct SourceCheckIntent {
     requires_source_check: bool,
+    #[serde(default)]
+    reason: String,
 }
 
 pub(super) struct ResolvedTurnRequest<'a> {
@@ -12,6 +14,7 @@ pub(super) struct ResolvedTurnRequest<'a> {
     pub needs_external_facts: bool,
     pub requires_extended_reasoning: bool,
     pub requires_source_check: bool,
+    pub requires_code_execution: bool,
 }
 
 impl ResolvedTurnRequest<'_> {
@@ -119,6 +122,7 @@ mod reasoning_tests {
             needs_external_facts: false,
             requires_extended_reasoning: false,
             requires_source_check: false,
+            requires_code_execution: false,
         };
         assert!(!request.use_extended_reasoning(false));
         assert!(request.use_extended_reasoning(true));
@@ -144,6 +148,7 @@ pub(super) fn assess_request<'a>(
             crate::research::RequestIntent {
                 needs_external_facts: true,
                 requires_extended_reasoning: true,
+                requires_code_execution: false,
                 resolved_request: request.into(),
             }
         });
@@ -165,7 +170,7 @@ pub(super) fn assess_request<'a>(
     };
     crate::diagnostics::research_decision(
         "conversation.request_intent",
-        json!({"question":request,"needs_external_facts":intent.needs_external_facts,"requires_extended_reasoning":intent.requires_extended_reasoning,"requires_source_check":requires_source_check}),
+        json!({"question":request,"needs_external_facts":intent.needs_external_facts,"requires_extended_reasoning":intent.requires_extended_reasoning,"requires_source_check":requires_source_check,"requires_code_execution":intent.requires_code_execution}),
     );
     ResolvedTurnRequest {
         original_message: request,
@@ -173,6 +178,7 @@ pub(super) fn assess_request<'a>(
         needs_external_facts: intent.needs_external_facts,
         requires_extended_reasoning: intent.requires_extended_reasoning,
         requires_source_check,
+        requires_code_execution: intent.requires_code_execution,
     }
 }
 
@@ -184,10 +190,16 @@ pub(super) fn requires_source_check(
 ) -> io::Result<bool> {
     let messages = [
         Message { role: "system".into(), content: r#"/no_think
-Read the latest user request in context. Use earlier turns only to resolve its references and still-applicable constraints; older requests are not automatically new source-check requirements. Does the user ask to check or verify against external sources, consult documentation, or use current external information? This is about what they requested, never whether you already know the answer. A statement, correction, challenge, or factual assertion is not by itself a request to check sources; for example, “Correction: I meant Wednesday” and “Are you sure?” do not ask for an external check. Code-writing and other tasks can require a source check when the user explicitly asks for one. Return ONLY JSON {"requires_source_check":true} or {"requires_source_check":false}."#.into() },
+Identify the basis the user asks you to use for satisfying the latest deliverable. A source check consults information outside the supplied inputs, such as external documents, independently reported facts or current information. Constructing an artifact and evaluating whether it follows the supplied specification uses a different basis: the supplied rules and observed behavior. A request for evaluation does not itself ask for external sources. Decide what verification the user actually requested, not whether you know enough to perform the task or whether it mentions a real topic. Preserve an explicit request for external verification even when you can construct or test part of the deliverable directly. Use earlier turns only to resolve references and still-applicable constraints; older requests do not automatically add new source requirements. Statements, corrections and challenges do not by themselves request source consultation. Return ONLY JSON with the rationale first: {"reason":"what basis the user requested and why that does or does not call for external sources","requires_source_check":true or false}."#.into() },
         Message { role: "user".into(), content: crate::research::request_context(request, history).to_string() },
     ];
     let intent: SourceCheckIntent = crate::research::json_object_as(&ask(&messages)?)?;
+    crate::diagnostics::research_decision(
+        "conversation.source_check_assessed",
+        json!({
+            "request":request,"requires_source_check":intent.requires_source_check,"reason":intent.reason,
+        }),
+    );
     Ok(intent.requires_source_check)
 }
 
