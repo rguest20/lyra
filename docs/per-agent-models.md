@@ -2,11 +2,12 @@
 
 ## Architecture
 
-The existing Candle Qwen3 and MLX Qwen3.5 backends remain unchanged. A
+Unquantized Qwen3 uses Candle; quantized Qwen3 and Qwen3.5 use MLX. A
 `ModelRuntime` gives each agent a lightweight `LocalModel` handle. Handles route
 inference through a lazy cache rather than loading a checkpoint per handle.
-Foreground chat and background upkeep have separate caches; matching canonical
-model directory, adapter path, and device reuse one backend within each lane,
+Foreground chat and background upkeep can share a pool or use separate caches.
+Matching canonical model directory, adapter path, and device reuse one backend
+within a pool,
 even if configured model labels differ. Different adapters intentionally select
 different instances. Model identifiers label local files; they do not download
 or select a hosted model.
@@ -18,15 +19,21 @@ Semantic lookup and source-grounded entity aliases are described in the README.
 An unset assignment inherits the global model and adapter. Invalid assignments
 fail explicitly; unavailable checkpoints never fall back to a smaller model.
 
-The background cache defaults to one resident backend. A separate chat cache
-keeps its own assigned backend warm, so a background generation already in
-progress cannot hold up a browser or terminal chat turn. Each lane is serialized
-internally and has its own process request lock: background uses
-`COMMUNITY_MODEL_LOCK` with `.requests` appended, and chat uses `.chat.requests`.
-This can keep two copies of the same model resident and generating at once; check
-memory pressure on smaller machines. Network requests and database work do not
-hold either inference mutex. Raw training and checkpoint commands retain their
-existing loader; stop agents before manual training or consolidation.
+The cache defaults to one resident backend per pool. With
+`COMMUNITY_MODEL_SHARED_LANES=on`, foreground and background handles share the
+same pool and process request lock. This avoids duplicate resident weights in
+one Lyra process when every assignment and adapter matches. Generation is
+serialized: a foreground call waits for active background inference to finish.
+Background calls still yield while a foreground turn is active and for two
+minutes afterward; the quiet-window check is repeated after acquiring the pool.
+
+Shared lanes are opt-in. With them disabled, chat and upkeep use separate caches
+and locks (`.chat.requests` and `.requests` derived from `COMMUNITY_MODEL_LOCK`).
+This permits concurrent foreground/background inference and can retain two
+copies of a checkpoint. Network requests and database work do not hold either
+inference mutex. Separate Lyra processes still have separate model workers.
+Raw training and checkpoint commands retain their existing loader; stop agents
+before manual training or consolidation.
 
 Dropping the last runtime or agent handle drops its cached backends and releases
 their leases. Existing MLX cleanup kills and reaps the Python worker. Terminal
@@ -34,8 +41,8 @@ chat shares its runtime with background maintenance, retaining models over idle
 ticks. Shutdown still waits for an already-running maintenance pass.
 
 The browser server keeps its model runtime for its full lifetime. Browser replies
-reuse the warm chat lane while the maintenance thread uses the separate
-background lane. The server warms Interaction before accepting requests and
+reuse the warm chat pool; maintenance uses that same pool with shared lanes
+enabled, or its own pool otherwise. The server warms Interaction before accepting requests and
 waits for an active maintenance pass when shutting down. Standalone `say` and
 `curate-once` commands remain short-lived processes.
 
@@ -64,77 +71,45 @@ Metal acceleration is preserved; setting `COMMUNITY_DEVICE=cpu` is supported
 only by Candle. The MLX backend requires Apple Silicon. This routing can be
 configured differently on a desktop, but it does not add ROCm or CUDA support.
 
-## MacBook Profile
+## MacBook Profile — 28 October 2026
 
-The global/default assignment remains the original BF16 2B checkpoint. The
-local development profile assigns all five roles to the 8-bit quantized
-checkpoint, with a separate adapter path for each role. The 0.6B files remain
-available for rollback. Keep the BF16 base checkpoint installed:
+The 16 GiB M5 development profile now assigns every local role to
+`mlx-community/Qwen3-14B-4bit`, revision
+`a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4`. The checkpoint is installed under
+`models/qwen3-14b-4bit`. All roles inherit the global assignment and the fresh
+`state/adapter-qwen3-14b-4bit-shared.safetensors` output adapter. Old per-role
+2B overrides were removed from the ignored `.env`. The role adapters were
+untrained; they were not migrated or combined. Sharing this new adapter does
+not enable training, create independent reviewers, or change the roles' prompts.
 
-```sh
-python3 -m venv --system-site-packages .venv-qwen35
-.venv-qwen35/bin/pip install -r scripts/requirements-mlx.txt
-hf download Qwen/Qwen3.5-2B config.json tokenizer.json tokenizer_config.json model.safetensors.index.json model.safetensors-00001-of-00001.safetensors --local-dir models/qwen3.5-2b
-```
+The profile enables shared lanes, sets cache size 1 and caps context at 8,192
+tokens. Exact operator settings are in README.md. Conversation, database and
+knowledge paths were preserved. A private pre-switch `.env` copy is retained
+under `state/config-backups/`; the 2B INT8 checkpoint and its adapters remain
+available for rollback. Restart existing processes after configuration changes.
 
-Set local environment variables or the Git-ignored `.env`:
+The first live load reported 8,312,829,968 bytes of active MLX allocations;
+a short JSON generation peaked at 8,440,576,332 bytes. These are MLX allocation
+figures, not total application or system RAM. Longer prompts, KV caches, multiple
+items in a batch, Docker and other apps require additional memory. A first
+coding replay completed planning and acceptance generation, then its worker
+exited during acceptance audit before the user-requested shutdown for Teams.
+That interrupted run remains unresolved. It does not establish a reliable 14B
+coding workflow or stable memory use under video-call workloads.
 
-```dotenv
-COMMUNITY_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_MODEL_DIR=models/qwen3.5-2b
-COMMUNITY_ADAPTER=state/adapter-qwen3.5-2b.safetensors
-COMMUNITY_MLX_PYTHON=.venv-qwen35/bin/python
-COMMUNITY_CONTEXT_TOKENS=2048
-COMMUNITY_CURMUDGEON_OPENAI=off
-COMMUNITY_MODEL_CACHE_SIZE=1
-```
+A fresh replay completed after three rounds (about 11.5 minutes), with one
+model load, no worker restart and about 9.67 GB peak MLX allocation. Both final
+eight-case suites and additional Codex-authored finite-domain checks passed.
+An isolated ordinary conversation with reasoning enabled also used one worker
+across Curmudgeon and Interaction and delivered a reply. Acceptance scope errors
+and failed schema repairs remain in the coding record; this is one successful
+pilot, not general reviewer or grounding acceptance. Detailed evidence and
+limitations are in docs/grounding-generalization-progress.md.
 
-The local `.env` overrides every role:
-
-```dotenv
-COMMUNITY_SCOUT_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_SCOUT_MODEL_DIR=models/qwen3.5-2b-8bit
-COMMUNITY_SCOUT_ADAPTER=state/adapter-qwen3.5-2b-8bit-scout.safetensors
-COMMUNITY_SCHOLAR_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_SCHOLAR_MODEL_DIR=models/qwen3.5-2b-8bit
-COMMUNITY_SCHOLAR_ADAPTER=state/adapter-qwen3.5-2b-8bit-scholar.safetensors
-COMMUNITY_CURMUDGEON_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_CURMUDGEON_MODEL_DIR=models/qwen3.5-2b-8bit
-COMMUNITY_CURMUDGEON_ADAPTER=state/adapter-qwen3.5-2b-8bit-curmudgeon.safetensors
-COMMUNITY_ARCHIVIST_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_ARCHIVIST_MODEL_DIR=models/qwen3.5-2b-8bit
-COMMUNITY_ARCHIVIST_ADAPTER=state/adapter-qwen3.5-2b-8bit-archivist.safetensors
-COMMUNITY_INTERACTION_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_INTERACTION_MODEL_DIR=models/qwen3.5-2b-8bit
-COMMUNITY_INTERACTION_ADAPTER=state/adapter-qwen3.5-2b-8bit-interaction.safetensors
-```
-
-The 4-bit checkpoint was removed locally at the user's request; its benchmark
-outputs remain as historical records. The INT8 assignments are inference
-choices only and do not enable training or adapter merging.
-
-Restart Lyra after configuration changes. Roles without overrides inherit the
-global 2B assignment. Changing Interaction's model preserves its saved
-conversation history and updates the model label when the next turn is saved.
-
-The development Mac has 16 GiB of physical RAM. The upstream BF16 weights are
-1,503,300,328 bytes for 0.6B and 4,548,221,488 bytes for 2B. Separate chat and
-upkeep lanes can each hold a copy, so two 2B BF16 backends require about 9.1 GB
-for weights alone, before KV caches, activations, adapters, Python/Metal
-allocation overhead, and other applications. Two simultaneous 4-bit MLX workers
-each reported about 1.07 GB active memory in a local probe. Monitor Activity
-Monitor and `memory_pressure` during normal use, especially while maintenance
-runs. Lower context limits reduce cache and attention memory if pressure or
-swap grows.
-The original BF16 2B checkpoint, experimental 8-bit checkpoint, and isolated
-MLX environment are installed locally. The ignored `.env` assigns every role
-to INT8. The 4-bit checkpoint was removed; only historical comparison data
-remains.
-Local review smoke probes accepted a supported crisp-flavours claim and rejected
-an off-topic US renewable-electricity claim for a food-production question.
-These synthetic fixtures check review decisions and routing, not general model
-accuracy or source classification. Lower context limits reduce cache and
-attention memory if pressure or swap grows.
+Earlier 0.6B/2B profiles and BF16/INT8/4-bit comparisons are historical evidence
+in docs/qlora-speed-experiment.md and the archived quantized-runtime notes.
+The 14B 4-bit choice is a new inference configuration; it does not establish
+that 4-bit quantization preserves this model's reviewer accuracy.
 
 ## Diagnostics And Validation
 
@@ -165,8 +140,9 @@ reuse, LRU eviction, lazy handles, and shutdown. Existing maintenance, research,
 review, storage, and web tests remain the workflow regression checks. No learning
 database schema or semantic map format was changed.
 
-Scholar benefits from 2B for section selection, faithful extraction and semantic
-entailment. In live crisp research, 0.6B rejected an explicitly named company
-as unrelated and returned generic definitions. Curmudgeon also supplies the
-semantic lookup planner, evidence selector and grounded answer generation.
+Historical small-model research pilots found that 0.6B rejected an explicitly
+named company as unrelated and returned generic definitions. Those narrow
+comparisons do not establish the new 14B model's grounding accuracy. Curmudgeon
+also supplies the semantic lookup planner, evidence selector and grounded
+answer generation.
 Scholar and Curmudgeon share weights when their directory and adapter match.

@@ -1,5 +1,5 @@
 LYRA — CURRENT TASKS
-Updated 27 October 2026
+Updated 28 October 2026
 
 Lyra should understand requests, give useful grounded answers, and learn without
 turning uncertain interpretations into established knowledge. Unchecked work is
@@ -57,9 +57,17 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   thinking and answer path for BF16, INT8 and 4-bit Interaction assignments.
   Initial latency, token rate and generation memory are recorded in
   `docs/qlora-speed-experiment.md`; this is a one-prompt pilot only.
-- [x] Assign all local roles to INT8 with role-specific adapter paths. The
-  4-bit checkpoint was removed locally because of quality-loss concerns; its
-  benchmark records remain historical comparison data.
+- [x] Previously assign all local roles to 2B INT8 with role-specific adapter
+  paths. Those measurements remain historical comparison data. The small-model
+  4-bit checkpoint was removed because of quality-loss concerns.
+- [x] Switch the local profile to Qwen3-14B at 4-bit using MLX, one shared
+  foreground/background pool, cache size 1 and a common fresh output adapter
+  for all five roles. Keep the previous configuration and 2B INT8 files for
+  rollback. This is an inference change, not a training or grounding acceptance.
+- [ ] Evaluate the 14B shared-worker profile for reviewer quality, ordinary chat,
+  batching, long contexts, latency and memory under normal desktop workloads.
+  Shared-model roles still do not provide independent confirmation. Active
+  background generation can delay chat; record that trade-off and worker exits.
 - [x] Compare three BF16-all-role and three INT8-all-role `say` runs on the
   same prompt. INT8 was about 42% faster end to end in this narrow speed check;
   raw results and the Candle backend limitation are recorded in
@@ -117,6 +125,32 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   partial-answer/rejection inconsistency; the parser leaves the latter
   unresolved after bounded repair. Keep grounding/training gates closed until
   these failures are evaluated. See docs/scout-intake-and-qualified-review-plan.md.
+
+7. Scholar coding experiments with Curmudgeon outcome review
+
+- [x] Add a bounded hypothesis, implementation, Docker execution, self-assessment
+  and revision loop using the existing Scholar and Curmudgeon assignments.
+  Retain acceptance preparation/audits, fixed execution suites, artifacts,
+  raw decisions, execution feedback,
+  explicit complete/partial/limited/not_solved/unresolved outcomes and causal
+  review. Support contextual chat routing, /code and standalone CLI experiments.
+- [x] Add the offline Python standard-library sandbox, resource/deadline bounds,
+  capped output, immutable image identity, cleanup and new-directory export.
+  Preserve external source prerequisites and keep experiment records separate
+  from knowledge promotion and approved learning.
+- [x] Bound model-authored tests as structured cases, keep implementation and
+  test generation separate, audit acceptance preparation before freezing it,
+  and retain a non-approving Curmudgeon failure evaluation when generation or
+  review cannot complete within its limits.
+- [ ] Evaluate live coding and revision across unrelated tasks, misleading or
+  vacuous tests, ambiguous follow-ups, external-evidence gaps and adversarial
+  artifacts. Retain latency, capped outputs, false success and unnecessary
+  abstention; seek independent judgments. Local deterministic checks do not
+  establish coding competence or independence between shared-model roles.
+- Defaults allow 12 implementation rounds, a 90-minute stage-admission budget,
+  and 8,192 tokens per attempt; operators can raise the bounded settings further.
+- Coding standards review and additional language/dependency profiles remain
+  deferred. Operator setup and limits are in README.md.
 
 The original code-simplification review and dated progress records are retained
 as historical references. They record completed work, deferred options, raw

@@ -1,9 +1,10 @@
 # Lyra
 
-One local multi-agent chatbot in Rust, supporting original **BF16 Qwen3 and
-Qwen3.5** checkpoints on Apple Metal. A persistent local MLX worker runs Qwen3.5's hybrid attention model;
+One local multi-agent chatbot in Rust, supporting **Qwen3 and Qwen3.5**
+checkpoints on Apple Metal. A persistent local MLX worker runs quantized Qwen3
+and BF16 or quantized Qwen3.5 models;
 Rust handles conversations, research, grounding, AI review, logging, and storage.
-No hosted inference service is required. The legacy Qwen3 backend uses Candle.
+No hosted inference service is required. Unquantized Qwen3 uses Candle.
 
 ## How the system works
 
@@ -20,7 +21,7 @@ useful answer does not turn an uncertain interpretation into stored knowledge.
 | Scout | Turns unanswered details and reviewed knowledge gaps into bounded research jobs. It prioritizes current conversation questions and avoids personal facts. |
 | Curator | Extracts claims from user observations and routes uncertain candidates for review. User reports remain distinct from externally sourced claims. |
 | Maintenance | Runs Curator, Curmudgeon, Scout, and Scholar during quiet time. It records each role's outcome and keeps foreground replies ahead of background work. |
-| Model runtime | Routes agent requests to local Candle or MLX backends, with separate foreground and maintenance lanes, caches, and process locks. |
+| Model runtime | Routes agent requests to local Candle or MLX backends. Foreground and maintenance can share one cache and worker, or use separate workers. |
 
 For a factual request, Interaction checks the conversation and existing
 evidence, then queues bounded research when a relevant public fact is missing.
@@ -65,30 +66,40 @@ Weights and the Python environment are ignored by Git. On Apple Silicon:
 ```sh
 python3 -m venv --system-site-packages .venv-qwen35
 .venv-qwen35/bin/pip install -r scripts/requirements-mlx.txt
-hf download Qwen/Qwen3.5-2B config.json tokenizer.json tokenizer_config.json model.safetensors.index.json model.safetensors-00001-of-00001.safetensors --local-dir models/qwen3.5-2b
+hf download mlx-community/Qwen3-14B-4bit --revision a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4 --local-dir models/qwen3-14b-4bit
 ```
 
 Set these in local `.env`:
 
 ```dotenv
-COMMUNITY_MODEL_ID=Qwen/Qwen3.5-2B
-COMMUNITY_MODEL_DIR=models/qwen3.5-2b
+COMMUNITY_MODEL_ID=mlx-community/Qwen3-14B-4bit
+COMMUNITY_MODEL_DIR=models/qwen3-14b-4bit
 COMMUNITY_MLX_PYTHON=.venv-qwen35/bin/python
-COMMUNITY_ADAPTER=state/adapter-qwen3.5-2b.safetensors
-COMMUNITY_STATE=state/agent-qwen3.5-2b.json
+COMMUNITY_ADAPTER=state/adapter-qwen3-14b-4bit-shared.safetensors
+COMMUNITY_STATE=state/agent.json
 COMMUNITY_CONTEXT_TOKENS=8192
 COMMUNITY_MODEL_LOCK=state/model-inference.lock
+COMMUNITY_MODEL_CACHE_SIZE=1
+COMMUNITY_MODEL_SHARED_LANES=on
 ```
+
+This is the current 16 GiB Mac profile: all five local roles inherit the global
+14B 4-bit model and share its untrained output adapter. Remove older per-role
+`MODEL_DIR`, `MODEL_ID` and `ADAPTER` overrides when applying this profile; a
+different adapter selects a different model instance. Keep existing
+`COMMUNITY_STATE`, `COMMUNITY_DB` and `COMMUNITY_KNOWLEDGE` paths during a model
+switch to preserve conversation and learning records. The checkpoint occupies
+about 8.31 GB before context and runtime memory; use one long-lived Lyra process.
+Separate CLI processes still load separate workers.
 
 Then run `cargo run --release -- chat` or `cargo run --release -- serve`.
 Chat uses the contextual request-intent assessment to decide whether a turn
 needs extended reasoning; structured extraction disables it. Debug mode keeps
 reasoning enabled and displays its trace. Only text inputs are supported.
 The MLX backend requires Apple Silicon Metal; `COMMUNITY_DEVICE=cpu` is available
-for the legacy Candle Qwen3 backend. MLX can load BF16 or quantized Qwen3.5
-checkpoints. BF16 remains the global/default configuration; per-agent overrides
-can select a quantized checkpoint. The current local profile assigns all roles
-to INT8. Quantized models keep their output adapters separate; the runtime will
+for the legacy Candle Qwen3 backend. MLX can load quantized Qwen3 and BF16 or
+quantized Qwen3.5 checkpoints. Quantized models keep their output adapters
+separate; the runtime will
 not merge adapters into quantized weights.
 
 The historical [Qwen3.5 switch record](docs/archive/qwen35-2b-switch.md)
@@ -100,22 +111,29 @@ silently discard conversation history.
 
 `model.loaded` logs backend, precision, shard count, context cap, template,
 device, and adapter selection. Agents use lazy model handles. Background upkeep
-waits throughout foreground replies and for two idle minutes afterward. Its
-separate warm cache and request lock mean an upkeep generation already in
-progress cannot block chat. Each lane is serialized internally; the background
+waits throughout foreground replies and for two idle minutes afterward.
+`COMMUNITY_MODEL_SHARED_LANES=on` shares the foreground/background pool and
+request lock. With identical assignments and cache size 1, all roles reuse one
+resident backend per process. Active background generation can delay a new
+foreground request; generation is not preempted. The quiet-window check still
+lets queued upkeep yield before its next call.
+
+With shared lanes disabled (the code default), separate warm caches and request
+locks allow chat to proceed while upkeep is generating. Each lane is serialized
+internally; the background
 lock is derived from `COMMUNITY_MODEL_LOCK`
 (default `state/model-inference.lock`) with `.requests` appended, while chat uses
 `.chat.requests`. A waiting process emits `model.waiting_for_lease`, and
 `model.request_wait` records quiet-window, local-pool, and process-lock waiting.
 `agent.inference` records agent/model identity, duration, and visible token usage
 where available, without prompt contents. Models remain cached up to
-`COMMUNITY_MODEL_CACHE_SIZE` (default 1) per lane. Foreground and background
-lanes have separate caches, so the same checkpoint may be resident twice.
+`COMMUNITY_MODEL_CACHE_SIZE` (default 1) per pool. Separate foreground and
+background pools can keep the same checkpoint resident twice.
 Agents with matching checkpoint, adapter, and device assignments share a
 backend within a lane. Restart running processes to pick up adapter changes.
 
-For per-agent configuration, the 0.6B/2B MacBook profile, measured memory
-constraints, and cache limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
+For per-agent configuration, model identity, memory constraints and cache
+limitations, see [Per-Agent Local Models](docs/per-agent-models.md).
 
 The MLX backend supports a fresh output adapter and teacher-forced adapter
 training. That adapter can be merged into an unquantized BF16 output head, while
@@ -221,6 +239,123 @@ proposal ledger. They cannot rewrite delivered text or verify factual claims.
 Source-backed answers retain their AI grounding review, and factual
 knowledge-promotion gates remain enforced. Retained failures and current
 validation limits are in [the progress report](docs/grounding-generalization-progress.md).
+
+## Scholar coding experiments
+
+Scholar can hypothesize a solution, write an artifact and executable tests in
+separate bounded stages,
+run it in Docker, and revise it from observed failures. Curmudgeon prepares a
+functional acceptance suite before implementation, then reviews each result
+against the original request, code, execution evidence and Scholar's own
+assessment. Before implementation, Scholar audits the proposed suite against
+the original request. Curmudgeon gets one revision opportunity; rejected suites
+and audit objections are retained. Unresolved test validity prevents `complete`.
+The resulting acceptance suite stays fixed across code revisions; Scholar sees
+its interface and coverage contract, plus execution feedback. There is no
+separate coding standards reviewer yet.
+
+Both agents author tests as 1–8 structured cases with short Python assertion
+bodies. The runner supplies `unittest` collection and the implementation
+namespace. This bounds test scaffolding without deciding what the requested
+behavior means; expected values and test usefulness still require model review.
+
+MLX coding calls use a dedicated non-thinking sampling profile: temperature
+0.3, top-p 0.8, top-k 20 and presence penalty 0.5 over generated output within
+the configured context. The [Qwen generation guidance](https://huggingface.co/Qwen/Qwen3.5-2B#best-practices)
+motivated evaluating repetition control; its higher-entropy text defaults also
+failed structured planning in local pilots. This conservative candidate still
+needs broader evaluation. Other inference paths keep
+their existing defaults. The profile is retained with the run configuration;
+its coding quality and generalization still require evaluation.
+
+Build the trusted local Python image once:
+
+```sh
+docker build -t lyra-code-python:1 docker/code-python
+```
+
+The contextual request assessment can route implementation and execution tasks
+into this loop. In chat or the browser, `/code PROBLEM` selects it explicitly.
+For a standalone experiment without adding to the conversation or factual ledger:
+
+```sh
+cargo run --release -- scholar code solve "Implement merge_intervals(intervals), merging touching intervals without changing the input"
+cargo run --release -- scholar code show RUN_ID
+cargo run --release -- scholar code export RUN_ID NEW_DIRECTORY
+```
+
+This first runtime supports **Python 3.12 and its standard library**. Artifacts
+include `solution.py`; code requiring other languages, packages, networking,
+live services or host files may remain partial, limited or unsolved. Ordinary
+discussion of code does not itself request execution. Conversation tasks retain
+the existing source-check/research path when needed. Missing required external
+evidence prevents `complete`; a working program cannot verify a world claim.
+Standalone experiments are offline: Scholar must mark external prerequisites
+in its plan, and missing evidence leaves that scope unresolved.
+
+Every suite starts in a fresh container. Generated bytes enter over stdin;
+there are no host directory, checkout or Docker socket mounts. Containers use
+a non-root UID, a read-only root filesystem, no network, dropped capabilities,
+`no-new-privileges`, bounded tmpfs storage, one CPU, 256 MiB memory with no
+additional swap, and a 64-process limit. Output is drained with at most 8 KiB
+retained per stream; truncation prevents `complete`. Docker's default seccomp
+policy remains enabled. The host inspects the actual container exit state and
+removes its own named containers, including after execution timeouts. These
+controls use Docker's [container execution options](https://docs.docker.com/reference/cli/docker/container/run/).
+The image is resolved to an immutable local ID before execution; runs never
+pull or install dependencies. The operator-controlled image must declare no
+volumes. These are Docker process boundaries, not a claim of protection from
+container-runtime vulnerabilities; test output also remains untrusted evidence.
+
+| Setting | Default | Allowed range or meaning |
+| --- | --- | --- |
+| `COMMUNITY_CODE_MAX_ROUNDS` | `12` | 1–32 implementation rounds |
+| `COMMUNITY_CODE_EXECUTION_SECONDS` | `30` | 1–120 seconds per suite, including Docker setup |
+| `COMMUNITY_CODE_WORKFLOW_SECONDS` | `5400` | 1–14400 seconds for admitting stages; checked before and after model calls, without interrupting active inference |
+| `COMMUNITY_CODE_GENERATION_TOKENS` | `8192` | 128–16384 tokens per attempt, also bounded by the available model context |
+| `COMMUNITY_CODE_SCHEMA_ATTEMPTS` | `4` | 1–8 attempts per structured stage |
+| `COMMUNITY_CODE_IMAGE` | `lyra-code-python:1` | Trusted locally built image |
+| `COMMUNITY_CODE_RUNS` | `code-runs/` beside `COMMUNITY_DB` | Local artifact and audit directory |
+
+Each model stage has at most four structured-output attempts by default, each with a
+configurable generation cap (8,192 tokens by default). Coding owns these repairs
+rather than using the
+MLX runtime's ordinary output-budget expansion. Capped/invalid outputs are
+retained and never silently become approvals. The workflow can overrun its
+stage-admission time budget while an active model call or cleanup completes;
+the execution deadline and round/call limits remain separately enforced.
+If a cycle fails before product review, Curmudgeon gets a bounded failure
+evaluation when time remains. It explains the failure and can return only
+`not_solved` or `unresolved`, never approve a rejected or unreviewed artifact.
+If that evaluation cannot run or parse, its error remains explicit.
+
+Final outcomes are `complete`, `partial`, `limited`, `not_solved`, or
+`unresolved` for invalid review or insufficient evidence. `complete` requires
+both successful suites, every planned requirement assessed as met and covered
+by accepted tests, an undisputed complete self-assessment, no material
+limitations, and a valid Curmudgeon verdict.
+Curmudgeon must also compare the plan to the original request so omitted
+requirements cannot be silently dropped. Its causal analysis explains why the
+attempt succeeded or failed and distinguishes observed causes from guesses.
+A process exit alone does not prove test adequacy or general correctness.
+
+Each private run directory contains an atomically updated `report.json` with
+the request, bounded speaker-attributed context, model IDs/configuration,
+system prompts, protocol version,
+image ID, plan, retained source context, acceptance preparation and audits,
+every candidate and suite, execution
+results, raw stage outputs and repairs, self-assessments, review, stop reason
+and timings. An interrupted report remains unfinished and unresolved. Export
+writes the final candidate and both test suites into a new directory and
+refuses to overwrite an existing directory. The artifact's review status and
+limits remain in its report. No code, critique or self-assessment is promoted
+into factual knowledge, approved lessons, training data or model weights.
+
+Scholar and Curmudgeon may use the same underlying model. Separate role passes
+and acceptance checks are useful evidence, not independent confirmation or a
+general coding benchmark. Controlled tests and Docker integration checks do
+not establish semantic success; current live results and limits are retained
+in [the progress report](docs/grounding-generalization-progress.md).
 
 ## Scholar research queue
 
@@ -651,8 +786,8 @@ input remains the final prompt message. Repeating an input for the same
 conversation turn after a failure reuses its observation. The `chat` command
 starts a background maintenance worker for Curator, Curmudgeon, Scout, and
 Scholar. It prioritizes pending conversation research, then runs bounded role
-work in the recorded pass order. It uses the separate background model lane
-described in [Model runtime](#model-runtime). Curator extracts claims with source
+work in the recorded pass order. Its model calls use the shared pool or separate
+background pool described in [Model runtime](#model-runtime). Curator extracts claims with source
 evidence. A second AI reviewer assesses flagged extractions;
 acceptance still requires the 0.95 confidence threshold, exact evidence, valid
 dates, and conflict checks. Curmudgeon resolves any remaining candidate

@@ -1152,3 +1152,193 @@ partial at best, and the response should say only that the available evidence
 does not establish deployment in Finland. This gives an expected human
 disposition for the captured case. It is one judgment and does not close the
 cross-domain or broader independent-review items.
+
+## 27 October 2026 — Scholar coding loop and retained model failures
+
+Scholar now owns a bounded Python coding experiment: hypothesize requirements,
+prepare an implementation, author structured test cases, execute both its own
+suite and Curmudgeon's acceptance suite, assess the result, and revise from
+retained feedback. Curmudgeon prepares acceptance tests before implementation;
+Scholar audits their functional validity, with one preparation revision before
+the suite is frozen. Final Curmudgeon review compares the original request,
+code, tests, executions and self-assessment and supplies a causal analysis.
+Malformed required stages cannot establish `complete`; valid partial artifacts
+still reach review when Scholar's tests or self-assessment remain unresolved.
+Exhausted cycles can receive a separate failure evaluation which cannot approve
+an unreviewed artifact. All outcomes and failed attempts remain explicit.
+
+The existing contextual request assessment can route coding tasks; `/code` and
+`scholar code solve/show/export` provide explicit entry points. The operator
+guide is README.md. The user's requested high defaults are 12 implementation
+rounds, a 90-minute stage-admission budget and 8,192 tokens per model attempt,
+with four structured-output attempts per stage. Settings remain bounded and
+configurable. Active inference is not interrupted by the admission deadline;
+execution has a separate deadline and resource limits. The coding path uses a
+single bounded generation per attempt instead of MLX's ordinary automatic
+output-budget expansion. It retains raw output, system prompts, role model
+configuration, execution results, acceptance preparation, review and timing.
+No new model role, coding-standards reviewer, fact promotion, approved lesson or
+training path was added.
+
+Generated Python runs only in fresh Docker containers: no host mounts or
+network, non-root UID, read-only root filesystem, dropped capabilities,
+no-new-privileges, bounded tmpfs, one CPU, 256 MiB memory with no extra swap,
+and 64 processes. The resolved local image ID is retained. Host pipe capture
+drains excess output while retaining at most 8 KiB per stream; truncation,
+timeouts, OOM, infrastructure errors or missing review prevent `complete`.
+Explicit export writes a new directory without overwriting existing files.
+An abrupt host-process death can bypass normal cleanup; unfinished reports
+remain unresolved. Docker boundaries and test output are not proof of safety
+against runtime vulnerabilities or deliberately deceptive artifacts.
+
+At the latest full-suite checkpoint, **509 Rust tests passed**, with the live
+Docker test deliberately excluded from the default suite and run separately.
+That live Docker check passed for valid execution, generated test scaffolding,
+non-root identity, blocked root writes/network access, missing Docker socket,
+zero-test and import-time-exit rejection, timeout, output truncation and OOM.
+Formatting, whitespace checks and the release build passed. Controlled model
+doubles cover bounded revisions, frozen suites, rejected test preparation,
+disputed self-assessments, invalid completion claims, external-evidence gaps,
+failure evaluation and terminal outcomes. These validate orchestration and
+resource contracts, not model understanding or a coding benchmark.
+
+Live pilots used the configured Qwen3.5-2B INT8 Scholar and Curmudgeon assignments
+with untrained role adapters. Their retained failures are material:
+
+- The first combined implementation/test generator repeated test classes until
+  reaching its output cap. An ordinary-runtime acceptance attempt used output
+  expansion and took about 534 seconds before failing. Bounded coding calls now
+  retain capped responses; implementation and test generation are separate.
+- A smaller two-round interval-merging pilot ended unresolved after four
+  malformed build outputs. Its acceptance suite also invented an integer-only
+  restriction and incorrectly merged disjoint intervals. Increasing the token
+  budget did not by itself fix repetitive generation or incorrect expectations.
+- A conversational run-length-encoding request was correctly recognized as
+  executable work but was initially misclassified as requiring external sources.
+  The source-check prompt now distinguishes evaluating a supplied specification
+  from consulting external facts. One replay correctly avoided that lookup;
+  this does not establish general routing accuracy.
+- Free-form test modules omitted imports and repeated boilerplate. Tests now use
+  1–8 bounded assertion cases with deterministic unittest scaffolding. Malformed
+  JSON remains a failure: syntax repair feedback uses the original context and
+  bounded invalid-output data, and never merges adjacent objects into approvals.
+- Scholar's audit accepted acceptance tests with wrong expected outputs. In a
+  later run, a valid run-length encoder passed Scholar's minimal test and failed
+  three incorrect acceptance cases. Curmudgeon eventually identified a wrong
+  expectation, but its review invented requirement IDs and was rejected. This
+  is a shared-model validity and schema failure, not evidence that those tests
+  are good or that the code should be changed to satisfy them.
+
+Raw prototype reports and logs are retained unchanged under
+`evals/results/coding-2026-10-27/`, with SHA-256 hashes in `manifest.json`.
+Some superseded long pilots were explicitly interrupted during development;
+their unfinished reports remain unresolved and are not counted as successful
+runs. Tests and experiments used isolated database, knowledge and conversation
+paths where those services were needed. Independent test-quality judgments,
+unrelated and adversarial coding tasks, follow-up handling, recurrence and
+false-success/unnecessary-abstention measurements remain open in nextSteps.txt.
+The existing grounding and training gates remain closed.
+
+The near-greedy coding sampler inherited from extraction (`temperature=0.1`)
+produced long repeated Unicode sequences inside implementation strings. A trial
+at temperature 1.0, top-p 1.0 and presence penalty 2.0 was retained, but its
+structured planning also failed. The current experimental coding-only MLX
+profile is temperature 0.3, top-p 0.8, top-k 20 and presence penalty 0.5,
+applied only to generated tokens. The worker's prompt-exclusion behavior has
+focused MLX tests; neither profile has established reliable live coding.
+
+## 28 October 2026 — live coding execution and artifact retention
+
+Run `code-18678-1793177499951684000` used the live local Qwen3.5-2B INT8
+Scholar and Curmudgeon assignments for a small interval-merging task. It took
+268 seconds and ended `partial` after three implementation rounds. The first
+two rounds retained malformed model outputs. In the final round, Scholar's
+implementation merged intervals correctly according to the request's explicit
+overlap-or-touch rule, but used `intervals.sort(...)`, violating the requirement
+not to mutate its input. Scholar's generated suite had two wrong expectations:
+one split a chain of touching intervals, and one merged intervals separated by
+a gap. The other six assertions passed.
+
+Curmudgeon's prepared acceptance test did not contain an assertion at all: it
+evaluated a comparison as a bare expression, so its successful execution proved
+nothing. Its final partial review then misdiagnosed Scholar's two invalid
+expectations as a problem in the request and missed the input-mutation defect.
+Therefore, the reported `partial` verdict is not a trustworthy evaluation of
+the artifact. This run is evidence of useful code generation, but also of
+critical acceptance-suite and reviewer failures; it is not a coding benchmark
+pass. The raw report and exported artifact are retained under
+`evals/results/coding-2026-10-28/live-merge-intervals/` with SHA-256 hashes.
+Docker containers were removed after execution; the run report retained code,
+tests, raw attempts and reviews, and explicit export materialized the files.
+
+
+## 28 October 2026 — 14B model assignment and shared worker
+
+At the user's request, all five local roles now inherit the global
+`mlx-community/Qwen3-14B-4bit` assignment, pinned to revision
+`a4d9b2df59d2c150bef02fcbe0d91046b7ca33a4`. The downloaded safetensors occupy
+8,307,898,514 bytes. Quantized Qwen3 now uses MLX; unquantized Qwen3 retains
+Candle. The MLX adapter wrapper handles both the flat Qwen3 language model and
+Qwen3.5's nested language model, preserves their respective attention caches,
+and records the actual architecture. The new common output adapter is untrained;
+no old adapters were migrated and no training or knowledge promotion was enabled.
+
+`COMMUNITY_MODEL_SHARED_LANES=on` lets chat and maintenance share the same pool
+and request lock. The local profile uses cache size 1, identical checkpoint and
+adapter identity for every role, and an 8,192-token context cap. Background
+quiet-window checks remain active. An already running background generation
+can delay chat; shared lanes do not preempt it. Separate Lyra processes still
+load separate workers. Previous environment settings are backed up privately
+under `state/config-backups/`; existing conversation and learning paths were
+preserved and the 2B INT8 files remain available for rollback.
+
+The serial Rust suite passed 513 tests with one live-Docker test excluded.
+Five Python worker tests passed, including actual tiny quantized-Qwen3 logits,
+tied and untied output heads, incremental decoding, active adapter arithmetic,
+and Qwen3.5's mixed recurrent/KV caches. These are numerical and orchestration
+checks, not model-understanding benchmarks. The release build, formatting and
+whitespace checks passed. CLI status resolves every role to the 14B model;
+adapter-file presence is now reported as presence rather than inferred training.
+
+An initial JSON inference succeeded, with 8.31 GB active MLX allocations at load
+and an 8.44 GB generation peak. The first coding replay completed planning and
+acceptance generation, but its worker exited twice during audit before the
+user-requested stop to free memory for Teams. Its unfinished report remains
+unresolved. The cause of those exits was not established. Exit-status logging
+and per-stage allocation reporting were added for diagnosis. Raw initial and
+interrupted-run evidence is retained unchanged, with hashes, under
+`evals/results/qwen3-14b-2026-10-28/`. Larger-model reviewer quality, ordinary
+conversation, batching, long contexts, foreground latency and normal desktop
+memory use remain acceptance work in nextSteps.txt.
+
+The restarted interval-merging replay (`code-53773-1793185543216771000`)
+finished with a valid `complete` outcome after three rounds and 686,978 ms.
+There was one model load and no worker restart during that run. Each final
+model-authored suite passed eight cases. The final code uses `sorted(...)`
+and does not mutate its input. Codex-authored checks in the same offline Docker
+image additionally passed 3,616 finite-domain inputs against a graph-connectivity
+oracle, plus an unsorted case with negative/fractional endpoints. These are
+synthetic functional checks, not independent human benchmark judgments.
+
+The larger model still made material review mistakes. It converted the input
+precondition `start <= end` into a new requirement to raise `ValueError` for
+invalid inputs, and both roles wrongly blamed the initial valid-domain solution
+for failing that invented check. The final extra validation does not contradict
+the original domain, but the resulting revision was unnecessary for the request.
+The model's claim that its suites cover all cases is unsupported; they did not
+exercise unsorted input. Round two also exhausted all four Scholar schema repairs
+by returning a null `next_change`, and its completion reviews were rejected for
+missing valid self-assessment. Round three supplied valid assessments without
+relaxing the gates. All those failed outputs are retained.
+
+Maximum reported MLX peak allocation during the coding replay was
+9,668,475,012 bytes (about 9.67 GB); this excludes other application/system memory.
+An isolated full `say` smoke used Curmudgeon and Interaction through the shared
+foreground pool with one load and no restart, correctly avoided an external
+lookup for fiction, completed the enabled reasoning phase, and delivered the
+dialogue. A separate short Interaction probe also answered successfully.
+The reports, exported Python, synthetic checks and logs are retained under the
+same hashed evaluation directory. The finished coding report and export also
+remain under `state/code-runs/code-53773-1793185543216771000/`. This establishes
+a functioning model/runtime switch and one completed coding pilot; it does not
+close reviewer-quality, general coding, grounding, or desktop-memory acceptance.
