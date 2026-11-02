@@ -523,9 +523,9 @@ impl Cli {
             "Adapter: {} ({})",
             adapter_path.display(),
             if adapter_path.exists() {
-                "trained"
+                "present"
             } else {
-                "fresh"
+                "not created"
             }
         );
         println!("Conversation turns: {}", agent.turn_count());

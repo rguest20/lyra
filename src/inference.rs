@@ -31,6 +31,11 @@ const MAX_TRAIN: usize = 128;
 const RANK: usize = 8;
 const PREFILL_CHUNK: usize = 256;
 
+pub(crate) fn bounded_task_configuration() -> serde_json::Value {
+    serde_json::json!({"mlx":{"temperature":0.3,"top_p":0.8,"top_k":20,"presence_penalty":0.5,"presence_exclude_prompt":true},
+        "candle":{"temperature":0.1,"top_p":0.8,"top_k":20,"presence_penalty":null}})
+}
+
 fn training_target_ids(
     tokenizer: &Tokenizer,
     answer: &str,
@@ -62,6 +67,17 @@ pub enum LocalModel {
 }
 
 impl LocalModel {
+    pub(crate) fn configuration(&self) -> io::Result<serde_json::Value> {
+        match self {
+            Self::Shared(model) => model.configuration(),
+            Self::Mlx(_) => Ok(
+                serde_json::json!({"model_id":self.model_id()?,"backend":"mlx","assignment":"direct"}),
+            ),
+            Self::Candle(_) => Ok(
+                serde_json::json!({"model_id":self.model_id()?,"backend":"candle","assignment":"direct"}),
+            ),
+        }
+    }
     pub fn model_id(&self) -> io::Result<String> {
         match self {
             Self::Shared(model) => model.model_id(),
@@ -97,16 +113,14 @@ impl LocalModel {
     ) -> io::Result<Self> {
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json"))?).map_err(other)?;
-        match config["model_type"].as_str() {
-            Some("qwen3") => Ok(Self::Candle(Box::new(CandleModel::load_checkpoint(
+        if checkpoint_uses_mlx(&config)? {
+            Ok(Self::Mlx(mlx::MlxModel::load(
                 dir, checkpoint, adapter, cpu, lease,
-            )?))),
-            Some("qwen3_5") => Ok(Self::Mlx(mlx::MlxModel::load(
+            )?))
+        } else {
+            Ok(Self::Candle(Box::new(CandleModel::load_checkpoint(
                 dir, checkpoint, adapter, cpu, lease,
-            )?)),
-            _ => Err(invalid(
-                "unsupported model architecture; expected qwen3 or qwen3_5",
-            )),
+            )?)))
         }
     }
 
@@ -180,6 +194,22 @@ impl LocalModel {
         max_tokens: usize,
     ) -> io::Result<String> {
         self.chat_with_reply_cap(messages, 0, max_tokens.clamp(1, MAX_REPLY), 0.1, false)
+    }
+
+    /// One bounded generation; task orchestration owns repairs and retains partial output.
+    pub(crate) fn chat_for_bounded_task(
+        &mut self,
+        messages: &[Message],
+        cap: usize,
+    ) -> io::Result<String> {
+        let cap = cap.clamp(1, 16_384);
+        match self {
+            Self::Shared(model) => {
+                model.with_model(|backend| backend.chat_for_bounded_task(messages, cap))
+            }
+            Self::Mlx(model) => model.chat_bounded(messages, cap),
+            Self::Candle(model) => model.chat_with_reply_cap(messages, 0, cap, 0.1, false),
+        }
     }
 
     pub fn probe(&mut self, prompt: &str) -> io::Result<String> {
@@ -832,6 +862,18 @@ pub(crate) fn checkpoint_files(checkpoint: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(shards.into_iter().collect())
 }
 
+fn checkpoint_uses_mlx(config: &serde_json::Value) -> io::Result<bool> {
+    match config["model_type"].as_str() {
+        Some("qwen3_5") => Ok(true),
+        Some("qwen3") => {
+            Ok(config["quantization"].is_object() || config["quantization_config"].is_object())
+        }
+        _ => Err(invalid(
+            "unsupported model architecture; expected qwen3 or qwen3_5",
+        )),
+    }
+}
+
 fn context_limit(native: usize, configured: Option<&str>) -> io::Result<usize> {
     let limit = match configured {
         Some(value) => value
@@ -974,6 +1016,24 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quantized_qwen3_uses_mlx_and_bf16_keeps_candle() {
+        use serde_json::json;
+        assert!(!super::checkpoint_uses_mlx(&json!({"model_type":"qwen3"})).unwrap());
+        assert!(
+            super::checkpoint_uses_mlx(&json!({"model_type":"qwen3", "quantization":{"bits":4}}))
+                .unwrap()
+        );
+        assert!(
+            super::checkpoint_uses_mlx(
+                &json!({"model_type":"qwen3", "quantization_config":{"bits":8}})
+            )
+            .unwrap()
+        );
+        assert!(super::checkpoint_uses_mlx(&json!({"model_type":"qwen3_5"})).unwrap());
+        assert!(super::checkpoint_uses_mlx(&json!({"model_type":"unsupported"})).is_err());
+    }
+
     #[test]
     fn chat_lease_does_not_wait_for_maintenance() {
         let directory = crate::test_support::unique_temp_path("community-chat-lease", "");

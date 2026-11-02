@@ -93,12 +93,18 @@ impl ModelRuntime {
         background_lock.push(".requests");
         let mut chat_lock = super::model_lease_path().into_os_string();
         chat_lock.push(".chat.requests");
+        let pool = Arc::new(Mutex::new(ModelPool::new(
+            assignments.clone(),
+            background_lock.into(),
+        )));
+        let chat_pool = if assignments.shared_lanes {
+            pool.clone()
+        } else {
+            Arc::new(Mutex::new(ModelPool::new(assignments, chat_lock.into())))
+        };
         Self {
-            pool: Arc::new(Mutex::new(ModelPool::new(
-                assignments.clone(),
-                background_lock.into(),
-            ))),
-            chat_pool: Arc::new(Mutex::new(ModelPool::new(assignments, chat_lock.into()))),
+            pool,
+            chat_pool,
             chat_activity: Arc::new(ChatActivity::default()),
             chat_turn: None,
         }
@@ -204,6 +210,19 @@ impl ModelRuntime {
 }
 
 impl RoutedModel {
+    pub(super) fn configuration(&self) -> io::Result<serde_json::Value> {
+        let pool = self
+            .runtime
+            .pool
+            .lock()
+            .map_err(|_| io::Error::other("model registry lock was poisoned"))?;
+        let spec = pool.assignments.model(self.role);
+        Ok(
+            serde_json::json!({"role":self.role.name(),"model_id":spec.id,
+            "directory":spec.directory,"adapter":spec.adapter,"cpu":spec.cpu,
+            "shared_lanes":pool.assignments.shared_lanes,"cache_capacity":pool.assignments.capacity}),
+        )
+    }
     pub(super) fn model_id(&self) -> io::Result<String> {
         self.runtime.model_id(self.role)
     }
@@ -237,6 +256,7 @@ impl RoutedModel {
                 serde_json::json!({
                     "agent": self.role.name(),
                     "lane": if self.runtime.chat_turn.is_some() { "chat" } else { "background" },
+                    "shared_lanes": pool.assignments.shared_lanes,
                     "quiet_wait_ms": quiet_wait.as_millis(),
                     "pool_wait_ms": pool_wait.as_millis(),
                     "process_lease_wait_ms": lease_wait.as_millis(),
@@ -406,6 +426,7 @@ pub struct ModelSpec {
 pub struct Assignments {
     models: HashMap<AgentRole, ModelSpec>,
     pub capacity: usize,
+    shared_lanes: bool,
 }
 
 impl Assignments {
@@ -429,6 +450,16 @@ impl Assignments {
                     )
                 })?,
             None => 1,
+        };
+        let shared_lanes = match lookup("COMMUNITY_MODEL_SHARED_LANES").as_deref() {
+            None | Some("off" | "false" | "0") => false,
+            Some("on" | "true" | "1") => true,
+            Some(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "COMMUNITY_MODEL_SHARED_LANES must be on/off, true/false, or 1/0",
+                ));
+            }
         };
         let mut models = HashMap::new();
         for role in [
@@ -472,7 +503,11 @@ impl Assignments {
             }
             models.insert(role, spec);
         }
-        Ok(Self { models, capacity })
+        Ok(Self {
+            models,
+            capacity,
+            shared_lanes,
+        })
     }
 
     pub fn model(&self, role: AgentRole) -> &ModelSpec {
@@ -589,6 +624,7 @@ mod tests {
         for (key, value) in [
             ("COMMUNITY_MODEL_CACHE_SIZE", "0"),
             ("COMMUNITY_MODEL_CACHE_SIZE", "bad"),
+            ("COMMUNITY_MODEL_SHARED_LANES", "sometimes"),
             ("COMMUNITY_SCHOLAR_MODEL_DIR", ""),
             ("COMMUNITY_SCOUT_MODEL_ID", "other"),
         ] {
@@ -696,6 +732,68 @@ mod tests {
         drop(scout);
         drop(scholar);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn shared_lanes_reuse_one_pool_and_model_identity_for_all_roles() {
+        let assignments = Assignments::with_lookup(default_model(), |key| {
+            (key == "COMMUNITY_MODEL_SHARED_LANES").then(|| "on".into())
+        })
+        .unwrap();
+        let runtime = ModelRuntime::with_assignments(assignments);
+        let chat = runtime.for_chat();
+        assert!(Arc::ptr_eq(&runtime.pool, &chat.pool));
+        assert!(Arc::ptr_eq(&runtime.pool, &runtime.chat_pool));
+        for role in [
+            AgentRole::Scout,
+            AgentRole::Scholar,
+            AgentRole::Curmudgeon,
+            AgentRole::Archivist,
+            AgentRole::Interaction,
+        ] {
+            assert_eq!(runtime.model_id(role).unwrap(), default_model().id);
+            let LocalModel::Shared(model) = chat.model(role) else {
+                panic!("expected shared handle")
+            };
+            assert_eq!(model.configuration().unwrap()["shared_lanes"], true);
+            assert!(Arc::ptr_eq(&model.runtime.pool, &runtime.pool));
+        }
+        assert!(
+            runtime.pool.lock().unwrap().cache.entries.is_empty(),
+            "handles must remain lazy"
+        );
+    }
+
+    #[test]
+    fn shared_lanes_serialize_active_work_and_do_not_pause_chat_for_quiet_window() {
+        let mut spec = default_model();
+        spec.directory = crate::test_support::unique_temp_path("shared-lanes-absent", "");
+        let assignments = Assignments::with_lookup(spec, |key| {
+            (key == "COMMUNITY_MODEL_SHARED_LANES").then(|| "true".into())
+        })
+        .unwrap();
+        let runtime = ModelRuntime::with_assignments(assignments);
+        let lock = crate::test_support::unique_temp_path("shared-lanes-requests", "lock");
+        runtime.pool.lock().unwrap().inference_lock = lock.clone();
+        let chat = runtime.for_chat();
+        let guard = runtime.pool.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            tx.send(chat.warm(AgentRole::Interaction)).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        let error = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("chat must proceed when the shared worker becomes available")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("model.safetensors"), "{error}");
+        worker.join().unwrap();
+        let _ = std::fs::remove_file(lock);
     }
 
     #[test]

@@ -14,13 +14,73 @@ def memory_stats(mx):
     return {'active_bytes': mx.get_active_memory(), 'peak_bytes': mx.get_peak_memory(), 'cache_bytes': mx.get_cache_memory()}
 
 
+def request_logits_processors(request, factory):
+    processors = factory(
+        presence_penalty=request.get('presence_penalty'),
+        presence_context_size=request.get('presence_context_size', 20))
+    if not request.get('presence_exclude_prompt', False):
+        return processors
+    # MLX passes prompt + generated tokens to processors. Presence penalties
+    # for coding apply to generated output, not required schema/input tokens.
+    offset = len(request['ids'])
+    return [lambda tokens, logits, process=process: process(tokens[offset:], logits)
+            for process in processors]
+
+
+def make_adapter_model(base, model_type):
+    """Share the output adapter across supported MLX language-model layouts."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.cache import make_prompt_cache
+
+    if model_type == 'qwen3_5':
+        language_model = base.language_model
+    elif model_type == 'qwen3':
+        language_model = base
+    else:
+        raise ValueError('Unsupported MLX model architecture')
+
+    class AdapterModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = base
+            args = language_model.args
+            self.down = mx.random.normal((args.hidden_size, 8)).astype(mx.float32) * 0.01
+            self.up = mx.zeros((8, args.vocab_size), dtype=mx.float32)
+            self.adapter_active = False
+
+        def baseline(self, hidden):
+            return (language_model.model.embed_tokens.as_linear(hidden)
+                    if language_model.args.tie_word_embeddings
+                    else language_model.lm_head(hidden))
+
+        def hidden(self, inputs, cache=None, **kwargs):
+            return language_model.model(inputs, cache=cache, **kwargs)
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            hidden = self.hidden(inputs, cache=cache, **kwargs)
+            baseline = self.baseline(hidden)
+            if not self.adapter_active:
+                return baseline
+            return baseline.astype(mx.float32) + hidden.astype(mx.float32) @ self.down @ self.up
+
+        def make_cache(self):
+            return make_prompt_cache(self.base)
+
+        @property
+        def layers(self):
+            return self.base.layers
+
+    return AdapterModel()
+
+
 def main():
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx_lm.generate import BatchGenerator, StopSequences, generate_step
     from mlx_lm.utils import load_model
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
     init = json.loads(sys.argv[1])
     config = json.loads((Path(init['model_dir']) / 'config.json').read_text())
@@ -30,34 +90,7 @@ def main():
     base.freeze()
     mx.eval(base.parameters())
 
-    class AdapterModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.base = base
-            args = base.language_model.args
-            self.down = mx.random.normal((args.hidden_size, 8)).astype(mx.float32) * 0.01
-            self.up = mx.zeros((8, args.vocab_size), dtype=mx.float32)
-            self.adapter_active = False
-
-        def baseline(self, hidden):
-            lm = self.base.language_model
-            return lm.model.embed_tokens.as_linear(hidden) if lm.args.tie_word_embeddings else lm.lm_head(hidden)
-
-        def __call__(self, inputs, cache=None, **kwargs):
-            hidden = self.base.language_model.model(inputs, cache=cache, **kwargs)
-            baseline = self.baseline(hidden)
-            if not self.adapter_active:
-                return baseline
-            return baseline.astype(mx.float32) + hidden.astype(mx.float32) @ self.down @ self.up
-
-        def make_cache(self):
-            return self.base.make_cache()
-
-        @property
-        def layers(self):
-            return self.base.layers
-
-    model = AdapterModel()
+    model = make_adapter_model(base, config['model_type'])
     adapter = Path(init['adapter'])
     adapter_loaded = adapter.exists()
     training_steps = 0
@@ -75,7 +108,7 @@ def main():
     def save_adapter(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.stem + '.tmp.safetensors')
-        metadata = {'model_type': 'qwen3_5', 'adapter_kind': 'output_rank8'}
+        metadata = {'model_type': config['model_type'], 'adapter_kind': 'output_rank8'}
         if training_steps is not None:
             metadata['training_steps'] = str(training_steps)
         mx.save_safetensors(str(temporary), {'down': model.down, 'up': model.up}, metadata=metadata)
@@ -152,8 +185,9 @@ def main():
                 in_thinking = request.get('thinking', False)
                 thought_tokens = 0
                 mx.reset_peak_memory()
-                sampler = make_sampler(temp=request['temperature'], top_p=0.8, top_k=20)
-                generator = generate_step(mx.array(request['ids']), model, max_tokens=request['max_tokens'], sampler=sampler, prefill_step_size=128)
+                sampler = make_sampler(temp=request['temperature'], top_p=request.get('top_p', 0.8), top_k=20)
+                processors = request_logits_processors(request, make_logits_processors)
+                generator = generate_step(mx.array(request['ids']), model, max_tokens=request['max_tokens'], sampler=sampler, logits_processors=processors, prefill_step_size=128)
                 try:
                     for token, _ in generator:
                         token = int(token.item()) if hasattr(token, 'item') else int(token)
@@ -172,11 +206,15 @@ def main():
                                 break
                 finally:
                     generator.close()
-                send({'tokens': tokens, 'finish_reason': finish_reason, 'generated_tokens': len(tokens), 'thinking_tokens': thought_tokens, 'memory': memory_stats(mx)})
+                send({'tokens': tokens, 'finish_reason': finish_reason, 'generated_tokens': len(tokens), 'thinking_tokens': thought_tokens, 'memory': memory_stats(mx),
+                      'sampling': {'temperature': request['temperature'], 'top_p': request.get('top_p', 0.8),
+                                   'presence_penalty': request.get('presence_penalty'),
+                                   'presence_context_size': request.get('presence_context_size', 20),
+                                   'presence_exclude_prompt': request.get('presence_exclude_prompt', False)}})
             elif op == 'train':
                 targets = request['targets']
                 sequence = request['ids'] + targets[:-1]
-                hidden = model.base.language_model.model(mx.array([sequence]))[:, len(request['ids']) - 1:, :]
+                hidden = model.hidden(mx.array([sequence]))[:, len(request['ids']) - 1:, :]
                 hidden = mx.stop_gradient(hidden)
                 baseline = mx.stop_gradient(model.baseline(hidden).astype(mx.float32))
                 hidden = hidden.astype(mx.float32)

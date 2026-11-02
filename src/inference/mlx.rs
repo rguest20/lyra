@@ -1,4 +1,4 @@
-//! Persistent MLX worker for Qwen3.5's hybrid attention architecture.
+//! Persistent MLX worker for Qwen3.5 and quantized Qwen3 checkpoints.
 use super::*;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -13,7 +13,14 @@ impl Worker {
     fn read(&mut self) -> io::Result<serde_json::Value> {
         let mut line = String::new();
         if self.output.read_line(&mut line)? == 0 {
-            return Err(other("MLX worker exited before returning a response"));
+            let status = self.child.try_wait()?.map_or_else(
+                || "stdout closed while the worker was still running".into(),
+                |status| status.to_string(),
+            );
+            crate::diagnostics::event("model.worker_exited", serde_json::json!({"status":status}));
+            return Err(other(format!(
+                "MLX worker exited before returning a response ({status})"
+            )));
         }
         let response: serde_json::Value = serde_json::from_str(&line).map_err(other)?;
         if let Some(error) = response["error"].as_str() {
@@ -83,16 +90,20 @@ impl MlxModel {
         lease: &Path,
     ) -> io::Result<Self> {
         if cpu {
-            return Err(invalid(
-                "the Qwen3.5 MLX backend currently requires Apple Silicon Metal",
-            ));
+            return Err(invalid("the MLX backend requires Apple Silicon Metal"));
         }
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json"))?).map_err(other)?;
-        let native = config["text_config"]["max_position_embeddings"]
+        let text_config = match config["model_type"].as_str() {
+            Some("qwen3") => &config,
+            Some("qwen3_5") => &config["text_config"],
+            _ => return Err(invalid("unsupported MLX model architecture")),
+        };
+        let native = text_config["max_position_embeddings"]
             .as_u64()
-            .ok_or_else(|| invalid("Qwen3.5 text context is missing"))?
+            .ok_or_else(|| invalid("MLX model text context is missing"))?
             as usize;
+        let consolidated = text_config["tie_word_embeddings"] == false;
         let max_context = context_limit(
             native,
             std::env::var("COMMUNITY_CONTEXT_TOKENS").ok().as_deref(),
@@ -113,12 +124,12 @@ impl MlxModel {
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(other)?;
         for token in ["<|im_end|>", "<|endoftext|>"] {
             if tokenizer.token_to_id(token).is_none() {
-                return Err(invalid("Qwen3.5 tokenizer is missing a stop token"));
+                return Err(invalid("MLX tokenizer is missing a stop token"));
             }
         }
         crate::diagnostics::event(
             "model.loaded",
-            serde_json::json!({"model_dir":dir,"backend":"mlx","precision":ready["precision"],"quantization":ready["quantization"],"shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":"qwen3_5_no_thinking","adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
+            serde_json::json!({"model_dir":dir,"model_type":config["model_type"],"backend":"mlx","precision":ready["precision"],"quantization":ready["quantization"],"shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":if supports_thinking {"qwen_chatml_with_thinking"} else {"qwen_chatml_without_thinking"},"adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
         );
         Ok(Self {
             worker: Mutex::new(worker),
@@ -128,7 +139,7 @@ impl MlxModel {
             supports_thinking,
             max_context,
             adapter: adapter.into(),
-            consolidated: config["text_config"]["tie_word_embeddings"] == false,
+            consolidated,
             last_thinking: None,
             _device_lease: device_lease,
         })
@@ -148,6 +159,34 @@ impl MlxModel {
             )
             .map_err(other)
             .map(|value| value.get_ids().to_vec())
+    }
+
+    /// Return even a capped partial object so the caller can retain and repair it.
+    pub(super) fn chat_bounded(&mut self, messages: &[Message], cap: usize) -> io::Result<String> {
+        self.last_thinking = None;
+        let ids = self.ids(messages, false)?;
+        if ids.is_empty() || ids.len() > self.max_context - MIN_REPLY {
+            return Err(invalid(
+                "bounded task exceeds configured context; no history was discarded",
+            ));
+        }
+        let limit = reply_budget(ids.len(), 0, self.max_context, cap);
+        let sampling = bounded_task_configuration()["mlx"].clone();
+        let response = self.request(serde_json::json!({"op":"generate","ids":ids,
+            "max_tokens":limit,"temperature":sampling["temperature"],"top_p":sampling["top_p"],
+            "presence_penalty":sampling["presence_penalty"],"presence_context_size":self.max_context,
+            "presence_exclude_prompt":sampling["presence_exclude_prompt"],
+            "stop_ids":[self.tokenizer.token_to_id("<|im_end|>"),self.tokenizer.token_to_id("<|endoftext|>")],
+            "thinking":false,"thinking_budget":0,
+            "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+        let tokens: Vec<u32> = serde_json::from_value(response["tokens"].clone()).map_err(other)?;
+        crate::diagnostics::event(
+            "model.bounded_task_generation",
+            serde_json::json!({
+            "backend":"mlx","prompt_tokens":ids.len(),"reply_limit":limit,
+            "generated_tokens":tokens.len(),"finish_reason":response["finish_reason"],"sampling":response["sampling"],"memory":response["memory"],"recovery_owned_by_caller":true}),
+        );
+        self.tokenizer.decode(&tokens, true).map_err(other)
     }
     pub(super) fn additional_prompt_tokens(
         &self,
@@ -511,6 +550,14 @@ mod tests {
     }
 
     #[test]
+    fn worker_eof_reports_the_process_exit_status() {
+        let mut worker = worker("import sys; sys.exit(9)");
+        assert_eq!(worker.child.wait().unwrap().code(), Some(9));
+        let error = worker.read().unwrap_err().to_string();
+        assert!(error.contains("exit status: 9"), "{error}");
+    }
+
+    #[test]
     fn batches_preserve_order_chunk_bounds_and_individual_recovery() {
         let vocabulary = [
             ("<unk>".into(), 0),
@@ -777,6 +824,50 @@ for call,line in enumerate(sys.stdin):
                 .contains("after two output-budget increases")
         );
         assert!(model.last_thinking.is_some());
+        drop(model);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_task_retains_partial_output_without_internal_budget_expansion() {
+        let vocabulary = [
+            ("<unk>".into(), 0),
+            ("<|im_end|>".into(), 1),
+            ("<|endoftext|>".into(), 2),
+            ("partial".into(), 3),
+        ]
+        .into_iter()
+        .collect();
+        let tokenizer = Tokenizer::new(
+            tokenizers::models::wordlevel::WordLevel::builder()
+                .vocab(vocabulary)
+                .unk_token("<unk>".into())
+                .build()
+                .unwrap(),
+        );
+        let path = crate::test_support::unique_temp_path("bounded-task-test", "");
+        let worker = worker(
+            "import sys,json\nfor call,line in enumerate(sys.stdin):\n r=json.loads(line)\n assert call<2 and r['max_tokens']==128 and r['thinking']==False\n assert r['temperature']==0.3 and r['top_p']==0.8 and r['presence_penalty']==0.5 and r['presence_context_size']==8192\n print(json.dumps({'tokens':[3], 'finish_reason':'max_tokens'}),flush=True)",
+        );
+        let mut model = MlxModel {
+            worker: Mutex::new(worker),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
+            tokenizer,
+            supports_thinking: false,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(&path).unwrap(),
+        };
+        let messages = [Message {
+            role: "user".into(),
+            content: "Build a parser".into(),
+        }];
+        for _ in 0..2 {
+            assert_eq!(model.chat_bounded(&messages, 128).unwrap(), "partial");
+        }
         drop(model);
         fs::remove_file(path).unwrap();
     }
