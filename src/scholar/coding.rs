@@ -63,6 +63,22 @@ pub(crate) fn solve(
             &mut |files, tests, budget| sandbox.run(files, tests, budget),
         )
     })();
+    if let Some(error) = report
+        .rounds
+        .last()
+        .into_iter()
+        .flat_map(|round| [&round.scholar_execution, &round.acceptance_execution])
+        .filter_map(Option::as_ref)
+        .find_map(|execution| execution.infrastructure_error.as_deref())
+    {
+        let destination = log.directory.join("unverified-export");
+        match export_unverified_implementation(&report, &destination, error) {
+            Ok(()) => report.exported_directory = Some(destination.display().to_string()),
+            Err(export_error) => report.stop_reason.push_str(&format!(
+                " Automatic code export also failed: {export_error}. The candidate remains in report.json."
+            )),
+        }
+    }
     if let Err(error) = &result {
         if !report.model_attempts.is_empty() {
             evaluate_failure(&mut report, &log, &error.to_string(), &mut |messages| {
@@ -72,6 +88,43 @@ pub(crate) fn solve(
     }
     finish(&mut report, &log, result)?;
     Ok((report, log.directory))
+}
+
+fn export_unverified_implementation(
+    report: &Report,
+    destination: &Path,
+    reason: &str,
+) -> io::Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    let candidate = report
+        .rounds
+        .last()
+        .and_then(|round| round.candidate.as_ref())
+        .ok_or_else(|| crate::errors::invalid_data("coding run has no implementation to export"))?;
+    candidate.validate_implementation()?;
+    fs::create_dir(destination)?;
+    for file in &candidate.files {
+        let path = destination.join(&file.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        output.write_all(file.content.as_bytes())?;
+    }
+    let note = format!(
+        "This implementation was exported because sandbox execution could not continue. It has not been fully tested.\n\nSandbox error: {reason}\n"
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination.join("UNVERIFIED.txt"))?
+        .write_all(note.as_bytes())?;
+    Ok(())
 }
 
 pub(crate) fn new_report(
@@ -109,6 +162,7 @@ pub(crate) fn new_report(
         failure_evaluation_error: None,
         outcome: Outcome::Unresolved,
         stop_reason: "Run in progress; interrupted runs are unresolved.".into(),
+        exported_directory: None,
         finished: false,
         elapsed_ms: 0,
     })
@@ -212,6 +266,17 @@ pub(crate) fn run_cycle(
                 &error.to_string(),
             );
             log.save(report)?;
+            if error.kind() == io::ErrorKind::Interrupted
+                && error.to_string().starts_with("coding_sandbox_unavailable:")
+            {
+                report.stop_reason = format!(
+                    "Stopped after the coding sandbox became unavailable: {}",
+                    error
+                        .to_string()
+                        .trim_start_matches("coding_sandbox_unavailable:")
+                );
+                return Ok(());
+            }
             if number == report.limits.rounds {
                 return Err(error);
             }
@@ -335,6 +400,28 @@ fn run_round(
             round.scholar_execution = Some(execution);
         }
         log.save(report)?;
+        let infrastructure_error = report
+            .rounds
+            .last()
+            .and_then(|round| {
+                round
+                    .scholar_execution
+                    .as_ref()
+                    .and_then(|execution| execution.infrastructure_error.as_deref())
+                    .or_else(|| {
+                        round
+                            .acceptance_execution
+                            .as_ref()
+                            .and_then(|execution| execution.infrastructure_error.as_deref())
+                    })
+            })
+            .map(str::to_owned);
+        if let Some(error) = infrastructure_error {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("coding_sandbox_unavailable: {error}"),
+            ));
+        }
     }
     let mut data = input(report);
     data["acceptance_tests"] =

@@ -77,10 +77,35 @@ pub struct MlxModel {
     supports_thinking: bool,
     max_context: usize,
     adapter: PathBuf,
+    stop_ids: [u32; 2],
+    think_start_id: Option<u32>,
+    think_end_id: Option<u32>,
     pub(super) consolidated: bool,
     pub(super) last_thinking: Option<String>,
     _device_lease: fs::File,
 }
+
+/// One `generate` request for the worker; the field names are the protocol.
+#[derive(serde::Serialize)]
+struct GenerationRequest {
+    ids: Vec<u32>,
+    max_tokens: usize,
+    temperature: f64,
+    stop_ids: [u32; 2],
+    thinking: bool,
+    thinking_budget: usize,
+    think_start_id: Option<u32>,
+    think_end_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_context_size: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_exclude_prompt: Option<serde_json::Value>,
+}
+
 impl MlxModel {
     pub(super) fn load(
         dir: &Path,
@@ -122,11 +147,14 @@ impl MlxModel {
         }
         let supports_thinking = checkpoint_supports_thinking(dir)?;
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(other)?;
-        for token in ["<|im_end|>", "<|endoftext|>"] {
-            if tokenizer.token_to_id(token).is_none() {
-                return Err(invalid("MLX tokenizer is missing a stop token"));
-            }
-        }
+        let stop_id = |token: &str| {
+            tokenizer
+                .token_to_id(token)
+                .ok_or_else(|| invalid("MLX tokenizer is missing a stop token"))
+        };
+        let stop_ids = [stop_id("<|im_end|>")?, stop_id("<|endoftext|>")?];
+        let think_start_id = tokenizer.token_to_id("<think>");
+        let think_end_id = tokenizer.token_to_id("</think>");
         crate::diagnostics::event(
             "model.loaded",
             serde_json::json!({"model_dir":dir,"model_type":config["model_type"],"backend":"mlx","precision":ready["precision"],"quantization":ready["quantization"],"shard_count":checkpoints.len(),"context_tokens":max_context,"device":"metal","chat_template":if supports_thinking {"qwen_chatml_with_thinking"} else {"qwen_chatml_without_thinking"},"adapter_path":adapter,"adapter_state": if ready["adapter_created"] == true {"initialized_untrained"} else if ready["adapter_active"] == true {"loaded_trained"} else {"loaded_untrained"},"adapter_loaded":ready["adapter_loaded"],"adapter_exists":adapter.exists(),"adapter_created":ready["adapter_created"],"adapter_active":ready["adapter_active"],"adapter_training_steps":ready["adapter_training_steps"],"memory":ready["memory"]}),
@@ -139,6 +167,9 @@ impl MlxModel {
             supports_thinking,
             max_context,
             adapter: adapter.into(),
+            stop_ids,
+            think_start_id,
+            think_end_id,
             consolidated,
             last_thinking: None,
             _device_lease: device_lease,
@@ -150,6 +181,34 @@ impl MlxModel {
             .lock()
             .map_err(|_| other("MLX worker lock is poisoned"))?;
         worker.request_with_restart(&value, || spawn_worker(&self.python, &self.init))
+    }
+    fn generation_request(
+        &self,
+        ids: Vec<u32>,
+        max_tokens: usize,
+        temperature: f64,
+        thinking: bool,
+        thinking_budget: usize,
+    ) -> GenerationRequest {
+        GenerationRequest {
+            ids,
+            max_tokens,
+            temperature,
+            stop_ids: self.stop_ids,
+            thinking,
+            thinking_budget,
+            think_start_id: self.think_start_id,
+            think_end_id: self.think_end_id,
+            top_p: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            presence_exclude_prompt: None,
+        }
+    }
+    fn generate(&self, request: &GenerationRequest) -> io::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(request).map_err(other)?;
+        value["op"] = "generate".into();
+        self.request(value)
     }
     fn ids(&self, messages: &[Message], thinking: bool) -> io::Result<Vec<u32>> {
         self.tokenizer
@@ -172,18 +231,23 @@ impl MlxModel {
         }
         let limit = reply_budget(ids.len(), 0, self.max_context, cap);
         let sampling = bounded_task_configuration()["mlx"].clone();
-        let response = self.request(serde_json::json!({"op":"generate","ids":ids,
-            "max_tokens":limit,"temperature":sampling["temperature"],"top_p":sampling["top_p"],
-            "presence_penalty":sampling["presence_penalty"],"presence_context_size":self.max_context,
-            "presence_exclude_prompt":sampling["presence_exclude_prompt"],
-            "stop_ids":[self.tokenizer.token_to_id("<|im_end|>"),self.tokenizer.token_to_id("<|endoftext|>")],
-            "thinking":false,"thinking_budget":0,
-            "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+        let prompt_tokens = ids.len();
+        let temperature = sampling["temperature"]
+            .as_f64()
+            .ok_or_else(|| invalid("bounded task configuration lacks a temperature"))?;
+        let request = GenerationRequest {
+            top_p: Some(sampling["top_p"].clone()),
+            presence_penalty: Some(sampling["presence_penalty"].clone()),
+            presence_context_size: Some(self.max_context),
+            presence_exclude_prompt: Some(sampling["presence_exclude_prompt"].clone()),
+            ..self.generation_request(ids, limit, temperature, false, 0)
+        };
+        let response = self.generate(&request)?;
         let tokens: Vec<u32> = serde_json::from_value(response["tokens"].clone()).map_err(other)?;
         crate::diagnostics::event(
             "model.bounded_task_generation",
             serde_json::json!({
-            "backend":"mlx","prompt_tokens":ids.len(),"reply_limit":limit,
+            "backend":"mlx","prompt_tokens":prompt_tokens,"reply_limit":limit,
             "generated_tokens":tokens.len(),"finish_reason":response["finish_reason"],"sampling":response["sampling"],"memory":response["memory"],"recovery_owned_by_caller":true}),
         );
         self.tokenizer.decode(&tokens, true).map_err(other)
@@ -226,10 +290,8 @@ impl MlxModel {
                     return Err(invalid("full conversation exceeds the configured context limit; no history was discarded"));
                 }
                 let limit = reply_budget(ids.len(), extra, self.max_context, cap);
-                Ok(serde_json::json!({"ids":ids,"max_tokens":limit,"temperature":temperature,
-                    "stop_ids":[self.tokenizer.token_to_id("<|im_end|>").unwrap(),self.tokenizer.token_to_id("<|endoftext|>").unwrap()],
-                    "thinking":use_thinking,"thinking_budget":thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1)),
-                    "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))
+                let thinking_budget = thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1));
+                serde_json::to_value(self.generation_request(ids, limit, temperature, use_thinking, thinking_budget)).map_err(other)
             }).collect();
             let response = requests.and_then(|requests| {
                 self.request(serde_json::json!({"op":"generate_batch","requests":requests}))
@@ -289,14 +351,15 @@ impl MlxModel {
             let requested_cap = cap.saturating_mul(1usize << attempt);
             let limit = reply_budget(ids.len(), extra, self.max_context, requested_cap);
             let initial_budget = thinking_budget().min(limit.saturating_sub(MIN_REPLY).max(1));
-            let stops = [
-                self.tokenizer.token_to_id("<|im_end|>").unwrap(),
-                self.tokenizer.token_to_id("<|endoftext|>").unwrap(),
-            ];
             let mut response = match initial.take() {
                 Some(response) => response,
-                None => self.request(serde_json::json!({"op":"generate","ids":ids,"max_tokens":limit,"temperature":temperature,"stop_ids":stops,
-                    "thinking":use_thinking,"thinking_budget":initial_budget,"think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":self.tokenizer.token_to_id("</think>")}))?,
+                None => self.generate(&self.generation_request(
+                    ids.clone(),
+                    limit,
+                    temperature,
+                    use_thinking,
+                    initial_budget,
+                ))?,
             };
             let mut tokens: Vec<u32> =
                 serde_json::from_value(response["tokens"].clone()).map_err(other)?;
@@ -312,12 +375,13 @@ impl MlxModel {
                     .saturating_sub(tokens.len())
                     .min(self.max_context.saturating_sub(continuation.len()));
                 if extra_budget > 0 && remaining > MIN_REPLY {
-                    let extended = self.request(serde_json::json!({"op":"generate",
-                        "ids":continuation,"max_tokens":remaining,"temperature":temperature,
-                        "stop_ids":stops,"thinking":true,
-                        "thinking_budget":extra_budget.min(remaining.saturating_sub(MIN_REPLY)),
-                        "think_start_id":self.tokenizer.token_to_id("<think>"),
-                        "think_end_id":self.tokenizer.token_to_id("</think>")}))?;
+                    let extended = self.generate(&self.generation_request(
+                        continuation,
+                        remaining,
+                        temperature,
+                        true,
+                        extra_budget.min(remaining.saturating_sub(MIN_REPLY)),
+                    ))?;
                     tokens.extend(
                         serde_json::from_value::<Vec<u32>>(extended["tokens"].clone())
                             .map_err(other)?,
@@ -336,8 +400,7 @@ impl MlxModel {
             }
             if use_thinking && response["finish_reason"] == "thinking_budget" {
                 let close = self
-                    .tokenizer
-                    .token_to_id("</think>")
+                    .think_end_id
                     .ok_or_else(|| invalid("thinking model omitted its closing token"))?;
                 tokens.push(close);
                 tokens.extend(
@@ -356,10 +419,13 @@ impl MlxModel {
                         "thinking left no context space for a visible answer",
                     ));
                 }
-                let completion = self.request(serde_json::json!({"op":"generate",
-                    "ids":continuation,"max_tokens":remaining,"temperature":temperature,
-                    "stop_ids":stops,"thinking":false,"thinking_budget":thinking_budget(),
-                    "think_start_id":self.tokenizer.token_to_id("<think>"),"think_end_id":close}))?;
+                let completion = self.generate(&self.generation_request(
+                    continuation,
+                    remaining,
+                    temperature,
+                    false,
+                    thinking_budget(),
+                ))?;
                 tokens.extend(
                     serde_json::from_value::<Vec<u32>>(completion["tokens"].clone())
                         .map_err(other)?,
@@ -393,7 +459,7 @@ impl MlxModel {
             }
             crate::diagnostics::event(
                 "model.generation",
-                serde_json::json!({"backend":"mlx","attempt":attempt+1,"prompt_tokens":ids.len(),"reply_limit":limit,"generated_tokens":tokens.len(),"thinking_enabled":use_thinking,"thinking_tokens":response["thinking_tokens"],"finish_reason":response["finish_reason"],"memory":response["memory"]}),
+                serde_json::json!({"backend":"mlx","attempt":attempt+1,"prompt_tokens":ids.len(),"cached_prompt_tokens":response["cached_prompt_tokens"],"reply_limit":limit,"generated_tokens":tokens.len(),"thinking_enabled":use_thinking,"thinking_tokens":response["thinking_tokens"],"finish_reason":response["finish_reason"],"memory":response["memory"]}),
             );
             match generation_reply(&decoded, use_thinking) {
                 Ok((thought, answer)) => {
@@ -549,6 +615,33 @@ mod tests {
         }
     }
 
+    fn test_model(
+        worker: Worker,
+        tokenizer: Tokenizer,
+        supports_thinking: bool,
+        lease: &Path,
+    ) -> MlxModel {
+        let stop_ids = [
+            tokenizer.token_to_id("<|im_end|>").unwrap(),
+            tokenizer.token_to_id("<|endoftext|>").unwrap(),
+        ];
+        MlxModel {
+            worker: Mutex::new(worker),
+            python: PathBuf::new(),
+            init: serde_json::Value::Null,
+            think_start_id: tokenizer.token_to_id("<think>"),
+            think_end_id: tokenizer.token_to_id("</think>"),
+            tokenizer,
+            supports_thinking,
+            max_context: 8192,
+            adapter: PathBuf::new(),
+            stop_ids,
+            consolidated: false,
+            last_thinking: None,
+            _device_lease: fs::File::create(lease).unwrap(),
+        }
+    }
+
     #[test]
     fn worker_eof_reports_the_process_exit_status() {
         let mut worker = worker("import sys; sys.exit(9)");
@@ -592,18 +685,7 @@ for call,line in enumerate(sys.stdin):
   response={'results':[{'tokens':[3], 'finish_reason':'stop_token'} for _ in range(2)]}
  print(json.dumps(response),flush=True)
 "#;
-        let mut model = MlxModel {
-            worker: Mutex::new(worker(script)),
-            python: PathBuf::new(),
-            init: serde_json::Value::Null,
-            tokenizer,
-            supports_thinking: false,
-            max_context: 8192,
-            adapter: PathBuf::new(),
-            consolidated: false,
-            last_thinking: None,
-            _device_lease: fs::File::create(&path).unwrap(),
-        };
+        let mut model = test_model(worker(script), tokenizer, false, &path);
         let conversations = vec![
             vec![Message {
                 role: "user".into(),
@@ -699,18 +781,7 @@ for call,line in enumerate(sys.stdin):
         let worker = worker(
             "import sys,json\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n assert request['thinking'] == (attempt<2)\n if attempt==0: initial=request['thinking_budget']\n if attempt==1:\n  assert request['thinking_budget']>initial\n  assert request['ids'][-2:]==[3,4]\n if attempt==2: assert request['ids'][-5:]==[3,4,4,6,7]\n print(json.dumps({'tokens':[[3,4],[4],[5]][attempt],'thinking_tokens':initial if attempt==0 else request['thinking_budget'] if attempt==1 else 0,'finish_reason':'thinking_budget' if attempt<2 else 'stop_token'}),flush=True)",
         );
-        let mut model = MlxModel {
-            worker: Mutex::new(worker),
-            python: PathBuf::new(),
-            init: serde_json::Value::Null,
-            tokenizer,
-            supports_thinking: true,
-            max_context: 8192,
-            adapter: PathBuf::new(),
-            consolidated: false,
-            last_thinking: None,
-            _device_lease: fs::File::create(&path).unwrap(),
-        };
+        let mut model = test_model(worker, tokenizer, true, &path);
         let messages = [Message {
             role: "user".into(),
             content: "How do I make soup?".into(),
@@ -749,18 +820,7 @@ for call,line in enumerate(sys.stdin):
         let worker = worker(
             "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<2\n if attempt==0:\n  assert request['thinking']\n  previous=request['max_tokens']\n  tokens=[3,4,5,6]\n  finish='max_tokens'\n else:\n  assert not request['thinking'] and request['max_tokens']>previous\n  tokens=[7]\n  finish='stop_token'\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':finish}),flush=True)",
         );
-        let mut model = MlxModel {
-            worker: Mutex::new(worker),
-            python: PathBuf::new(),
-            init: serde_json::Value::Null,
-            tokenizer,
-            supports_thinking: true,
-            max_context: 8192,
-            adapter: PathBuf::new(),
-            consolidated: false,
-            last_thinking: None,
-            _device_lease: fs::File::create(&path).unwrap(),
-        };
+        let mut model = test_model(worker, tokenizer, true, &path);
         let messages = [Message {
             role: "user".into(),
             content: "How do I make soup?".into(),
@@ -800,18 +860,7 @@ for call,line in enumerate(sys.stdin):
         let worker = worker(
             "import sys,json\nprevious=0\nfor attempt,line in enumerate(sys.stdin):\n request=json.loads(line)\n assert attempt<3\n if attempt:\n  assert not request['thinking'] and request['max_tokens']>previous\n previous=request['max_tokens']\n tokens=[3,4,5,6] if attempt==0 else [6]\n print(json.dumps({'tokens':tokens,'thinking_tokens':1 if attempt==0 else 0,'finish_reason':'max_tokens'}),flush=True)",
         );
-        let mut model = MlxModel {
-            worker: Mutex::new(worker),
-            python: PathBuf::new(),
-            init: serde_json::Value::Null,
-            tokenizer,
-            supports_thinking: true,
-            max_context: 8192,
-            adapter: PathBuf::new(),
-            consolidated: false,
-            last_thinking: None,
-            _device_lease: fs::File::create(&path).unwrap(),
-        };
+        let mut model = test_model(worker, tokenizer, true, &path);
         let messages = [Message {
             role: "user".into(),
             content: "How do I make soup?".into(),
@@ -849,18 +898,7 @@ for call,line in enumerate(sys.stdin):
         let worker = worker(
             "import sys,json\nfor call,line in enumerate(sys.stdin):\n r=json.loads(line)\n assert call<2 and r['max_tokens']==128 and r['thinking']==False\n assert r['temperature']==0.3 and r['top_p']==0.8 and r['presence_penalty']==0.5 and r['presence_context_size']==8192\n print(json.dumps({'tokens':[3], 'finish_reason':'max_tokens'}),flush=True)",
         );
-        let mut model = MlxModel {
-            worker: Mutex::new(worker),
-            python: PathBuf::new(),
-            init: serde_json::Value::Null,
-            tokenizer,
-            supports_thinking: false,
-            max_context: 8192,
-            adapter: PathBuf::new(),
-            consolidated: false,
-            last_thinking: None,
-            _device_lease: fs::File::create(&path).unwrap(),
-        };
+        let mut model = test_model(worker, tokenizer, false, &path);
         let messages = [Message {
             role: "user".into(),
             content: "Build a parser".into(),

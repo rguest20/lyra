@@ -13,6 +13,7 @@ use safetensors::{
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokenizers::Tokenizer;
@@ -30,6 +31,75 @@ const MIN_REPLY: usize = 256;
 const MAX_TRAIN: usize = 128;
 const RANK: usize = 8;
 const PREFILL_CHUNK: usize = 256;
+
+fn runtime_date_context() -> String {
+    let local = Command::new("date")
+        .arg("+%Y-%m-%d %Z %z")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|date| !date.is_empty());
+    let utc = Command::new("date")
+        .args(["-u", "+%Y-%m-%d UTC"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|date| !date.is_empty())
+        .unwrap_or_else(|| utc_date_from_system_clock());
+    match local {
+        Some(local) => format!(
+            "Runtime date context from the machine clock: local date and time zone {local}; UTC date {utc}. Treat this as the current date for date questions and past/future interpretation. Dates earlier than this are in the past and later dates are in the future. If the user reports an event in the past that is not independently verified, preserve its past timing and treat it as a report or conditional premise; do not recast it as a future event because pretrained knowledge is missing. The date does not establish whether a world event occurred or its outcome; use evidence or research for those."
+        ),
+        None => format!(
+            "Runtime date context from the machine clock: UTC date {utc}. Treat this as the current date for date questions and past/future interpretation. Dates earlier than this are in the past and later dates are in the future. If the user reports an event in the past that is not independently verified, preserve its past timing and treat it as a report or conditional premise; do not recast it as a future event because pretrained knowledge is missing. The date does not establish whether a world event occurred or its outcome; use evidence or research for those."
+        ),
+    }
+}
+
+fn utc_date_from_system_clock() -> String {
+    let days = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+        / 86_400;
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02} UTC")
+}
+
+fn with_runtime_date_context(messages: &[Message]) -> Vec<Message> {
+    let mut messages = messages.to_vec();
+    let date_context = runtime_date_context();
+    if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+        system.content = format!("{date_context}\n{}", system.content);
+    } else {
+        messages.insert(
+            0,
+            Message {
+                role: "system".into(),
+                content: date_context,
+            },
+        );
+    }
+    messages
+}
 
 pub(crate) fn bounded_task_configuration() -> serde_json::Value {
     serde_json::json!({"mlx":{"temperature":0.3,"top_p":0.8,"top_k":20,"presence_penalty":0.5,"presence_exclude_prompt":true},
@@ -170,10 +240,18 @@ impl LocalModel {
         }
         match self {
             Self::Mlx(model) => {
-                model.chat_batch(conversations, extra_tokens, cap, temperature, thinking)
+                let conversations = conversations
+                    .iter()
+                    .map(|messages| with_runtime_date_context(messages))
+                    .collect::<Vec<_>>();
+                model.chat_batch(&conversations, extra_tokens, cap, temperature, thinking)
             }
             Self::Shared(model) => {
-                model.generate_batch(conversations, extra_tokens, cap, temperature, thinking)
+                let conversations = conversations
+                    .iter()
+                    .map(|messages| with_runtime_date_context(messages))
+                    .collect::<Vec<_>>();
+                model.generate_batch(&conversations, extra_tokens, cap, temperature, thinking)
             }
             Self::Candle(_) => conversations
                 .iter()
@@ -203,12 +281,13 @@ impl LocalModel {
         cap: usize,
     ) -> io::Result<String> {
         let cap = cap.clamp(1, 16_384);
+        let messages = with_runtime_date_context(messages);
         match self {
             Self::Shared(model) => {
-                model.with_model(|backend| backend.chat_for_bounded_task(messages, cap))
+                model.with_model(|backend| backend.chat_for_bounded_task(&messages, cap))
             }
-            Self::Mlx(model) => model.chat_bounded(messages, cap),
-            Self::Candle(model) => model.chat_with_reply_cap(messages, 0, cap, 0.1, false),
+            Self::Mlx(model) => model.chat_bounded(&messages, cap),
+            Self::Candle(model) => model.chat_with_reply_cap(&messages, 0, cap, 0.1, false),
         }
     }
 
@@ -311,13 +390,14 @@ impl LocalModel {
         temperature: f64,
         thinking: bool,
     ) -> io::Result<String> {
+        let messages = with_runtime_date_context(messages);
         match self {
             Self::Candle(model) => {
-                model.chat_with_reply_cap(messages, extra_tokens, cap, temperature, thinking)
+                model.chat_with_reply_cap(&messages, extra_tokens, cap, temperature, thinking)
             }
-            Self::Mlx(model) => model.chat(messages, extra_tokens, cap, temperature, thinking),
+            Self::Mlx(model) => model.chat(&messages, extra_tokens, cap, temperature, thinking),
             Self::Shared(model) => {
-                model.generate(messages, extra_tokens, cap, temperature, thinking)
+                model.generate(&messages, extra_tokens, cap, temperature, thinking)
             }
         }
     }
@@ -1016,6 +1096,63 @@ fn other(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_date_context_is_added_to_the_first_system_message() {
+        use crate::agent::Message;
+
+        let messages = vec![
+            Message {
+                role: "system".into(),
+                content: "Role instructions".into(),
+            },
+            Message {
+                role: "user".into(),
+                content: "What year is it?".into(),
+            },
+        ];
+        let contextual = super::with_runtime_date_context(&messages);
+
+        assert_eq!(contextual.len(), messages.len());
+        assert!(
+            contextual[0]
+                .content
+                .starts_with("Runtime date context from the machine clock:")
+        );
+        assert!(contextual[0].content.contains("\nRole instructions"));
+        assert!(
+            contextual[0]
+                .content
+                .contains("Treat this as the current date")
+        );
+        assert!(
+            contextual[0]
+                .content
+                .contains("Dates earlier than this are in the past")
+        );
+        assert_eq!(contextual[1], messages[1]);
+        assert!(!messages[0].content.contains("Runtime date context"));
+    }
+
+    #[test]
+    fn runtime_date_context_is_inserted_when_a_prompt_has_no_system_message() {
+        use crate::agent::Message;
+
+        let messages = [Message {
+            role: "user".into(),
+            content: "What date is it?".into(),
+        }];
+        let contextual = super::with_runtime_date_context(&messages);
+
+        assert_eq!(contextual.len(), 2);
+        assert_eq!(contextual[0].role, "system");
+        assert!(
+            contextual[0]
+                .content
+                .contains("Runtime date context from the machine clock:")
+        );
+        assert_eq!(contextual[1], messages[0]);
+    }
+
     #[test]
     fn quantized_qwen3_uses_mlx_and_bf16_keeps_candle() {
         use serde_json::json;

@@ -14,7 +14,7 @@ def memory_stats(mx):
     return {'active_bytes': mx.get_active_memory(), 'peak_bytes': mx.get_peak_memory(), 'cache_bytes': mx.get_cache_memory()}
 
 
-def request_logits_processors(request, factory):
+def request_logits_processors(request, factory, prompt_length=None):
     processors = factory(
         presence_penalty=request.get('presence_penalty'),
         presence_context_size=request.get('presence_context_size', 20))
@@ -22,9 +22,98 @@ def request_logits_processors(request, factory):
         return processors
     # MLX passes prompt + generated tokens to processors. Presence penalties
     # for coding apply to generated output, not required schema/input tokens.
-    offset = len(request['ids'])
+    offset = len(request['ids']) if prompt_length is None else prompt_length
     return [lambda tokens, logits, process=process: process(tokens[offset:], logits)
             for process in processors]
+
+
+def request_sampler(request, make_sampler):
+    return make_sampler(temp=request['temperature'], top_p=request.get('top_p', 0.8), top_k=20)
+
+
+class TokenTracker:
+    """Apply the stop-token and thinking-budget rules of one request to a token stream."""
+
+    def __init__(self, request):
+        self.stops = set(request['stop_ids'])
+        self.think_start = request.get('think_start_id')
+        self.think_end = request.get('think_end_id')
+        self.budget = request.get('thinking_budget', 256)
+        self.thinking = request.get('thinking', False)
+        self.tokens = []
+        self.thinking_tokens = 0
+        self.finish_reason = 'max_tokens'
+
+    def accept(self, token):
+        """Record one token; return False once this request must stop generating."""
+        if token in self.stops:
+            self.finish_reason = 'stop_token'
+            return False
+        self.tokens.append(token)
+        if token == self.think_start:
+            self.thinking = True
+        if token == self.think_end:
+            self.thinking = False
+        if self.thinking:
+            self.thinking_tokens += 1
+            if self.thinking_tokens >= self.budget:
+                self.finish_reason = 'thinking_budget'
+                return False
+        return True
+
+    def result(self):
+        return {'tokens': self.tokens, 'finish_reason': self.finish_reason,
+                'generated_tokens': len(self.tokens), 'thinking_tokens': self.thinking_tokens}
+
+
+def common_prefix_length(left, right):
+    count = 0
+    for a, b in zip(left, right):
+        if a != b:
+            break
+        count += 1
+    return count
+
+
+class PrefixCache:
+    """Reuse the previous request's KV cache for the prompt prefix it shares.
+
+    Only trimmable caches (plain attention layers) are reused; hybrid layouts
+    with recurrent state are always rebuilt. The cache contents are a function
+    of the base weights alone, so adapter training does not invalidate them.
+    """
+
+    MIN_REUSE_TOKENS = 16
+
+    def __init__(self, model, can_trim, trim):
+        self.model = model
+        self.can_trim = can_trim
+        self.trim = trim
+        self.ids = []
+        self.cache = None
+
+    def prepare(self, ids, allow_reuse=True):
+        """Return (cache, prompt_suffix, reused_tokens) for a prompt."""
+        reusable = (allow_reuse and self.cache is not None and self.can_trim(self.cache))
+        if reusable:
+            # Keep at least one prompt token so the model has input to process.
+            common = min(common_prefix_length(self.ids, ids), len(ids) - 1)
+            if common >= self.MIN_REUSE_TOKENS:
+                stored = max(c.offset for c in self.cache if hasattr(c, 'offset'))
+                self.trim(self.cache, stored - common)
+                self.ids = self.ids[:common]
+                return self.cache, ids[common:], common
+        self.cache = self.model.make_cache()
+        self.ids = []
+        return self.cache, list(ids), 0
+
+    def record(self, ids, tokens):
+        """Remember which tokens the cache now covers, in order."""
+        self.ids = list(ids) + list(tokens)
+
+    def invalidate(self):
+        self.cache = None
+        self.ids = []
 
 
 def make_adapter_model(base, model_type):
@@ -79,6 +168,7 @@ def main():
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx_lm.generate import BatchGenerator, StopSequences, generate_step
+    from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
     from mlx_lm.utils import load_model
     from mlx_lm.sample_utils import make_sampler, make_logits_processors
 
@@ -116,6 +206,7 @@ def main():
 
     if not adapter_loaded:
         save_adapter(adapter)
+    prefix_cache = PrefixCache(model, can_trim_prompt_cache, trim_prompt_cache)
     send({'ready': True, 'backend': 'mlx', 'precision': 'quantized' if quantization else 'BF16',
           'quantization': quantization, 'adapter_loaded': adapter_loaded,
           'adapter_created': not adapter_loaded, 'adapter_active': model.adapter_active,
@@ -126,16 +217,15 @@ def main():
             raise ValueError('Generation batches must contain one to four requests')
         generator = BatchGenerator(model, prefill_batch_size=len(requests),
                                    completion_batch_size=len(requests), prefill_step_size=128)
-        results = [{'tokens': [], 'finish_reason': 'max_tokens', 'thinking_tokens': 0}
-                   for request in requests]
-        thinking = [request.get('thinking', False) for request in requests]
+        trackers = [TokenTracker(request) for request in requests]
         mx.reset_peak_memory()
         try:
             uids = generator.insert(
                 [request['ids'] for request in requests],
                 max_tokens=[request['max_tokens'] for request in requests],
-                samplers=[make_sampler(temp=request['temperature'], top_p=0.8, top_k=20)
-                          for request in requests],
+                samplers=[request_sampler(request, make_sampler) for request in requests],
+                logits_processors=[request_logits_processors(request, make_logits_processors)
+                                   for request in requests],
                 stop_sequences=[StopSequences([[token] for token in request['stop_ids']])
                                 for request in requests])
             indices = {uid: index for index, uid in enumerate(uids)}
@@ -145,32 +235,46 @@ def main():
                 if not responses:
                     raise RuntimeError('Batch generator ended before all requests completed')
                 for response in responses:
-                    index = indices[response.uid]
-                    request, result = requests[index], results[index]
-                    token = response.token
-                    if token in request['stop_ids']:
-                        result['finish_reason'] = 'stop_token'
+                    tracker = trackers[indices[response.uid]]
+                    if not tracker.accept(response.token):
                         finished.add(response.uid)
-                        continue
-                    result['tokens'].append(token)
-                    if token == request.get('think_start_id'):
-                        thinking[index] = True
-                    if token == request.get('think_end_id'):
-                        thinking[index] = False
-                    if thinking[index]:
-                        result['thinking_tokens'] += 1
-                        if result['thinking_tokens'] >= request.get('thinking_budget', 256):
-                            result['finish_reason'] = 'thinking_budget'
+                        if tracker.finish_reason == 'thinking_budget':
                             generator.remove([response.uid])
-                            finished.add(response.uid)
-                    if response.finish_reason is not None:
+                    elif response.finish_reason is not None:
                         finished.add(response.uid)
-            for result in results:
-                result['generated_tokens'] = len(result['tokens'])
-                result['memory'] = memory_stats(mx)
-            return results
+            return [dict(tracker.result(), memory=memory_stats(mx)) for tracker in trackers]
         finally:
             generator.close()
+
+    def generate(request):
+        mx.reset_peak_memory()
+        processors = request_logits_processors(request, make_logits_processors)
+        # Processors that see the prompt would observe only the uncached suffix.
+        cache, prompt, reused = prefix_cache.prepare(
+            request['ids'], allow_reuse=not processors or request.get('presence_exclude_prompt', False))
+        if reused and processors:
+            processors = request_logits_processors(request, make_logits_processors, len(prompt))
+        tracker = TokenTracker(request)
+        generator = generate_step(mx.array(prompt), model, max_tokens=request['max_tokens'],
+                                  sampler=request_sampler(request, make_sampler),
+                                  logits_processors=processors, prompt_cache=cache,
+                                  prefill_step_size=128)
+        try:
+            for token, _ in generator:
+                token = int(token.item()) if hasattr(token, 'item') else int(token)
+                if not tracker.accept(token):
+                    break
+        except Exception:
+            prefix_cache.invalidate()
+            raise
+        finally:
+            generator.close()
+        prefix_cache.record(request['ids'], tracker.tokens)
+        return dict(tracker.result(), cached_prompt_tokens=reused, memory=memory_stats(mx),
+                    sampling={'temperature': request['temperature'], 'top_p': request.get('top_p', 0.8),
+                              'presence_penalty': request.get('presence_penalty'),
+                              'presence_context_size': request.get('presence_context_size', 20),
+                              'presence_exclude_prompt': request.get('presence_exclude_prompt', False)})
 
     for line in sys.stdin:
         try:
@@ -179,38 +283,7 @@ def main():
             if op == 'generate_batch':
                 send({'results': generate_batch(request['requests'])})
             elif op == 'generate':
-                stops = set(request['stop_ids'])
-                tokens = []
-                finish_reason = 'max_tokens'
-                in_thinking = request.get('thinking', False)
-                thought_tokens = 0
-                mx.reset_peak_memory()
-                sampler = make_sampler(temp=request['temperature'], top_p=request.get('top_p', 0.8), top_k=20)
-                processors = request_logits_processors(request, make_logits_processors)
-                generator = generate_step(mx.array(request['ids']), model, max_tokens=request['max_tokens'], sampler=sampler, logits_processors=processors, prefill_step_size=128)
-                try:
-                    for token, _ in generator:
-                        token = int(token.item()) if hasattr(token, 'item') else int(token)
-                        if token in stops:
-                            finish_reason = 'stop_token'
-                            break
-                        tokens.append(token)
-                        if token == request.get('think_start_id'):
-                            in_thinking = True
-                        if token == request.get('think_end_id'):
-                            in_thinking = False
-                        if in_thinking:
-                            thought_tokens += 1
-                            if thought_tokens >= request.get('thinking_budget', 256):
-                                finish_reason = 'thinking_budget'
-                                break
-                finally:
-                    generator.close()
-                send({'tokens': tokens, 'finish_reason': finish_reason, 'generated_tokens': len(tokens), 'thinking_tokens': thought_tokens, 'memory': memory_stats(mx),
-                      'sampling': {'temperature': request['temperature'], 'top_p': request.get('top_p', 0.8),
-                                   'presence_penalty': request.get('presence_penalty'),
-                                   'presence_context_size': request.get('presence_context_size', 20),
-                                   'presence_exclude_prompt': request.get('presence_exclude_prompt', False)}})
+                send(generate(request))
             elif op == 'train':
                 targets = request['targets']
                 sequence = request['ids'] + targets[:-1]

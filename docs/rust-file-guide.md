@@ -35,6 +35,7 @@ that file is for and, in short, how it does the work. The list covers the 94
 | `src/scout.rs` | Finds public knowledge gaps for Scholar to investigate. It ranks sparse or challenged map topics, creates focused questions, and limits model-suggested probes. |
 | `src/scholar.rs` | Coordinates public research jobs. It queries Wikipedia and discovery providers, checks fetched material, extracts grounded findings, and hands evidence to storage for assessment and promotion. |
 | `src/maintenance.rs` | Runs one recorded maintenance pass. It gives the available work to the appropriate roles under configured budgets and reports what the pass accomplished. |
+| `src/research.rs` | Model-assisted lookup intent and evidence selection. Submodules hold JSON parsing (`json.rs`), bounded structured model passes with repair prompts (`passes.rs`), request-intent assessment (`request.rs`), currentness assessment and evidence selection. |
 
 ## Scholar modules
 

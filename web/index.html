@@ -114,6 +114,21 @@
       }
     }
 
+    async function followActivity(stopPolling) {
+      while (!stopPolling.value) {
+        try {
+          const response = await fetch(`/api/activity?session_id=${sessionId}`);
+          if (response.ok) {
+            const update = await response.json();
+            status.textContent = update.activity || 'Working…';
+          }
+        } catch {
+          // Chat remains available if the optional activity check fails.
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+
     form.addEventListener('submit', async event => {
       event.preventDefault();
       const message = prompt.value.trim();
@@ -122,7 +137,9 @@
       prompt.value = '';
       send.disabled = true;
       newChat.disabled = true;
-      status.textContent = 'Waiting for Lyra…';
+      status.textContent = 'Starting up Lyra…';
+      const stopPolling = { value: false };
+      const activityPoller = followActivity(stopPolling);
       try {
         const response = await fetch('/api/chat', {
           method: 'POST',
@@ -130,6 +147,8 @@
           body: JSON.stringify({ message, session_id: sessionId, show_thinking: showThinking.checked })
         });
         const result = await response.json();
+        stopPolling.value = true;
+        await activityPoller;
         if (!response.ok) throw new Error(result.error || 'The reply failed.');
         addMessage(result.reply, 'agent');
         addThinking(result.thinking);
@@ -145,9 +164,13 @@
         status.textContent = 'Ready';
         refreshMaintenance();
       } catch (error) {
+        stopPolling.value = true;
+        await activityPoller;
         addMessage(error.message, 'error');
         status.textContent = 'Ready';
       } finally {
+        stopPolling.value = true;
+        await activityPoller;
         send.disabled = false;
         newChat.disabled = false;
       }

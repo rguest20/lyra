@@ -24,9 +24,10 @@ use research_reply::answer_from_research_with_thinking;
 pub(crate) use research_reply::{answer_from_research, semantic_research_evidence};
 
 const STATE_VERSION: u64 = 1;
-const CONTEXT_USE_POLICY: &str = "Keep supplied facts distinct from generated suggestions, examples and assumptions. Earlier assistant content does not establish facts about the user or actions the user has completed. When constructing a draft from supplied information, preserve that information boundary and represent missing details as placeholders if requested. Use earlier turns to resolve references while letting the latest request define the current task. Apply earlier constraints within their actual scope; a previous topic does not itself restrict what can be requested next.";
-pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a language model. Do not perform a fixed persona. The conversation below is context; older assistant replies may be mistaken or repetitive. Answer the final user message directly and specifically, using natural language suited to the request. Speak as the assistant, not as a narrator describing what the user requested or what your system prompt contains. Describe missing evidence directly in terms of the user's actual question. For thanks or praise, acknowledge it briefly; do not attribute your own honesty or uncertainty to the user. Respond in your own words; do not parrot the user's latest statement as your reply. You may quote earlier user statements when attributing evidence. Do not append stock closings, offers of further help, invitations to continue, or unnecessary follow-up questions. For a greeting, reply briefly without reintroducing yourself unless asked. Before answering a question about the user, check the supplied sourced claims and user statements. Treat a clear statement from the user as reliable evidence of what they told you, even if its extracted candidate is awaiting review; extractor confidence measures the extraction, not the user's honesty. State such information as user-reported and distinguish it from independently verified facts. Lack of access to device or location data is not a reason to ignore a direct user statement. Never say you do not know when the answer is present in the supplied user evidence. Acknowledge mistakes when corrected. For semantic claims, extraction confidence describes only how confidently the extractor mapped text into a claim; it is not truth probability or evidence strength. Source quality is a categorical assessment of the cited source, and freshness describes that source's recency for time-sensitive information; neither alone proves a claim. Claim status controls answer use: active means eligible with source attribution, not verified; uncertain means qualify and seek corroboration; challenged means do not present as established and explain the disagreement if relevant. Treat unknown assessments as unknown, not as strong evidence. User-reported information is evidence of what the user said, not independent verification. Ask a brief confirmation question when the user's intent or a material fact remains unclear. Use only as many reply tokens as needed to answer fully. Do not claim that conversation changed your model weights or code.";
+const CONTEXT_USE_POLICY: &str = "Distinguish supplied facts from generated suggestions, examples, or assumptions. Past assistant turns do not establish user facts or completed actions. If drafting from supplied data, preserve this boundary and use placeholders for missing details if requested. Use history to resolve context, but let the latest turn define the active task; past topics do not inherently restrict new requests. If a user provides an unverified premise, reason from it conditionally rather than rejecting it via pretrained memory; clearly separate conditional logic from verified fact.";
+pub(crate) const SYSTEM_PROMPT: &str = "You are Lyra, a learning LLM. Allow your personality to emerge naturally and adaptively through the conversation; do not force a rigid, static persona or narrate your constraints. Respond directly and in your own words to the final message; omit stock closings or robotic follow-ups. Treat clear user statements as evidence of what the user reported, and distinguish user-reported information from independently verified facts. If evidence is incomplete, provide a tentative best guess or partial answer; explicitly attach uncertainty and its basis in the same sentence. Never state you do not know if the answer exists in user evidence. Acknowledge mistakes when corrected. Evaluate metadata strictly: extraction confidence is mapping accuracy, not truth probability; source quality and freshness do not alone prove claims. Claim status rules: 'active' allows use with attribution; 'uncertain' requires qualification; 'challenged' requires explaining the disagreement without presenting it as fact. You can use Lyra's coding workflow for implementation tasks: Scholar plans, implements and runs bounded Python 3.12 standard-library code in an isolated sandbox, then revises it against a fixed functional acceptance suite and Curmudgeon review. This workflow may return partial or unresolved results; do not imply support for other runtimes, packages, network or host files. Users can ask you to implement code conversationally or invoke it explicitly with /code followed by the task. /skills lists available coding capability and its limits. Do not claim conversation alters your weights or code.";
 
+const SKILLS_HELP: &str = "Lyra's available coding workflow can plan and implement Python 3.12 solutions using the standard library, run them in an isolated sandbox, and revise them against a fixed functional acceptance suite with Curmudgeon review. Results can be complete, partial, limited, unresolved, or not solved. It does not currently provide other language runtimes, third-party packages, network access, or host-file access.\n\nTo trigger it, describe an implementation task naturally, or use `/code <task>` to request the coding workflow explicitly. For example: `/code Implement merge_intervals(intervals), merging touching intervals without changing the input`. Use `/skills` to see this capability again.";
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {
     pub role: String,
@@ -52,9 +53,16 @@ pub struct ReplyServices<'a> {
     pub scholar_model: &'a mut LocalModel,
     pub maintenance: Option<&'a MaintenanceHandle>,
     pub state_path: &'a Path,
+    pub activity: Option<&'a dyn Fn(&str)>,
 }
 
 impl<'a> ReplyServices<'a> {
+    pub(crate) fn report_activity(&self, activity: &str) {
+        if let Some(report) = self.activity {
+            report(activity);
+        }
+    }
+
     pub(crate) fn split_models(
         models: &'a mut ReplyModels,
         store: &'a LearningStore,
@@ -76,6 +84,7 @@ impl<'a> ReplyServices<'a> {
                 scholar_model,
                 maintenance,
                 state_path,
+                activity: None,
             },
         )
     }
@@ -90,7 +99,6 @@ struct ResearchResolution {
 
 struct ResearchTurn<'a> {
     request: &'a task::ResolvedTurnRequest<'a>,
-    pending: &'a [Observation],
     initial_evidence: &'a [ScholarEvidenceForAnswer],
     plan: io::Result<Option<crate::research::ResearchPlan>>,
     answer: String,
@@ -200,6 +208,7 @@ impl Agent {
         if input.is_empty() {
             return Err(invalid("message is empty"));
         }
+        services.report_activity("Understanding your request");
         // Session identity is user-controlled; topic interpretation must not
         // erase the dialogue needed to understand subsequent follow-ups.
         let observation_id = services.store.stage_observation(
@@ -210,15 +219,27 @@ impl Agent {
         if let Some(maintenance) = services.maintenance {
             maintenance.wake();
         }
+        if matches!(input, "/skills" | "/skills coding") {
+            return self.deliver_reply(
+                raw_input,
+                SKILLS_HELP.to_owned(),
+                None,
+                false,
+                services,
+                show_thinking,
+            );
+        }
         // An explicit command is a protocol delimiter, not semantic phrase matching.
         let explicit_code = input
             .strip_prefix("/code ")
             .filter(|problem| !problem.trim().is_empty());
+        services.report_activity("Choosing how to handle your request");
         let request =
             task::assess_request(explicit_code.unwrap_or(input), &self.history, |messages| {
                 services.research_model.chat_for_extraction(messages)
             });
         if explicit_code.is_some() || request.requires_code_execution {
+            services.report_activity("Working through the coding task");
             crate::diagnostics::event(
                 "conversation.coding_requested",
                 json!({
@@ -236,6 +257,7 @@ impl Agent {
                 show_thinking,
             );
         }
+        services.report_activity("Checking your conversation and relevant knowledge");
         let turn_context = task::select_turn_context(
             services.store,
             &self.conversation_id,
@@ -244,6 +266,7 @@ impl Agent {
             map,
             services.research_model,
         )?;
+        services.report_activity("Writing a response");
         let (answer, answer_thinking) = self.initial_draft(
             &request,
             &turn_context,
@@ -252,11 +275,11 @@ impl Agent {
             show_thinking,
         )?;
         let task::TurnContext {
-            pending,
             research_evidence,
             uncertain_candidate,
             ..
         } = turn_context;
+        services.report_activity("Preparing any needed Scholar research");
         let plan = self.plan_research(
             &request,
             &answer,
@@ -271,13 +294,11 @@ impl Agent {
         } = self.resolve_research(
             ResearchTurn {
                 request: &request,
-                pending: &pending,
                 initial_evidence: &research_evidence,
                 plan,
                 answer,
                 thinking: answer_thinking,
             },
-            backend,
             &mut services,
         )?;
         let (answer, thinking) = finalize_answer(
@@ -291,6 +312,7 @@ impl Agent {
                 })
             },
         )?;
+        services.report_activity("Finishing your reply");
         self.deliver_reply(
             request.original_message,
             answer,
@@ -323,9 +345,12 @@ impl Agent {
             .map(|finding| json!({"source":finding.source_url,"passage":finding.evidence_text}))
             .collect::<Vec<_>>();
         let known_evidence = serde_json::to_string(&known_evidence).map_err(io::Error::other)?;
-        crate::research::plan_with(&request.resolved_request, &known_evidence, |messages| {
-            model.chat_for_extraction(messages)
-        })
+        crate::research::plan_for_missing_facts(
+            &request.resolved_request,
+            &known_evidence,
+            request.needs_external_facts && evidence.is_empty(),
+            |messages| model.chat_for_extraction(messages),
+        )
     }
 
     fn initial_draft(
@@ -389,89 +414,42 @@ impl Agent {
     fn resolve_research(
         &self,
         turn: ResearchTurn<'_>,
-        backend: &mut LocalModel,
         services: &mut ReplyServices<'_>,
     ) -> io::Result<ResearchResolution> {
         let ResearchTurn {
             request,
-            pending,
             initial_evidence,
             plan,
             mut answer,
-            mut thinking,
+            thinking,
         } = turn;
         let mut queued = false;
         let mut limitation = None;
         match plan {
             Ok(Some(plan)) => {
+                services.report_activity("Queuing Scholar research for follow-up");
                 let turn = self.turn_count() + 1;
                 services
                     .store
                     .enqueue_research_plan(&self.conversation_id, turn, &plan)?;
                 queued = true;
+                if let Some(maintenance) = services.maintenance {
+                    maintenance.wake();
+                }
                 crate::diagnostics::research_decision(
                     "conversation.lookup_plan",
                     json!({
                         "conversation_id":self.conversation_id,"turn":turn,"question":plan.question,"queries":plan.queries,
                     }),
                 );
-                if let Err(error) = crate::scholar::process_conversation(
-                    services.database_path,
-                    &self.conversation_id,
-                    turn,
-                    services.scholar_model,
-                ) {
-                    eprintln!("foreground lookup failed: {error}");
-                }
-                let found = semantic_research_evidence(
-                    services.store,
-                    if request.needs_external_facts {
-                        &request.resolved_request
-                    } else {
-                        &plan.question
-                    },
-                    services.research_model,
-                )?;
-                crate::diagnostics::research_decision(
-                    "conversation.lookup_completed",
-                    json!({
-                        "conversation_id":self.conversation_id,"turn":turn,"evidence_ids":found.iter().map(|f| f.id).collect::<Vec<_>>(),
-                    }),
-                );
-                if !found.is_empty() {
-                    let (researched, revised_thinking) = if request.needs_external_facts {
-                        answer_from_research_with_thinking(
-                            request.original_message,
-                            &self.history,
-                            &found,
-                            services.research_model,
-                        )?
-                    } else {
-                        let messages = task::messages(
-                            request.original_message,
-                            &self.history,
-                            pending,
-                            &found,
-                        );
-                        let answer =
-                            backend.chat(&messages, 0, request.use_extended_reasoning(false))?;
-                        (answer, backend.take_thinking())
-                    };
-                    answer = researched;
-                    thinking = revised_thinking;
-                } else if request.needs_external_facts {
-                    thinking = None;
-                    answer =
-                        "I haven't found enough relevant evidence to answer that reliably yet."
-                            .into();
+                if request.needs_external_facts {
+                    limitation =
+                        Some("Scholar research is queued to look for source support.".into());
                 } else {
                     limitation = Some(format!(
-                        "I couldn't find relevant sources to resolve the remaining gap: {}.",
+                        "I haven't checked the requested sources yet. Scholar research is queued, so this reply is still unverified: {}.",
                         plan.question.trim_end_matches(['.', '?'])
                     ));
-                }
-                if let Some(maintenance) = services.maintenance {
-                    maintenance.wake();
                 }
             }
             Ok(None) => crate::diagnostics::research_decision(
@@ -497,12 +475,16 @@ impl Agent {
                     );
                 }
                 if request.needs_external_facts && initial_evidence.is_empty() {
-                    thinking = None;
-                    answer =
-                        "I haven't found enough relevant evidence to answer that reliably yet."
-                            .into();
+                    limitation =
+                        Some("I couldn't prepare a Scholar lookup for this answer.".into());
                 }
             }
+        }
+        if initial_evidence.is_empty()
+            && (request.needs_external_facts || request.requires_source_check)
+            && !answer.trim().is_empty()
+        {
+            answer = tentative_answer(&answer);
         }
         Ok(ResearchResolution {
             answer,
@@ -947,6 +929,10 @@ fn finalize_answer(
     Ok((answer, thinking))
 }
 
+fn tentative_answer(answer: &str) -> String {
+    format!("I'm not sure, but my best answer is: {answer}")
+}
+
 fn confirmation_question(evidence: &str) -> String {
     format!(
         "Correct me if I'm wrong, but you said “{}.” Is that right?",
@@ -970,6 +956,16 @@ pub(super) fn normalized_words(text: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::test_support::ScholarJobTestHelpers;
+
+    #[test]
+    fn unverified_factual_draft_is_prefaced_as_a_best_effort_answer() {
+        let draft = "A person can hold two presidential numbers after non-consecutive terms.";
+
+        let answer = tentative_answer(draft);
+
+        assert!(answer.starts_with("I'm not sure, but my best answer is:"));
+        assert!(answer.ends_with(draft));
+    }
 
     #[test]
     fn followups_keep_the_saved_session_context_across_topics_and_model_changes() {

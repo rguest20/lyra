@@ -1342,3 +1342,73 @@ same hashed evaluation directory. The finished coding report and export also
 remain under `state/code-runs/code-53773-1793185543216771000/`. This establishes
 a functioning model/runtime switch and one completed coding pilot; it does not
 close reviewer-quality, general coding, grounding, or desktop-memory acceptance.
+
+## 2 November 2026 — foreground research handoff
+
+A browser reply that attempted Scholar work could hold the single web request
+handler through retrieval and extraction. A local run remained in the Scholar
+MLX call for several minutes, during which even the page request could not be
+served. The earlier election question also produced `lookup_not_needed` despite
+the request-intent assessment requiring external facts, so no lookup was queued
+for that turn.
+
+Foreground replies now queue planned research and wake maintenance without
+calling Scholar inline. If contextual assessment requires public facts and no
+source passages are available, the lookup planner must produce a bounded plan;
+the reply reports that evidence is insufficient and research is queued. Explicit
+source-check tasks with a queued lookup are marked unverified. This change does
+not remove latency from the bounded intent/planning/Interaction model calls and
+does not make the HTTP server concurrent. It has not yet had live-model or
+regression-suite validation. `cargo fmt --check` and the release build pass;
+the model's ability to produce a useful plan and later use completed evidence
+remains open grounding work.
+
+A subsequent browser exchange exposed a separate temporal-context failure: the
+model reasoned as if the year were 2023 and then said it could not provide the
+date. Every local inference call now receives the operating system's local date
+and zone, plus the UTC date (with a UTC clock fallback), including batched and
+bounded work used across agents. This is context for date questions and temporal
+interpretation only; other current-world claims still require relevant evidence.
+The first live check returned `2026` for “What year is it?”. Initially, a past-
+election question and a non-consecutive-presidency question both received the
+generic no-evidence reply. The reply path was then changed to retain the draft,
+ask for a tentative best effort, prefix unsupported factual answers with an
+uncertainty marker, and queue Scholar without waiting. A repeat of the election
+question answered that the election occurred on November 5, 2024, while marking
+the answer unverified and queuing research. In a separate conversation that
+explicitly reported Trump's 2024 win, the model still described the win as a
+future hypothetical, then said that no election had occurred as of 2026, despite
+the runtime date and the user's past-tense premise.
+Thus the uncertainty behavior improved, but temporal premise reconciliation
+remains a live-model failure. These are local-model outputs, not independent
+judgments. The final Rust suite passed 525 tests with one ignored; formatting
+checks and the release build also passed.
+
+On a later turn, a Scholar finding that remains `needs_review` can still support
+a provisional partial answer when the stored source assessment records direct
+support and the quoted passage is present in the archived source. The answer
+path requires attribution and explicit uncertainty; this does not promote the
+finding as settled knowledge. Extractions without direct passage support remain
+ineligible. This behavior has not yet been validated with a live-model replay.
+
+### Graded Curmudgeon acceptance — 2 November 2026
+
+Curmudgeon's structured claim decision now includes `tentative` between reject
+and acceptance. A tentative assessment requires validated caveats and plausible
+passage support/relevance; when the source is otherwise suitable, it preserves
+the finding as `needs_review` and does not send it through rejection/repair or
+promotion. Its caveats are retained for the answer path to express the evidence
+limit. Deterministic promotion checks remain in force for direct support,
+confidence, freshness, provenance, privacy and corroboration. Benchmark and
+live-model evaluation of false rejection versus unsupported tentative answers
+remains pending.
+
+### Coding sandbox interruption recovery — 3 November 2026
+
+The `code-95247-1793638291347403000` run lost its Docker daemon in round 4.
+Rounds 4–12 recorded the same sandbox connection failure, yet the workflow kept
+revising and retrying execution for the rest of its round budget. On a recorded
+sandbox infrastructure error, the coding loop now stops before self-assessment
+and another revision, retains the current report, exports the latest source to
+`unverified-export/` with an explicit not-tested note, and includes that path in
+the user-facing summary. A replay that closes Docker mid-run remains pending.

@@ -1,5 +1,5 @@
 LYRA — CURRENT TASKS
-Updated 28 October 2026
+Updated 3 November 2026
 
 Lyra should understand requests, give useful grounded answers, and learn without
 turning uncertain interpretations into established knowledge. Unchecked work is
@@ -10,6 +10,11 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
 
 - [ ] Obtain independent judgments for the nine fixed benchmark cases and the
   16 cross-domain cases. Keep the blinded packets and raw outputs unchanged.
+- [ ] Evaluate Curmudgeon's graded claim decisions (reject, tentative,
+  accept-with-caveats, accept) on strong-but-incomplete evidence, including
+  claims with imagined edge cases, misleading passages, and genuine conflicts.
+  Confirm tentative findings retain their caveats and stay out of promoted
+  knowledge; track false rejections and unsupported tentative answers.
 - [ ] Replay the current source-reference extraction candidate on the fixed
   nine-case corpus, all cross-domain fixtures, and retained multi-turn failures.
   Review assertion-level support, useful partial answers, unnecessary
@@ -17,6 +22,13 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
 - [ ] Continue conversation-quality review after delivery, including
   corrections, challenges, constructive tasks, knowledge gaps, and research
   follow-ups. These audits remain advisory and separate from factual review.
+- [ ] Replay temporal-reasoning cases across independent conversations and
+  agent roles. The machine date now reaches every local model call and “What
+  year is it?” returned 2026. Best-effort answers now remain visible with an
+  uncertainty preface while Scholar checks them. A non-consecutive-presidency
+  replay still recast the user's reported 2024 win as future and said no election
+  had occurred in 2026. Improve temporal premise handling without phrase rules;
+  keep the event outcome visibly unverified until source evidence is available.
 - Keep training and scaling gated until this benchmark passes. Unit tests and
   same-model review do not establish semantic acceptance.
 - The related log-driven fixes and their isolated validation limits are in
@@ -37,6 +49,24 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
 - Steps 1–7 of the simplification review are implemented. The latest candidate
   removes source-reference phrase rewriting from extraction; its live replays
   and independent judgments remain pending.
+- [x] Performance and structure pass (November 2026): release profile with LTO;
+  schema v70 indexes on `scholar_findings(semantic_claim_id)`, `(job_id)` and
+  `candidate_claims(semantic_claim_id)`; `active_semantic_claims` and
+  maintenance history read in bulk instead of per row; relevance ranking reads
+  the cheap claim columns and loads the full view only for winners; Curmudgeon
+  canonicalizes reference claims once per reply and loads active claims once per
+  inbox pass; shared `structured_pass` helper for bounded ask→validate→repair
+  model passes; shared `match_active_claim` for candidate equivalence and
+  conflict detection; MLX worker reuses the previous KV cache for shared prompt
+  prefixes (greedy parity confirmed on the 14B checkpoint) and applies one
+  token-tracking rule set to single and batched generation.
+- [ ] Measure the prompt-prefix cache on representative multi-turn chats and
+  thinking continuations (prompt-processing time, memory held between turns)
+  and record the results; disable it if memory pressure outweighs the saving.
+- Remaining structural candidates: a backend trait for `LocalModel` dispatch,
+  migrating the ~800 `.map_err(database_error)` sites to `DbResultExt`, and
+  moving `research_reply`/`currentness` retries onto `structured_pass` where
+  their feedback shape allows.
 - Revisit semantic interpretation only with retained before/after evidence.
   Keep language meaning contextual and model-assessed; keep schemas, evidence
   identity, provenance, allowed states, resource limits, and review gates
@@ -46,10 +76,17 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
 
 4. Defer gated architecture and training proposals
 
-- Evaluate a single knowledge authority, inference ownership changes, async
-  orchestration, new interpretation roles, and broader adapters only with the
-  compatibility, benchmark, latency, and rollback evidence specified in the
-  detailed plans. None is implied by the cleanup work.
+- [x] Keep foreground factual replies independent of Scholar execution: require
+  a lookup when contextual assessment says public facts are needed and no source
+  passages are available, return qualified uncertainty, and wake maintenance
+  to process the queued job.
+- [x] Include the machine's current local date/time zone and UTC date in every
+  local model call, including batch and bounded calls, so all roles share the
+  same temporal context. This does not verify other current-world facts.
+- Evaluate a single knowledge authority, broader asynchronous orchestration,
+  inference ownership changes, new interpretation roles, and broader adapters
+  only with the compatibility, benchmark, latency, and rollback evidence
+  specified in the detailed plans. None is implied by the cleanup work.
 
 5. Evaluate quantized thinking inference and QLoRA adapters
 
@@ -147,6 +184,10 @@ source evidence, attribution, scope, review history, and unresolved outcomes.
   artifacts. Retain latency, capped outputs, false success and unnecessary
   abstention; seek independent judgments. Local deterministic checks do not
   establish coding competence or independence between shared-model roles.
+- [ ] Replay Docker shutdown after an implementation is generated. Confirm the
+  workflow stops on the first sandbox infrastructure error, exports the last
+  implementation with an explicit unverified note, and does not spend remaining
+  rounds retrying unavailable execution.
 - Defaults allow 12 implementation rounds, a 90-minute stage-admission budget,
   and 8,192 tokens per attempt; operators can raise the bounded settings further.
 - Coding standards review and additional language/dependency profiles remain

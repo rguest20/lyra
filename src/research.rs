@@ -9,6 +9,8 @@ pub(crate) use json::{
     DecisionRationale, deserialize_json_object, json_object, json_object_as, json_object_slice,
     json_object_with_delimiter_recovery,
 };
+mod passes;
+pub(crate) use passes::{append_repair, structured_pass};
 mod request;
 pub(crate) use request::{
     RequestIntent, property_request_with, request_context, request_intent_with,
@@ -105,13 +107,38 @@ pub(crate) fn private_fact_request(question: &str) -> bool {
 pub fn plan_with(
     question: &str,
     known_evidence: &str,
-    mut ask: impl FnMut(&[Message]) -> io::Result<String>,
+    ask: impl FnMut(&[Message]) -> io::Result<String>,
+) -> io::Result<Option<ResearchPlan>> {
+    plan_with_requirement(question, known_evidence, false, ask)
+}
+
+pub(crate) fn plan_for_missing_facts(
+    question: &str,
+    known_evidence: &str,
+    require_lookup: bool,
+    ask: impl FnMut(&[Message]) -> io::Result<String>,
+) -> io::Result<Option<ResearchPlan>> {
+    plan_with_requirement(question, known_evidence, require_lookup, ask)
+}
+
+fn plan_with_requirement(
+    question: &str,
+    known_evidence: &str,
+    require_lookup: bool,
+    ask: impl FnMut(&[Message]) -> io::Result<String>,
 ) -> io::Result<Option<ResearchPlan>> {
     if private_fact_request(question) {
         return Ok(None);
     }
-    let system = "/no_think\nPlan a lookup for missing PUBLIC facts needed by the current request (the last message). Prior user questions supply context. Known evidence contains SOURCE PASSAGES only, not a model draft. A best/preference request has factual prerequisites: neutral available choices or properties, never proof of an objective favourite. Research available candidates and relevant properties before making a recommendation. Do not research whether an assistant's invented answer is best. Search terms must describe the user's topic, not an unsupported answer. Preserve requested entities and constraints. Each query must retain the requested property, comparison, time or scope needed to find relevant evidence; do not return an entity-only query for a question about a specific attribute. For best X for purpose Y, keep purpose Y and research relevant properties, not merely a generic list of X. Skip lookup only when the passages address the concrete request and its constraints, not merely the same topic. Partial context does not fill missing facts needed for the requested comparison, use or recommendation. Private user facts, acknowledgments, corrections without a new factual request, and creative tasks need no lookup. Return ONLY JSON {\"needs_research\":true,\"question\":\"neutral factual prerequisite\",\"queries\":[\"public topic phrase\",\"synonym or alternate title\"]}, at most two queries. Otherwise return {\"needs_research\":false,\"question\":null,\"queries\":[]}.";
-    let mut messages = vec![
+    let required_lookup_guidance = if require_lookup {
+        " The request has already been assessed as requiring public facts, and no source passage is available; a lookup is required. Do not classify missing evidence as sufficient or return needs_research false."
+    } else {
+        ""
+    };
+    let system = format!(
+        "/no_think\nPlan a lookup for missing PUBLIC facts needed by the current request (the last message). Prior user questions supply context. Known evidence contains SOURCE PASSAGES only, not a model draft. A best/preference request has factual prerequisites: neutral available choices or properties, never proof of an objective favourite. Research available candidates and relevant properties before making a recommendation. Do not research whether an assistant's invented answer is best. Search terms must describe the user's topic, not an unsupported answer. Preserve requested entities and constraints. Each query must retain the requested property, comparison, time or scope needed to find relevant evidence; do not return an entity-only query for a question about a specific attribute. For best X for purpose Y, keep purpose Y and research relevant properties, not merely a generic list of X. Skip lookup only when the passages address the concrete request and its constraints, not merely the same topic. Partial context does not fill missing facts needed for the requested comparison, use or recommendation. Private user facts, acknowledgments, corrections without a new factual request, and creative tasks need no lookup. Return ONLY JSON {{\"needs_research\":true,\"question\":\"neutral factual prerequisite\",\"queries\":[\"public topic phrase\",\"synonym or alternate title\"]}}, at most two queries. Otherwise return {{\"needs_research\":false,\"question\":null,\"queries\":[]}}.{required_lookup_guidance}"
+    );
+    let messages = vec![
         Message {
             role: "system".into(),
             content: format!(
@@ -125,17 +152,25 @@ pub fn plan_with(
                 .to_string(),
         },
     ];
-    for attempt in 0..2 {
-        let raw = ask(&messages)?;
-        crate::diagnostics::research_decision(
-            "conversation.fact_research_assessed",
-            serde_json::json!({
-                "request":question,
-                "attempt":attempt+1,
-                "model_output":crate::diagnostics::text_excerpt(&raw, 1200),
-            }),
-        );
-        let parsed = parse_plan(&raw).and_then(|plan| {
+    structured_pass(
+        messages,
+        2,
+        ask,
+        |attempt, raw| {
+            crate::diagnostics::research_decision(
+                "conversation.fact_research_assessed",
+                serde_json::json!({
+                    "request":question,
+                    "attempt":attempt,
+                    "model_output":crate::diagnostics::text_excerpt(raw, 1200),
+                }),
+            );
+            let plan = parse_plan(raw)?;
+            if require_lookup && plan.is_none() {
+                return Err(invalid(
+                    "the request requires public facts but no source evidence is available",
+                ));
+            }
             if let Some(plan) = &plan {
                 for name in crate::entities::possessive_names(question) {
                     if !crate::entities::mentions_name(&plan.question, &name)
@@ -151,23 +186,17 @@ pub fn plan_with(
                 }
             }
             Ok(plan)
-        });
-        match parsed {
-            Ok(plan) => return Ok(plan),
-            Err(error) if attempt == 0 => {
-                messages.push(Message {
-                    role: "assistant".into(),
-                    content: raw,
-                });
-                messages.push(Message {
-                    role: "user".into(),
-                    content: format!("Your assessment was invalid: {error}. Correct it and return the required JSON object only."),
-                });
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!()
+        },
+        |messages, raw, error| {
+            append_repair(
+                messages,
+                raw,
+                format!(
+                    "Your assessment was invalid: {error}. Correct it and return the required JSON object only."
+                ),
+            )
+        },
+    )
 }
 
 pub fn parse_plan(raw: &str) -> io::Result<Option<ResearchPlan>> {

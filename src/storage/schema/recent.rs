@@ -1534,6 +1534,25 @@ impl LearningStore {
                 .map_err(database_error)?;
             tx.commit().map_err(database_error)?;
         }
+        if version < 70 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(database_error)?;
+            // Correlated subqueries in the semantic-claim read paths join on these columns.
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS scholar_findings_by_claim
+                    ON scholar_findings(semantic_claim_id, id);
+                 CREATE INDEX IF NOT EXISTS scholar_findings_by_job
+                    ON scholar_findings(job_id, id);
+                 CREATE INDEX IF NOT EXISTS candidate_claims_by_claim
+                    ON candidate_claims(semantic_claim_id);",
+            )
+            .map_err(database_error)?;
+            tx.pragma_update(None, "user_version", 70)
+                .map_err(database_error)?;
+            tx.commit().map_err(database_error)?;
+        }
         Ok(())
     }
 }

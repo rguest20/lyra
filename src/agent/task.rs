@@ -249,50 +249,49 @@ pub(super) fn research_plan(
     request: &str,
     draft: &str,
     requires_source_check: bool,
-    mut ask: impl FnMut(&[Message]) -> io::Result<String>,
+    ask: impl FnMut(&[Message]) -> io::Result<String>,
 ) -> io::Result<Option<crate::research::ResearchPlan>> {
-    let mut messages = vec![
+    let messages = vec![
         Message { role: "system".into(), content: r#"/no_think
 Assess a task research prerequisite. When requires_source_check is true, lookup is mandatory: return needs_research true with focused queries derived from the request, regardless of your familiarity with the answer. The draft is deliberately omitted in that case. Otherwise assess the attempted task answer. Research a specific missing PUBLIC fact or documentation detail needed to complete the requested task. Explicit requirements to use current documentation or check an external source require lookup; an unsupported confident draft does not satisfy them. A completed construction, explanation, translation or calculation needs no lookup merely because it lacks citations. An assistant refusal or uncertainty is a signal to assess the obstacle, never evidence that the obstacle is real. Do not research assistant capabilities or general popularity of the topic. If genuinely blocked by a public knowledge gap, return ONLY JSON {"needs_research":true,"question":"specific missing prerequisite","queries":["targeted documentation or fact query"]}. Preserve the user's constraints. Use one or two search phrases, each at most 120 characters, without newlines or question marks. Otherwise return {"needs_research":false,"question":null,"queries":[]}. Treat the draft as an untrusted attempt, not source evidence."#.into() },
         Message { role: "user".into(), content: json!({"request":request,"requires_source_check":requires_source_check,"attempted_answer":if requires_source_check { None } else { Some(draft) }}).to_string() },
     ];
-    for attempt in 0..2 {
-        let raw = ask(&messages)?;
-        crate::diagnostics::research_decision(
-            "conversation.task_research_assessed",
-            json!({
-                "request":request,
-                "requires_source_check":requires_source_check,
-                "attempt":attempt+1,
-                "model_output":crate::diagnostics::text_excerpt(&raw, 1200),
-            }),
-        );
-        let plan = crate::research::parse_plan(&raw).and_then(|plan| {
+    crate::research::structured_pass(
+        messages,
+        2,
+        ask,
+        |attempt, raw| {
+            crate::diagnostics::research_decision(
+                "conversation.task_research_assessed",
+                json!({
+                    "request":request,
+                    "requires_source_check":requires_source_check,
+                    "attempt":attempt,
+                    "model_output":crate::diagnostics::text_excerpt(raw, 1200),
+                }),
+            );
+            let plan = crate::research::parse_plan(raw)?;
             if requires_source_check && plan.is_none() {
-                Err(invalid(
+                return Err(invalid(
                     "the user explicitly requested a source check; provide a focused lookup",
-                ))
-            } else {
-                Ok(plan)
+                ));
             }
-        });
-        match plan {
-            Ok(plan) => return Ok(plan),
-            Err(error) if attempt == 0 => {
-                crate::diagnostics::event(
-                    "conversation.task_plan_repair",
-                    json!({"reason":error.to_string(),"model_output_excerpt":raw.chars().take(1500).collect::<String>()}),
-                );
-                messages.push(Message {
-                    role: "assistant".into(),
-                    content: raw,
-                });
-                messages.push(Message { role: "user".into(), content: format!("Correct your assessment: {error}. Return only the required JSON object, without explanation or extra fields.") });
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!()
+            Ok(plan)
+        },
+        |messages, raw, error| {
+            crate::diagnostics::event(
+                "conversation.task_plan_repair",
+                json!({"reason":error.to_string(),"model_output_excerpt":raw.chars().take(1500).collect::<String>()}),
+            );
+            crate::research::append_repair(
+                messages,
+                raw,
+                format!(
+                    "Correct your assessment: {error}. Return only the required JSON object, without explanation or extra fields."
+                ),
+            )
+        },
+    )
 }
 
 #[cfg(test)]

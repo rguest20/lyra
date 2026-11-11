@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) use crate::errors::invalid_data as invalid;
 use crate::knowledge::{Claim, KnowledgeMap};
 
-const SCHEMA_VERSION: i64 = 69;
+const SCHEMA_VERSION: i64 = 70;
 static SCHEMA_MIGRATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub(crate) struct ResearchSourceInput<'a> {
@@ -216,6 +216,25 @@ pub struct StoredCandidate {
     pub semantic_claim_id: Option<i64>,
     pub valid_from: Option<String>,
     pub valid_until: Option<String>,
+}
+
+impl From<&StoredCandidate> for CandidateClaim {
+    /// The stored row does not retain context references or the resolution.
+    fn from(candidate: &StoredCandidate) -> Self {
+        Self {
+            subject: candidate.subject.clone(),
+            relation: candidate.relation.clone(),
+            object: candidate.object.clone(),
+            evidence_text: candidate.evidence_text.clone(),
+            context_message_ids: Vec::new(),
+            resolution: None,
+            confidence: candidate.confidence,
+            status: candidate.status.clone(),
+            decision_reason: candidate.decision_reason.clone(),
+            valid_from: candidate.valid_from.clone(),
+            valid_until: candidate.valid_until.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1095,6 +1114,72 @@ pub(super) struct ActiveSemanticClaim {
     valid_until: Option<String>,
 }
 
+/// Outcome of comparing a candidate against the active semantic claims.
+pub(super) enum ActiveClaimMatch {
+    Equivalent(i64),
+    Conflict(ActiveSemanticClaim),
+}
+
+impl ActiveSemanticClaim {
+    pub(super) fn id(&self) -> i64 {
+        self.id
+    }
+
+    pub(super) fn period(&self) -> (Option<&str>, Option<&str>) {
+        (self.valid_from.as_deref(), self.valid_until.as_deref())
+    }
+
+    pub(super) fn conflict_message(&self) -> String {
+        format!(
+            "conflicts with active semantic claim #{}: {} {} {}",
+            self.id, self.subject, self.relation, self.object
+        )
+    }
+}
+
+/// Scan active claims in id order for the first one that is equivalent to the
+/// candidate (same subject via aliases, relation, object and dates) or that
+/// conflicts with it (same subject and relation, different object, overlapping
+/// period). Same subject/relation/object over a different period is neither.
+pub(super) fn match_active_claim(
+    tx: &Transaction<'_>,
+    candidate: &CandidateClaim,
+) -> io::Result<Option<ActiveClaimMatch>> {
+    let existing = query_vec(
+        tx,
+        "SELECT id, subject, relation, object, valid_from, valid_until FROM semantic_claims
+         WHERE retracted_by IS NULL ORDER BY id",
+        [],
+        ActiveSemanticClaim::from_row,
+    )?;
+    let today = current_sql_date(tx)?;
+    let aliases = entities::EntityAliases::load(tx)?;
+    let relation = canonical(&candidate.relation);
+    let object = canonical(&candidate.object);
+    for claim in existing {
+        let overlaps = claim_periods_overlap(
+            candidate.valid_from.as_deref(),
+            candidate.valid_until.as_deref(),
+            claim.valid_from.as_deref(),
+            claim.valid_until.as_deref(),
+            &today,
+        );
+        if !overlaps
+            || !aliases.same(&claim.subject, &candidate.subject)
+            || canonical(&claim.relation) != relation
+        {
+            continue;
+        }
+        if canonical(&claim.object) != object {
+            return Ok(Some(ActiveClaimMatch::Conflict(claim)));
+        }
+        if claim.valid_from == candidate.valid_from && claim.valid_until == candidate.valid_until {
+            return Ok(Some(ActiveClaimMatch::Equivalent(claim.id)));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn link_candidate_to_semantic_claim(
     tx: &Transaction<'_>,
     semantic_claim_id: i64,
@@ -1127,51 +1212,15 @@ fn curate_candidate(
     tx: &Transaction<'_>,
     observation_id: &str,
     candidate: &mut CandidateClaim,
-) -> io::Result<Result<i64, String>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT id, subject, relation, object, valid_from, valid_until FROM semantic_claims
-         WHERE retracted_by IS NULL ORDER BY id",
-        )
-        .map_err(database_error)?;
-    let existing = statement
-        .query_map([], ActiveSemanticClaim::from_row)
-        .map_err(database_error)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(database_error)?;
-    drop(statement);
-    let today = current_sql_date(tx)?;
-    let aliases = entities::EntityAliases::load(tx)?;
-    for claim in existing {
-        let overlaps = claim_periods_overlap(
-            candidate.valid_from.as_deref(),
-            candidate.valid_until.as_deref(),
-            claim.valid_from.as_deref(),
-            claim.valid_until.as_deref(),
-            &today,
-        );
-        if !overlaps {
-            continue;
-        }
-        if aliases.same(&claim.subject, &candidate.subject)
-            && canonical(&claim.relation) == canonical(&candidate.relation)
-            && canonical(&claim.object) == canonical(&candidate.object)
-            && claim.valid_from.as_deref() == candidate.valid_from.as_deref()
-            && claim.valid_until.as_deref() == candidate.valid_until.as_deref()
-        {
+) -> io::Result<Result<i64, ActiveSemanticClaim>> {
+    match match_active_claim(tx, candidate)? {
+        Some(ActiveClaimMatch::Equivalent(id)) => {
             candidate.status = "promoted".into();
             candidate.decision_reason = Some("equivalent active claim; source attached".into());
-            return Ok(Ok(claim.id));
+            return Ok(Ok(id));
         }
-        if aliases.same(&claim.subject, &candidate.subject)
-            && canonical(&claim.relation) == canonical(&candidate.relation)
-            && canonical(&claim.object) != canonical(&candidate.object)
-        {
-            return Ok(Err(format!(
-                "conflicts with active semantic claim #{}: {} {} {}",
-                claim.id, claim.subject, claim.relation, claim.object
-            )));
-        }
+        Some(ActiveClaimMatch::Conflict(claim)) => return Ok(Err(claim)),
+        None => {}
     }
     tx.execute(
         "INSERT INTO semantic_claims
@@ -1650,6 +1699,29 @@ pub(crate) fn publication_date_is_recent(
 
 fn database_error(error: rusqlite::Error) -> io::Error {
     io::Error::other(error)
+}
+
+/// Shorthand for `.map_err(database_error)` on rusqlite results.
+pub(crate) trait DbResultExt<T> {
+    fn db(self) -> io::Result<T>;
+}
+
+impl<T> DbResultExt<T> for rusqlite::Result<T> {
+    fn db(self) -> io::Result<T> {
+        self.map_err(database_error)
+    }
+}
+
+/// Run a read-only query and collect every mapped row.
+pub(crate) fn query_vec<T, P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    map: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> io::Result<Vec<T>> {
+    let mut statement = connection.prepare_cached(sql).db()?;
+    let rows = statement.query_map(params, map).db()?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().db()
 }
 
 fn sqlite_limit(limit: usize) -> io::Result<i64> {

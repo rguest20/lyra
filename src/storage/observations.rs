@@ -10,6 +10,45 @@ pub(super) fn read_observation_text(connection: &Connection, id: &str) -> io::Re
         .map_err(database_error)
 }
 
+/// Decide whether an extracted claim is promoted now, held for review, or left
+/// rejected. Updates the claim's status and reason; returns the semantic claim
+/// it was promoted into, if any.
+fn resolve_candidate_status(
+    tx: &Transaction<'_>,
+    observation_id: &str,
+    observation_text: &str,
+    claim: &mut CandidateClaim,
+) -> io::Result<Option<i64>> {
+    if claim.status == "rejected" {
+        return Ok(None);
+    }
+    if !claim_period_is_stated(
+        claim.valid_from.as_deref(),
+        claim.valid_until.as_deref(),
+        observation_text,
+    ) {
+        claim.status = "needs_review".into();
+        claim.decision_reason =
+            Some("claim dates are invalid or not explicit in the user observation".into());
+        return Ok(None);
+    }
+    if claim.status == "proposed" && claim.confidence >= PROMOTION_CONFIDENCE {
+        return match curate_candidate(tx, observation_id, claim)? {
+            Ok(id) => Ok(Some(id)),
+            Err(conflicting) => {
+                claim.status = "needs_review".into();
+                claim.decision_reason = Some(conflicting.conflict_message());
+                Ok(None)
+            }
+        };
+    }
+    claim.status = "needs_review".into();
+    claim.decision_reason.get_or_insert_with(|| {
+        format!("confidence below promotion threshold of {PROMOTION_CONFIDENCE:.2}")
+    });
+    Ok(None)
+}
+
 impl LearningStore {
     /// Import the JSON map without changing it. Re-running is safe: matching
     /// rows are accepted, while an ID with different content aborts the import.
@@ -241,37 +280,11 @@ impl LearningStore {
             claim.subject = normalize(&claim.subject);
             claim.relation = normalize(&claim.relation);
             claim.object = normalize(&claim.object);
-            let claim_period_valid = claim_period_is_stated(
-                claim.valid_from.as_deref(),
-                claim.valid_until.as_deref(),
-                &observation_text,
-            );
-            let semantic_id = if claim.status == "rejected" {
-                None
-            } else if !claim_period_valid {
-                claim.status = "needs_review".into();
-                claim.decision_reason =
-                    Some("claim dates are invalid or not explicit in the user observation".into());
-                review_reasons.push(claim.decision_reason.clone().unwrap());
-                None
-            } else if claim.status == "proposed" && claim.confidence >= PROMOTION_CONFIDENCE {
-                match curate_candidate(&tx, observation_id, &mut claim)? {
-                    Ok(id) => Some(id),
-                    Err(reason) => {
-                        claim.status = "needs_review".into();
-                        claim.decision_reason = Some(reason.clone());
-                        review_reasons.push(reason);
-                        None
-                    }
-                }
-            } else {
-                claim.status = "needs_review".into();
-                claim.decision_reason.get_or_insert_with(|| {
-                    format!("confidence below promotion threshold of {PROMOTION_CONFIDENCE:.2}")
-                });
-                review_reasons.push(claim.decision_reason.clone().unwrap());
-                None
-            };
+            let semantic_id =
+                resolve_candidate_status(&tx, observation_id, &observation_text, &mut claim)?;
+            if claim.status == "needs_review" {
+                review_reasons.extend(claim.decision_reason.clone());
+            }
             let candidate_id: String = tx
                 .query_row(
                     "INSERT INTO candidate_claims

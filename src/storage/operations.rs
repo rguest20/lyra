@@ -134,29 +134,36 @@ impl LearningStore {
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
-        let mut roles = self
-            .connection
-            .prepare(
-                "SELECT role, status, processed, detail, duration_ms
-                 FROM maintenance_role_runs WHERE pass_id = ?1 ORDER BY id",
-            )
-            .map_err(database_error)?;
+        // Passes are ordered by id DESC, so their ids bound one range query.
+        let mut roles_by_pass: std::collections::HashMap<i64, Vec<MaintenanceRoleRun>> =
+            std::collections::HashMap::new();
+        if let (Some(newest), Some(oldest)) = (passes.first(), passes.last()) {
+            let runs = query_vec(
+                &self.connection,
+                "SELECT pass_id, role, status, processed, detail, duration_ms
+                 FROM maintenance_role_runs WHERE pass_id BETWEEN ?1 AND ?2 ORDER BY id",
+                [oldest.id, newest.id],
+                |row| {
+                    let processed: i64 = row.get(3)?;
+                    let duration: Option<i64> = row.get(5)?;
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        MaintenanceRoleRun {
+                            role: row.get(1)?,
+                            status: row.get(2)?,
+                            processed: usize::try_from(processed).unwrap_or(0),
+                            detail: row.get(4)?,
+                            duration_ms: duration.and_then(|value| u64::try_from(value).ok()),
+                        },
+                    ))
+                },
+            )?;
+            for (pass_id, run) in runs {
+                roles_by_pass.entry(pass_id).or_default().push(run);
+            }
+        }
         for pass in &mut passes {
-            pass.roles = roles
-                .query_map([pass.id], |row| {
-                    let processed: i64 = row.get(2)?;
-                    let duration: Option<i64> = row.get(4)?;
-                    Ok(MaintenanceRoleRun {
-                        role: row.get(0)?,
-                        status: row.get(1)?,
-                        processed: usize::try_from(processed).unwrap_or(0),
-                        detail: row.get(3)?,
-                        duration_ms: duration.and_then(|value| u64::try_from(value).ok()),
-                    })
-                })
-                .map_err(database_error)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(database_error)?;
+            pass.roles = roles_by_pass.remove(&pass.id).unwrap_or_default();
         }
         Ok(passes)
     }

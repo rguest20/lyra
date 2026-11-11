@@ -25,13 +25,31 @@ useful answer does not turn an uncertain interpretation into stored knowledge.
 
 For a factual request, Interaction checks the conversation and existing
 evidence, then queues bounded research when a relevant public fact is missing.
-Scholar retains the fetched passage before evaluating an extracted claim.
+It gives a supported partial answer or tentative best effort with explicit
+uncertainty instead of waiting for Scholar's fetch, extraction and review or
+discarding a useful draft. The unverified portion stays marked and is not
+promoted to knowledge. Scholar runs through maintenance; later turns can use
+retained evidence. Directly source-supported findings that are still awaiting
+review may support a provisional, attributed partial answer; that does not
+make them settled knowledge or eligible for automatic promotion. Scholar
+retains the fetched passage before evaluating an extracted claim.
 Semantic review checks whether the claim follows from that passage; source,
 provenance, conflict, and corroboration gates remain separate. Accepted research
 can support an answer, while automatic promotion to the durable claim ledger
 requires its own evidence gates. The answer keeps its source attribution and
 scope. If evidence is incomplete or disputed, Lyra reports the gap or gives a
 qualified partial answer.
+
+Curmudgeon uses graded claim decisions: reject, tentative, accept with caveats,
+and accept. Tentative findings retain their validated caveats and remain pending
+review, so they may inform an explicitly uncertain answer but cannot enter the
+settled claim ledger. Acceptance level does not override direct-support,
+freshness, provenance, privacy, conflict, corroboration, or promotion rules.
+
+Every local model call, including Scholar, Scout, and Curmudgeon work, receives
+the machine's current local date and time zone, with the UTC date as a fallback.
+This anchors date questions and temporal interpretation; it does not establish
+other current-world facts or replace source-backed research.
 
 Ordinary conversational replies are delivered before advisory quality audits
 run during maintenance. Those audits can inform later review but cannot rewrite
@@ -160,9 +178,25 @@ initial budget, capped at 2048 tokens and the available context. At that cap it
 closes the reasoning phase and generates the answer while preserving the reasoning
 in context. Malformed output still gets one recovery attempt with thinking disabled
 and a labelled discarded trace. `model.generation` records token
-counts, stop reason, and MLX active/peak/cache memory; `model.reply_recovery`
-records the retry. The browser forwards reply diagnostics to server stderr on
-both success and failure, while error bubbles show the actual error message.
+counts, stop reason, cached prompt tokens, and MLX active/peak/cache memory;
+`model.reply_recovery` records the retry. The browser forwards reply diagnostics
+to server stderr on both success and failure, while error bubbles show the
+actual error message.
+
+When **Show model thinking (debug)** is selected, the browser also keeps the
+generated trace visible when Lyra replaces an unsupported factual draft with an
+uncertainty reply, or falls back after a source-based draft cannot be reviewed
+successfully. Thinking remains hidden in ordinary chat unless this debug option
+is enabled.
+
+The MLX worker keeps the KV cache of its last single-request generation. A new
+prompt that shares a prefix of at least 16 tokens with the cached prompt and
+reply is trimmed to that prefix and only the remaining tokens are processed, so
+multi-turn chat and thinking-budget continuations skip re-reading the system
+prompt and earlier turns. Only plain attention caches are reused; Qwen3.5's
+hybrid recurrent layers are rebuilt every request, and bounded-task requests
+whose presence penalty must see the prompt also start fresh. The adapter only
+changes the output head, so training does not invalidate the cache.
 
 Scholar checks claim meaning in a separate AI entailment pass. Faithful synonyms
 and paraphrases can pass without matching the source's words. The reviewer
@@ -229,6 +263,11 @@ is shared across sessions. Topic changes do not clear the session history;
 Lyra keeps earlier turns available for later clarifications and corrections.
 Set `COMMUNITY_WEB_ADDR` to another loopback address if port 8080 is in
 use; non-loopback addresses are rejected.
+While Lyra handles a message, the browser status line reports the current
+request stage, such as understanding the request, checking relevant knowledge,
+drafting, or working through the coding workflow. These per-session updates are
+available from `GET /api/activity?session_id=...`; independent browser requests
+remain serviceable while a reply is being generated.
 
 Starting a new browser conversation keeps the previous session file in place.
 Archives created by older automatic topic resets also remain intact.
@@ -275,7 +314,12 @@ docker build -t lyra-code-python:1 docker/code-python
 ```
 
 The contextual request assessment can route implementation and execution tasks
-into this loop. In chat or the browser, `/code PROBLEM` selects it explicitly.
+into this loop. Lyra's system context describes the workflow and its limits.
+In chat or the browser, `/code PROBLEM` selects it explicitly; `/skills` lists
+the available coding capability and shows how to invoke it.
+If the Docker sandbox becomes unavailable mid-run, the workflow stops revising,
+retains the run report, exports the latest implementation under
+`unverified-export/`, and tells the user that testing could not be completed.
 For a standalone experiment without adding to the conversation or factual ledger:
 
 ```sh

@@ -13,6 +13,7 @@ impl Agent {
         };
         let mut researched = false;
         if sources.required {
+            services.report_activity("Researching prerequisites for the coding task");
             let result = (|| {
                 let plan = self
                     .plan_research(
@@ -66,6 +67,7 @@ impl Agent {
                 sources.limitation = Some(error.to_string());
             }
         }
+        services.report_activity("Generating, running, and revising a Python solution");
         let root = crate::scholar::coding::runs_root(services.database_path);
         let (report, directory) = crate::scholar::coding::solve(
             request.original_message,

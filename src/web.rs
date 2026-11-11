@@ -1,10 +1,12 @@
 //! Loopback-only browser interface with one long-lived local model runtime.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -18,6 +20,7 @@ use crate::storage::LearningStore;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const PAGE: &str = include_str!("../web/index.html");
+type ActivityState = Arc<Mutex<HashMap<String, String>>>;
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static SIGNAL_HANDLER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
 
@@ -62,14 +65,15 @@ pub fn serve(
         .unwrap_or_else(|| Path::new("state"))
         .join("web-sessions");
     fs::create_dir_all(&session_state_directory)?;
-    let maintenance = MaintenanceHandle::spawn_for_web(
+    let maintenance = Arc::new(MaintenanceHandle::spawn_for_web(
         database_path.to_owned(),
         knowledge_path.to_owned(),
         models.clone(),
-    );
+    ));
+    let activities: ActivityState = Arc::new(Mutex::new(HashMap::new()));
 
     while !SHUTDOWN.load(Ordering::SeqCst) {
-        let (mut stream, _) = match listener.accept() {
+        let (stream, _) = match listener.accept() {
             Ok(stream) => stream,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -81,45 +85,55 @@ pub fn serve(
                 continue;
             }
         };
-        if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(15))) {
-            web_io_failure("read_timeout_setup", &error, None);
-            return Err(error);
-        }
-        match handle_request(
-            &mut stream,
-            address,
-            &session_state_directory,
-            Path::new(database_path),
-            Path::new(knowledge_path),
-            Some((&models, &maintenance)),
-        ) {
-            Ok(should_curate) if should_curate => {
-                maintenance.wake();
-            }
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                // An idle or incomplete client request is bounded by the read
-                // timeout; keep serving without reporting it as a server error.
-            }
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                // The read layer records the peer close separately.
-            }
-            Err(error) => {
-                web_io_failure("request_handler", &error, None);
-                eprintln!("could not handle web request: {error}");
-            }
+        let session_state_directory = session_state_directory.clone();
+        let database_path = Path::new(database_path).to_path_buf();
+        let knowledge_path = Path::new(knowledge_path).to_path_buf();
+        let models = models.clone();
+        let maintenance = Arc::clone(&maintenance);
+        let activities = Arc::clone(&activities);
+        if let Err(error) = std::thread::Builder::new()
+            .name("lyra-web-request".into())
+            .spawn(move || {
+                let mut stream = stream;
+                if let Err(error) = stream.set_read_timeout(Some(Duration::from_secs(15))) {
+                    web_io_failure("read_timeout_setup", &error, None);
+                    return;
+                }
+                match handle_request_with_activity(
+                    &mut stream,
+                    address,
+                    &session_state_directory,
+                    &database_path,
+                    &knowledge_path,
+                    Some((&models, &maintenance)),
+                    &activities,
+                ) {
+                    Ok(should_curate) if should_curate => maintenance.wake(),
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+                    Err(error) => {
+                        web_io_failure("request_handler", &error, None);
+                        eprintln!("could not handle web request: {error}");
+                    }
+                }
+            })
+        {
+            web_io_failure("request_thread_spawn", &error, None);
         }
     }
-    maintenance.stop();
+    if let Ok(maintenance) = Arc::try_unwrap(maintenance) {
+        maintenance.stop();
+    }
     Ok(())
 }
 
 /// Returns true after a chat request, which triggers one curation pass.
+#[cfg(test)]
 fn handle_request(
     stream: &mut TcpStream,
     address: SocketAddr,
@@ -127,6 +141,26 @@ fn handle_request(
     database_path: &Path,
     knowledge_path: &Path,
     chat_runtime: Option<(&ModelRuntime, &MaintenanceHandle)>,
+) -> io::Result<bool> {
+    handle_request_with_activity(
+        stream,
+        address,
+        session_state_directory,
+        database_path,
+        knowledge_path,
+        chat_runtime,
+        &Arc::new(Mutex::new(HashMap::new())),
+    )
+}
+
+fn handle_request_with_activity(
+    stream: &mut TcpStream,
+    address: SocketAddr,
+    session_state_directory: &Path,
+    database_path: &Path,
+    knowledge_path: &Path,
+    chat_runtime: Option<(&ModelRuntime, &MaintenanceHandle)>,
+    activities: &ActivityState,
 ) -> io::Result<bool> {
     let request = read_request(stream)?;
     let mut lines = request.split(|byte| *byte == b'\n');
@@ -187,6 +221,32 @@ fn handle_request(
             "200 OK",
             "application/json; charset=utf-8",
             &serde_json::to_vec(&status).map_err(crate::errors::invalid_json)?,
+        )?;
+        return Ok(false);
+    }
+    if method == b"GET" && path.starts_with(b"/api/activity?session_id=") {
+        let session_id =
+            std::str::from_utf8(&path[b"/api/activity?session_id=".len()..]).unwrap_or_default();
+        if !valid_session_id(session_id) {
+            respond(
+                stream,
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                br#"{"error":"invalid session ID"}"#,
+            )?;
+            return Ok(false);
+        }
+        let activity = activities
+            .lock()
+            .map_err(|_| io::Error::other("activity status lock was poisoned"))?
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| "Ready".to_owned());
+        respond(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({"activity": activity}).to_string().into_bytes(),
         )?;
         return Ok(false);
     }
@@ -278,6 +338,15 @@ fn handle_request(
     };
     let chat_models = models.for_chat();
     let state_path = session_state_directory.join(format!("{}.json", parsed.session_id));
+    if !try_start_activity(activities, &parsed.session_id, "Starting up Lyra")? {
+        respond(
+            stream,
+            "409 Conflict",
+            "application/json; charset=utf-8",
+            br#"{"error":"a reply is already being generated for this session"}"#,
+        )?;
+        return Ok(false);
+    }
     let result = browser_reply(
         &parsed,
         &state_path,
@@ -285,23 +354,22 @@ fn handle_request(
         knowledge_path,
         &chat_models,
         maintenance,
+        activities,
     );
-    match result {
-        Ok(result) => {
-            respond(
-                stream,
-                "200 OK",
-                "application/json; charset=utf-8",
-                &json!({
-                    "reply": result.text,
-                    "thinking": result.thinking,
-                    "new_conversation": false,
-                    "research_queued": result.research_queued
-                })
-                .to_string()
-                .into_bytes(),
-            )?;
-        }
+    let response_result = match result {
+        Ok(result) => respond(
+            stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &json!({
+                "reply": result.text,
+                "thinking": result.thinking,
+                "new_conversation": false,
+                "research_queued": result.research_queued
+            })
+            .to_string()
+            .into_bytes(),
+        ),
         Err(error) => {
             let reason = error.to_string();
             crate::diagnostics::event("web.reply_failed", json!({"reason":reason}));
@@ -310,9 +378,14 @@ fn handle_request(
                 "500 Internal Server Error",
                 "application/json; charset=utf-8",
                 &json!({"error": reason}).to_string().into_bytes(),
-            )?;
+            )
         }
-    }
+    };
+    activities
+        .lock()
+        .map_err(|_| io::Error::other("activity status lock was poisoned"))?
+        .remove(&parsed.session_id);
+    response_result?;
     Ok(true)
 }
 
@@ -323,19 +396,28 @@ fn browser_reply(
     knowledge_path: &Path,
     models: &ModelRuntime,
     maintenance: &MaintenanceHandle,
+    activities: &ActivityState,
 ) -> io::Result<crate::agent::AgentReply> {
     let model_id = models.model_id(AgentRole::Interaction)?;
     let mut agent = Agent::load_for_model_change(state_path, &model_id)?;
     let map = KnowledgeMap::load(knowledge_path)?;
     let store = LearningStore::open(database_path)?;
     let mut reply_models = models.reply_models();
-    let (interaction, services) = ReplyServices::split_models(
+    let (interaction, mut services) = ReplyServices::split_models(
         &mut reply_models,
         &store,
         database_path,
         Some(maintenance),
         state_path,
     );
+    let activity_state = Arc::clone(activities);
+    let session_id = request.session_id.clone();
+    let report_activity = move |activity: &str| {
+        if let Ok(mut states) = activity_state.lock() {
+            states.insert(session_id.clone(), activity.to_owned());
+        }
+    };
+    services.activity = Some(&report_activity);
     agent.reply(
         &request.message,
         interaction,
@@ -343,6 +425,21 @@ fn browser_reply(
         services,
         request.show_thinking,
     )
+}
+
+fn try_start_activity(
+    activities: &ActivityState,
+    session_id: &str,
+    activity: &str,
+) -> io::Result<bool> {
+    let mut states = activities
+        .lock()
+        .map_err(|_| io::Error::other("activity status lock was poisoned"))?;
+    if states.contains_key(session_id) {
+        return Ok(false);
+    }
+    states.insert(session_id.to_owned(), activity.to_owned());
+    Ok(true)
 }
 
 fn valid_session_id(id: &str) -> bool {

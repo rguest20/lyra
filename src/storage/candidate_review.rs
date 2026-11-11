@@ -115,42 +115,11 @@ impl LearningStore {
             };
             let semantic_id = match curate_candidate(&tx, &observation_id, &mut claim)? {
                 Ok(id) => id,
-                Err(conflict) => {
-                    let mut statement = tx
-                        .prepare(
-                            "SELECT id, subject, relation, object, valid_from, valid_until
-                         FROM semantic_claims WHERE retracted_by IS NULL",
-                        )
-                        .map_err(database_error)?;
-                    let rows = statement
-                        .query_map([], ActiveSemanticClaim::from_row)
-                        .map_err(database_error)?;
-                    let today = crate::storage::current_sql_date(&tx)?;
-                    let aliases = entities::EntityAliases::load(&tx)?;
-                    let mut conflicting = None;
-                    for row in rows {
-                        let existing = row.map_err(database_error)?;
-                        if aliases.same(&existing.subject, &claim.subject)
-                            && canonical(&existing.relation) == canonical(&claim.relation)
-                            && canonical(&existing.object) != canonical(&claim.object)
-                            && claim_periods_overlap(
-                                claim.valid_from.as_deref(),
-                                claim.valid_until.as_deref(),
-                                existing.valid_from.as_deref(),
-                                existing.valid_until.as_deref(),
-                                &today,
-                            )
-                        {
-                            conflicting =
-                                Some((existing.id, existing.valid_from, existing.valid_until));
-                            break;
-                        }
-                    }
-                    drop(statement);
-                    let (current_id, old_from, old_until) =
-                        conflicting.ok_or_else(|| invalid(&conflict))?;
-                    let supersedes_id = if old_from.as_deref() == claim.valid_from.as_deref()
-                        && old_until.as_deref() == claim.valid_until.as_deref()
+                Err(conflicting) => {
+                    let current_id = conflicting.id();
+                    let (old_from, old_until) = conflicting.period();
+                    let supersedes_id = if old_from == claim.valid_from.as_deref()
+                        && old_until == claim.valid_until.as_deref()
                     {
                         research::supersede_semantic_claim(
                             &tx,

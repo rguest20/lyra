@@ -176,27 +176,56 @@ impl LearningStore {
         if query_words.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut statement = self
-            .connection
-            .prepare(&format!(
-                "SELECT {SEMANTIC_CLAIM_COLUMNS}, {SEMANTIC_CLAIM_RELEVANCE}
+        // Rank on the cheap text columns first; the full claim view runs
+        // several correlated subqueries per row, so fetch it only for winners.
+        struct Candidate {
+            id: i64,
+            text: String,
+            research_relevance: Option<String>,
+        }
+        let candidates = query_vec(
+            &self.connection,
+            &format!(
+                "SELECT id, subject || ' ' || relation || ' ' || object, {SEMANTIC_CLAIM_RELEVANCE}
                  FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id DESC LIMIT 1000"
-            ))
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], semantic_claim_from_row)
-            .map_err(database_error)?;
-        let claims = rows
-            .map(|row| row.map_err(database_error))
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok(rank_relevant(
-            claims,
+            ),
+            [],
+            |row| {
+                Ok(Candidate {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    research_relevance: row.get(2)?,
+                })
+            },
+        )?;
+        let ranked = rank_relevant(
+            candidates,
             &query_words,
             limit,
-            |claim| format!("{} {} {}", claim.subject, claim.relation, claim.object),
-            |claim| claim.research_relevance.as_deref(),
-            |claim| claim.id,
-        ))
+            |candidate| candidate.text.clone(),
+            |candidate| candidate.research_relevance.as_deref(),
+            |candidate| candidate.id,
+        );
+        if ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ranked.len()].join(",");
+        let mut claims = query_vec(
+            &self.connection,
+            &format!(
+                "SELECT {SEMANTIC_CLAIM_COLUMNS}, {SEMANTIC_CLAIM_RELEVANCE}
+                 FROM semantic_claims WHERE id IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(ranked.iter().map(|candidate| candidate.id)),
+            semantic_claim_from_row,
+        )?
+        .into_iter()
+        .map(|claim| (claim.id, claim))
+        .collect::<std::collections::HashMap<_, _>>();
+        Ok(ranked
+            .iter()
+            .filter_map(|candidate| claims.remove(&candidate.id))
+            .collect())
     }
 
     #[cfg(test)]
@@ -470,52 +499,45 @@ impl LearningStore {
     }
 
     pub fn active_semantic_claims(&self) -> io::Result<Vec<SemanticClaimDetail>> {
-        let mut statement = self
-            .connection
-            .prepare(&format!(
+        let claims = query_vec(
+            &self.connection,
+            &format!(
                 "SELECT {SEMANTIC_CLAIM_COLUMNS}, NULL AS research_relevance
                  FROM semantic_claims WHERE retracted_by IS NULL ORDER BY id"
-            ))
-            .map_err(database_error)?;
-        let rows = statement
-            .query_map([], semantic_claim_from_row)
-            .map_err(database_error)?;
-        let claims = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(database_error)?;
-        drop(statement);
-        claims
+            ),
+            [],
+            semantic_claim_from_row,
+        )?;
+        let mut sources_by_claim: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::with_capacity(claims.len());
+        let observation_sources = query_vec(
+            &self.connection,
+            "SELECT s.semantic_claim_id, o.id || ': ' || o.raw_text
+             FROM semantic_claim_sources s
+             JOIN semantic_claims c ON c.id = s.semantic_claim_id AND c.retracted_by IS NULL
+             JOIN observations o ON o.id = s.observation_id
+             ORDER BY s.semantic_claim_id, o.created_at, o.turn_number",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        let scholar_sources = query_vec(
+            &self.connection,
+            "SELECT f.semantic_claim_id, f.source_url || ': ' || f.evidence_text
+             FROM scholar_findings f
+             JOIN semantic_claims c ON c.id = f.semantic_claim_id AND c.retracted_by IS NULL
+             WHERE f.status = 'promoted' ORDER BY f.semantic_claim_id, f.id",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for (claim_id, source) in observation_sources.into_iter().chain(scholar_sources) {
+            sources_by_claim.entry(claim_id).or_default().push(source);
+        }
+        Ok(claims
             .into_iter()
             .map(|claim| {
-                let mut sources_statement = self
-                    .connection
-                    .prepare(
-                        "SELECT o.id || ': ' || o.raw_text FROM semantic_claim_sources s
-                 JOIN observations o ON o.id = s.observation_id
-                 WHERE s.semantic_claim_id = ?1 ORDER BY o.created_at, o.turn_number",
-                    )
-                    .map_err(database_error)?;
-                let sources = sources_statement
-                    .query_map([claim.id], |row| row.get(0))
-                    .map_err(database_error)?
-                    .collect::<Result<Vec<String>, _>>()
-                    .map_err(database_error)?;
-                let mut sources: Vec<String> = sources;
-                let mut scholar_statement = self
-                    .connection
-                    .prepare(
-                        "SELECT source_url || ': ' || evidence_text FROM scholar_findings
-                     WHERE semantic_claim_id = ?1 AND status = 'promoted' ORDER BY id",
-                    )
-                    .map_err(database_error)?;
-                let scholar_sources = scholar_statement
-                    .query_map([claim.id], |row| row.get(0))
-                    .map_err(database_error)?
-                    .collect::<Result<Vec<String>, _>>()
-                    .map_err(database_error)?;
-                sources.extend(scholar_sources);
-                Ok(SemanticClaimDetail { claim, sources })
+                let sources = sources_by_claim.remove(&claim.id).unwrap_or_default();
+                SemanticClaimDetail { claim, sources }
             })
-            .collect()
+            .collect())
     }
 }

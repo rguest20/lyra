@@ -486,6 +486,8 @@ pub(crate) struct Report {
     pub failure_evaluation_error: Option<String>,
     pub outcome: Outcome,
     pub stop_reason: String,
+    #[serde(default)]
+    pub exported_directory: Option<String>,
     pub finished: bool,
     pub elapsed_ms: u128,
 }
@@ -516,6 +518,11 @@ impl Report {
         }
         if let Some(error) = &self.failure_evaluation_error {
             text.push_str(&format!("\nFinal failure review unavailable: {error}"));
+        }
+        if let Some(directory) = &self.exported_directory {
+            text.push_str(&format!(
+                "\nThe latest implementation was exported to {directory}. It is unverified because the coding sandbox became unavailable before execution could finish."
+            ));
         }
         text
     }
